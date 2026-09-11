@@ -162,8 +162,10 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
       throw error;
     }
     const result = await connectTelegramWithCode({ code: command.code!, telegramUserId, chatId, updateId });
-    if (result.linked) await clearRateLimit(attemptKey);
-    if (result.linked) return { text: "✅ Telegram conectado com segurança à sua família." };
+    if (result.linked) {
+      try { await clearRateLimit(attemptKey); } catch { console.error("telegram_rate_limit_cleanup_failed"); }
+      return { text: "✅ Telegram conectado com segurança à sua família." };
+    }
     if (result.reason === "conflict") return { text: "Esta conta Telegram já está vinculada a outro usuário ou família." };
     if (result.reason === "inactive_member") return { text: "O usuário desse código não é mais membro ativo da família." };
     return { text: "Código inválido, expirado ou já utilizado." };
@@ -220,8 +222,9 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
     return { text: `✅ ${intent.type === "income" ? "Entrada" : "Despesa"} de ${formatBrl(intent.amountCents!)} registrada.` };
   }
   if (/^\/saldo(?:@\w+)?$/iu.test(text) || command.intent === "query" && (command as FinancialIntent & { query?: string }).query === "balance") {
+    const reply = await balanceText(link.householdId);
     await commitUpdate(updateId);
-    return { text: await balanceText(link.householdId) };
+    return { text: reply };
   }
 
   const context = await loadHouseholdContext(link.householdId);
@@ -244,8 +247,9 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
   const selectedCard = context.cards.find((item) => item.id === prepared.cardId);
   const selectedSubcategory = context.subcategories.find((item) => item.id === prepared.subcategoryId);
   const selectedCategory = context.categories.find((item) => item.id === prepared.categoryId);
+  const reply = confirmationText(prepared, selectedAccount?.name, selectedCard?.name, selectedSubcategory?.name ?? selectedCategory?.name);
   await saveState(updateId, telegramUserId, link.householdId, { phase: "confirming", financialIntent: prepared, originalText, originalUpdateId });
-  return { text: confirmationText(prepared, selectedAccount?.name, selectedCard?.name, selectedSubcategory?.name ?? selectedCategory?.name), buttons: confirmationButtons };
+  return { text: reply, buttons: confirmationButtons };
 }
 
 export function isTelegramPayloadTooLarge(request: Request) {

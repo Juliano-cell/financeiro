@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { hasTelegramDeliveryFailure } from "../lib/telegram-delivery.mjs";
 
 function database() {
   const db = new DatabaseSync(":memory:");
@@ -98,4 +99,34 @@ test("handler exige confirmação, auditoria, household e payload limitado", () 
   assert.match(handler, /phase: "confirming"/); assert.match(handler, /clearTelegramStateFor/); assert.match(handler, /eq\(householdMembers\.status, "active"\)/);
   assert.match(service, /INSERT INTO audit_logs/); assert.match(service, /INSERT INTO telegram_processed_updates/); assert.match(service, /env\.DB\.batch|d1\.batch/);
   assert.match(webhook, /16_384/); assert.match(webhook, /safeSecretEqual/); assert.doesNotMatch(webhook, /TELEGRAM_BOT_TOKEN/);
+});
+
+test("webhook retorna 5xx antes do commit e mantém 2xx quando apenas a entrega ao Telegram falha", async () => {
+  const webhook = readFileSync(new URL("../app/api/telegram/webhook/route.ts", import.meta.url), "utf8");
+  const processing = webhook.indexOf("await handleTelegramUpdate(update)");
+  const delivery = webhook.indexOf("await hasTelegramDeliveryFailure(deliveries)");
+  assert.ok(processing >= 0 && delivery > processing);
+  assert.match(webhook, /telegram_webhook_processing_failed/);
+  assert.match(webhook, /status: 503/);
+  assert.match(webhook, /telegram_webhook_response_failed/);
+  assert.match(webhook, /responseDeliveryFailed: true/);
+  assert.equal(await hasTelegramDeliveryFailure([Promise.resolve()]), false);
+  assert.equal(await hasTelegramDeliveryFailure([Promise.reject(new Error("Telegram indisponível"))]), true);
+});
+
+test("callback query é reconhecida sem transformar falha de confirmação visual em retry", () => {
+  const webhook = readFileSync(new URL("../app/api/telegram/webhook/route.ts", import.meta.url), "utf8");
+  const telegram = readFileSync(new URL("../lib/telegram.ts", import.meta.url), "utf8");
+  assert.match(webhook, /answerTelegramCallback\(callbackQueryId\)/);
+  assert.match(webhook, /hasTelegramDeliveryFailure\(deliveries\)/);
+  assert.match(telegram, /answerCallbackQuery/);
+  assert.match(telegram, /callback_query_id: callbackQueryId/);
+});
+
+test("handler não deixa operação falível relevante depois de confirmação isolada do update", () => {
+  const handler = readFileSync(new URL("../lib/telegram-handler.ts", import.meta.url), "utf8");
+  const balanceRead = handler.indexOf("const reply = await balanceText(link.householdId)");
+  const balanceCommit = handler.indexOf("await commitUpdate(updateId)", balanceRead);
+  assert.ok(balanceRead >= 0 && balanceCommit > balanceRead);
+  assert.match(handler, /catch \{ console\.error\("telegram_rate_limit_cleanup_failed"\); \}/);
 });

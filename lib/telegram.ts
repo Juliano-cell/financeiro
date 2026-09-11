@@ -8,4 +8,10 @@ export async function sendTelegramMessage(chatId: string, text: string, buttons?
   if (!response.ok) throw new Error(`Telegram respondeu ${response.status}.`);
 }
 
+export async function answerTelegramCallback(callbackQueryId: string) {
+  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN não configurado.");
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ callback_query_id: callbackQueryId }) });
+  if (!response.ok) throw new Error(`Telegram respondeu ${response.status}.`);
+}
+
 export const formatBrl = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);

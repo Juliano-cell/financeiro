@@ -2,7 +2,8 @@ import { env } from "cloudflare:workers";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { handleTelegramUpdate, isDuplicateTelegramError, isTelegramPayloadTooLarge } from "@/lib/telegram-handler";
-import { sendTelegramMessage } from "@/lib/telegram";
+import { hasTelegramDeliveryFailure } from "@/lib/telegram-delivery.mjs";
+import { answerTelegramCallback, sendTelegramMessage } from "@/lib/telegram";
 
 export const dynamic = "force-dynamic";
 
@@ -29,17 +30,27 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "JSON inválido." }, { status: 400 });
   }
+  const candidate = update as { message?: { chat?: { id?: number | string } }; callback_query?: { id?: string; message?: { chat?: { id?: number | string } } } };
+  const chatId = String(candidate.message?.chat?.id ?? candidate.callback_query?.message?.chat?.id ?? "");
+  const callbackQueryId = candidate.callback_query?.id;
+  let result: Awaited<ReturnType<typeof handleTelegramUpdate>>;
   try {
-    const result = await handleTelegramUpdate(update);
-    if (result.duplicate) return NextResponse.json({ ok: true, duplicate: true });
-    const candidate = update as { message?: { chat?: { id?: number | string } }; callback_query?: { message?: { chat?: { id?: number | string } } } };
-    const chatId = String(candidate.message?.chat?.id ?? candidate.callback_query?.message?.chat?.id ?? "");
-    if (result.text && chatId) await sendTelegramMessage(chatId, result.text, result.buttons);
-    return NextResponse.json({ ok: true });
+    result = await handleTelegramUpdate(update);
   } catch (error) {
-    if (isDuplicateTelegramError(error)) return NextResponse.json({ ok: true, duplicate: true });
-    if (error instanceof z.ZodError) return NextResponse.json({ error: "Payload inválido." }, { status: 400 });
-    console.error("telegram_webhook_failed");
-    return NextResponse.json({ ok: true });
+    if (isDuplicateTelegramError(error)) result = { duplicate: true };
+    else if (error instanceof z.ZodError) return NextResponse.json({ error: "Payload inválido." }, { status: 400 });
+    else {
+      console.error("telegram_webhook_processing_failed");
+      return NextResponse.json({ error: "Falha temporária ao processar o update." }, { status: 503 });
+    }
   }
+
+  const deliveries: Promise<void>[] = [];
+  if (callbackQueryId) deliveries.push(answerTelegramCallback(callbackQueryId));
+  if (!result.duplicate && result.text && chatId) deliveries.push(sendTelegramMessage(chatId, result.text, result.buttons));
+  const responseDeliveryFailed = await hasTelegramDeliveryFailure(deliveries);
+  if (responseDeliveryFailed) console.error("telegram_webhook_response_failed");
+
+  if (result.duplicate) return NextResponse.json({ ok: true, duplicate: true, ...(responseDeliveryFailed ? { responseDeliveryFailed: true } : {}) });
+  return NextResponse.json({ ok: true, ...(responseDeliveryFailed ? { responseDeliveryFailed: true } : {}) });
 }
