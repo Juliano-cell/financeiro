@@ -33,7 +33,8 @@ O código de recuperação é mostrado uma única vez após cadastro ou redefini
 
 Os arquivos abaixo preparam uma implantação em uma conta Cloudflare própria:
 
-- `wrangler.production.jsonc.example`: modelo do Worker, assets e binding D1;
+- `wrangler.production.jsonc`: configuração do Worker e do D1 pessoal selecionado;
+- `wrangler.production.jsonc.example`: modelo para uma futura troca de conta ou banco;
 - `.env.example`: variáveis da aplicação, sem valores secretos;
 - `docs/DEPLOYMENT-INDEPENDENT.md`: serviços, credenciais e procedimento de implantação;
 - `docs/DATA-MIGRATION.md`: exportação e migração dos dados sem sobrescrever a origem.

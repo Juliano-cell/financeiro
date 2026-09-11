@@ -24,8 +24,8 @@ Essa arquitetura não exige conta, login, chave ou cabeçalho do ChatGPT/OpenAI.
 1. Crie uma conta Cloudflare sob seu controle e clone o repositório do GitHub em uma máquina confiável.
 2. Execute `npm ci` (ou `npm run install:ci` neste projeto).
 3. Autentique o Wrangler com `npx wrangler login`. Em CI, use um token de API limitado à conta e ao projeto.
-4. Crie o banco: `npx wrangler d1 create nossa-casa-financas`.
-5. Copie `wrangler.production.jsonc.example` para `wrangler.production.jsonc` e substitua `SUBSTITUA_PELO_ID_DO_SEU_D1` pelo identificador retornado. O arquivo real é ignorado pelo Git.
+4. O banco pessoal selecionado já existe com o nome `financeiro-prod`.
+5. O arquivo versionado `wrangler.production.jsonc` já contém o binding `DB` e o identificador desse banco. Use `wrangler.production.jsonc.example` somente como modelo se trocar de conta ou banco no futuro.
 6. Execute `npm run check:independent`, `npm run typecheck`, `npm test` e `npm run build`.
 7. Aplique somente no banco novo: `npm run db:migrate:independent`.
 8. Antes de importar usuários antigos, configure um segredo temporário com `npx wrangler secret put LEGACY_ACCOUNT_CLAIM_SECRET --config wrangler.production.jsonc`.
@@ -42,9 +42,9 @@ Nenhum desses comandos deve apontar para o banco antigo. Confirme sempre o `data
 | `LEGACY_ACCOUNT_CLAIM_SECRET` | Segredo de runtime para o primeiro vínculo de contas importadas | Temporário durante a migração |
 | `CLOUDFLARE_API_TOKEN` | Automação/CI de build, migração e deploy | Somente em CI |
 | `CLOUDFLARE_ACCOUNT_ID` | Seleção da conta em automações que não consigam inferi-la | Conforme o ambiente |
-| `database_id` | Binding `DB` em `wrangler.production.jsonc` | Sim |
+| `database_id` | Binding `DB` em `wrangler.production.jsonc`; é um identificador de recurso, não uma credencial | Sim |
 
-Nunca salve valores reais no GitHub. O arquivo `.env.example` documenta apenas o nome do segredo da aplicação.
+Nunca salve tokens ou segredos reais no GitHub. O identificador do D1 pode ser versionado; ele não permite acesso sem autenticação na conta Cloudflare. O arquivo `.env.example` documenta apenas o nome do segredo da aplicação.
 
 ## Reconstrução a partir de `C:\projeto`
 

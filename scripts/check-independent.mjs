@@ -22,6 +22,7 @@ for (const file of [
   "package.json",
   "package-lock.json",
   "vite.config.ts",
+  "wrangler.production.jsonc",
   "wrangler.production.jsonc.example",
   "db/schema.ts",
   "db/index.ts",
@@ -41,8 +42,10 @@ const viteConfig = readFileSync(path.join(root, "vite.config.ts"), "utf8");
 if (/\.openai\/|hosting\.json|sites-vite-plugin/u.test(viteConfig)) failures.push("O build padrão ainda depende da configuração do Sites.");
 const packageAndInstall = ["package.json", "scripts/install-ci.mjs"].map((file) => readFileSync(path.join(root, file), "utf8")).join("\n");
 if (/sites-env|sites-vite-plugin|hosting\.json/u.test(packageAndInstall)) failures.push("Um comando padrão ainda depende de um auxiliar do Sites.");
-const deploymentExample = readFileSync(path.join(root, "wrangler.production.jsonc.example"), "utf8");
-if (!/"binding"\s*:\s*"DB"/u.test(deploymentExample)) failures.push("A configuração independente não declara o binding D1 DB.");
+const deploymentConfig = readFileSync(path.join(root, "wrangler.production.jsonc"), "utf8");
+if (!/"binding"\s*:\s*"DB"/u.test(deploymentConfig)) failures.push("A configuração independente não declara o binding D1 DB.");
+if (!/"database_name"\s*:\s*"financeiro-prod"/u.test(deploymentConfig)) failures.push("A configuração independente não aponta para o D1 financeiro-prod.");
+if (!/"database_id"\s*:\s*"a57807df-cb08-40a8-bb56-5e0477a869be"/u.test(deploymentConfig)) failures.push("A configuração independente não contém o ID esperado do D1 pessoal.");
 
 if (failures.length) {
   console.error(failures.join("\n"));
