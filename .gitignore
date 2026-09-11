@@ -30,6 +30,10 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+/wrangler.production.jsonc
+/migration-backups/
+/migration-import.sql
 
 # vercel
 .vercel
@@ -40,6 +44,7 @@ next-env.d.ts
 /dist/
 /.wrangler/
 /.sites-runtime/
+/.runtime-state/
 /.agents/
 /.codex/
 /outputs/

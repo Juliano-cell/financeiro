@@ -2,6 +2,8 @@
 
 Sistema de controle financeiro familiar construído com Vinext, React, TypeScript e Cloudflare D1.
 
+A aplicação tem autenticação própria e não usa a conta ChatGPT do visitante. O código de execução e o build padrão também não dependem de login ChatGPT nem do domínio `chatgpt.site`. O arquivo `.openai/hosting.json` foi mantido somente como referência temporária do ambiente antigo, necessária para uma futura migração controlada; ele não é lido pelo build padrão.
+
 ## Execução local
 
 Requisitos: Node.js 22.13 ou mais recente.
@@ -9,35 +11,46 @@ Requisitos: Node.js 22.13 ou mais recente.
 ```powershell
 npm run install:ci
 npm run build
-node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_family_finance.sql
-node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_sharp_barracuda.sql
+node --import ./scripts/runtime-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_family_finance.sql
+node --import ./scripts/runtime-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_sharp_barracuda.sql
 npm run dev
 ```
 
 Abra `http://localhost:5173`. Não repita migrações já aplicadas no mesmo banco local.
 
-## Autenticação
+## Autenticação e isolamento familiar
 
-A aplicação possui autenticação própria e não usa a conta ChatGPT do visitante:
+- Senhas são armazenadas como PBKDF2-SHA-256 com salt individual e 310.000 iterações.
+- Cookies de sessão são `HttpOnly`, `SameSite=Lax` e `Secure` em HTTPS; o banco guarda somente o hash do token.
+- Redefinições de senha revogam as sessões anteriores e trocam o código de recuperação.
+- Contas antigas exigem `LEGACY_ACCOUNT_CLAIM_SECRET` somente no primeiro vínculo de senha.
+- A família é resolvida no servidor pela sessão e pela associação ativa em `household_members`; consultas e alterações financeiras filtram por `household_id`.
+- Convites usam códigos aleatórios, armazenados somente como hash, e expiram em sete dias.
 
-- senhas são armazenadas como PBKDF2-SHA-256 com salt individual e 310.000 iterações;
-- cookies de sessão são `HttpOnly`, `SameSite=Lax` e `Secure` em HTTPS;
-- somente o hash do token de sessão é armazenado no banco;
-- redefinições revogam todas as sessões anteriores e trocam o código de recuperação;
-- tentativas de autenticação são limitadas por janela de tempo;
-- contas antigas exigem `LEGACY_ACCOUNT_CLAIM_SECRET` para o primeiro vínculo de senha;
-- em ambiente local, o código de ativação de desenvolvimento é `DESENVOLVIMENTO-LOCAL`.
+O código de recuperação é mostrado uma única vez após cadastro ou redefinição e deve ser guardado em local seguro. No ambiente local, o código de ativação de desenvolvimento é `DESENVOLVIMENTO-LOCAL`.
 
-O código de recuperação é exibido uma única vez após cadastro ou redefinição. Ele deve ser guardado em local seguro.
+## Hospedagem independente
 
-## Isolamento familiar
+Os arquivos abaixo preparam uma implantação em uma conta Cloudflare própria:
 
-O servidor resolve a família a partir da sessão e da associação ativa em `household_members`. Todas as consultas e alterações financeiras incluem o `household_id` dessa associação. Convites utilizam códigos aleatórios, armazenados apenas como hash, e expiram em sete dias.
+- `wrangler.production.jsonc.example`: modelo do Worker, assets e binding D1;
+- `.env.example`: variáveis da aplicação, sem valores secretos;
+- `docs/DEPLOYMENT-INDEPENDENT.md`: serviços, credenciais e procedimento de implantação;
+- `docs/DATA-MIGRATION.md`: exportação e migração dos dados sem sobrescrever a origem.
 
-## Comandos
+Comandos de validação e implantação:
 
-- `npm run dev`: servidor local na porta 5173;
-- `npm run build`: compilação de produção;
-- `npx tsc --noEmit`: verificação de tipos;
-- `node --test tests/*.test.mjs`: testes de banco e autenticação;
-- `npm run db:generate`: cria uma nova migração após alterações de esquema.
+```powershell
+npm run check:independent
+npm run typecheck
+npm test
+npm run build
+npm run db:migrate:independent
+npm run deploy:independent
+```
+
+Os dois últimos comandos só devem ser executados depois de criar `wrangler.production.jsonc` com o banco D1 da conta própria.
+
+## Conteúdo do GitHub
+
+O repositório contém o código-fonte, lockfile, esquema e migrações necessários para reconstruir a aplicação. Por segurança, banco de dados, backups, credenciais, configuração real de produção, dependências instaladas e artefatos de build não são versionados.
