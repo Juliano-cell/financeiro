@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { digestToken, generateOpaqueToken, generateRecoveryCode, hashPassword, normalizeRecoveryCode, verifyPassword } from "../lib/auth-crypto.mjs";
+import { PASSWORD_HASH_ITERATIONS, digestToken, generateOpaqueToken, generateRecoveryCode, hashPassword, normalizeRecoveryCode, verifyPassword } from "../lib/auth-crypto.mjs";
 
 function database() {
   const db = new DatabaseSync(":memory:");
@@ -26,6 +26,7 @@ async function createAccount(db, id, email, password = "Senha segura 123") {
 }
 
 test("cadastro guarda hash seguro e nunca a senha em texto puro", async () => {
+  assert.equal(PASSWORD_HASH_ITERATIONS, 100_000, "Cloudflare Workers aceita no máximo 100.000 iterações de PBKDF2");
   const db = database();
   const account = await createAccount(db, "user_a", "a@example.com");
   const stored = db.prepare("SELECT password_hash FROM password_credentials WHERE user_id=?").get("user_a").password_hash;
