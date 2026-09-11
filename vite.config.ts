@@ -1,5 +1,5 @@
 import vinext from "vinext";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 
 const LOCAL_PLACEHOLDER_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
@@ -19,6 +19,31 @@ const localBindingConfig = {
   ],
   r2_buckets: [],
 };
+
+// Work around vinext#2794 until a release containing its upstream fix is used.
+// Installed vinext shims otherwise form circular client chunks that abort hydration.
+const vinextShimsSingleChunk = {
+  name: "vinext-shims-single-chunk",
+  configEnvironment(name) {
+    if (name !== "client") return;
+    return {
+      build: {
+        rolldownOptions: {
+          output: {
+            codeSplitting: {
+              groups: [
+                {
+                  name: "vinext-shims",
+                  test: /[\\/]node_modules[\\/]vinext[\\/]dist[\\/]shims[\\/]/,
+                },
+              ],
+            },
+          },
+        },
+      },
+    };
+  },
+} satisfies Plugin;
 
 export default defineConfig(async () => {
   // Use Miniflare's local Request.cf placeholder unless fetching is requested.
@@ -40,6 +65,7 @@ export default defineConfig(async () => {
       ? { watch: { useFsEvents: false, usePolling: true } }
       : undefined,
     plugins: [
+      vinextShimsSingleChunk,
       vinext(),
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
