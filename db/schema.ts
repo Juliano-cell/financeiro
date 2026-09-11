@@ -5,6 +5,38 @@ export const users = sqliteTable("users", {
   status: text("status", { enum: ["active", "inactive"] }).notNull().default("active"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 }, (table) => [uniqueIndex("users_email_unique").on(table.email)]);
 
+export const passwordCredentials = sqliteTable("password_credentials", {
+  userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  passwordHash: text("password_hash").notNull(),
+  passwordChangedAt: text("password_changed_at").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const sessions = sqliteTable("sessions", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  expiresAt: text("expires_at").notNull(),
+  revokedAt: text("revoked_at"),
+  createdAt: text("created_at").notNull(),
+  lastSeenAt: text("last_seen_at").notNull(),
+}, (table) => [index("idx_sessions_user").on(table.userId), index("idx_sessions_expires").on(table.expiresAt)]);
+
+export const passwordRecoveryCodes = sqliteTable("password_recovery_codes", {
+  userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  codeHash: text("code_hash").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const authRateLimits = sqliteTable("auth_rate_limits", {
+  key: text("key").primaryKey(),
+  attempts: integer("attempts").notNull().default(0),
+  windowStartedAt: text("window_started_at").notNull(),
+  blockedUntil: text("blocked_until"),
+  updatedAt: text("updated_at").notNull(),
+});
+
 export const households = sqliteTable("households", {
   id: text("id").primaryKey(), name: text("name").notNull(), createdBy: text("created_by").notNull().references(() => users.id), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 });
@@ -13,6 +45,13 @@ export const householdMembers = sqliteTable("household_members", {
   id: text("id").primaryKey(), householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }), userId: text("user_id").references(() => users.id), invitedEmail: text("invited_email"),
   role: text("role", { enum: ["owner", "member"] }).notNull().default("member"), status: text("status", { enum: ["active", "invited", "inactive"] }).notNull().default("invited"), joinedAt: text("joined_at"), createdAt: text("created_at").notNull(),
 }, (table) => [index("idx_household_members_household").on(table.householdId), index("idx_household_members_user").on(table.userId), index("idx_household_members_invited_email").on(table.invitedEmail)]);
+
+export const householdInviteTokens = sqliteTable("household_invite_tokens", {
+  memberId: text("member_id").primaryKey().references(() => householdMembers.id, { onDelete: "cascade" }),
+  tokenHash: text("token_hash").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [uniqueIndex("household_invite_tokens_hash_unique").on(table.tokenHash), index("idx_household_invite_tokens_expires").on(table.expiresAt)]);
 
 export const accounts = sqliteTable("accounts", {
   id: text("id").primaryKey(), householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }), name: text("name").notNull(),

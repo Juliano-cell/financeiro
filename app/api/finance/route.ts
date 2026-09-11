@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { and, asc, desc, eq, isNull } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
-import { getChatGPTUser } from "@/app/chatgpt-auth";
+import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { accounts, auditLogs, categories, householdMembers, households, subcategories, transactions, users } from "@/db/schema";
+import { accounts, auditLogs, categories, householdInviteTokens, householdMembers, households, subcategories, transactions, users } from "@/db/schema";
+import { digestToken, generateRecoveryCode, normalizeRecoveryCode } from "@/lib/auth-crypto.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -15,20 +16,11 @@ const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 
 async function currentIdentity() {
-  const auth = await getChatGPTUser();
-  if (!auth) return null;
+  const user = await getCurrentUser();
+  if (!user) return null;
   const db = getDb();
-  const existing = await db.select().from(users).where(eq(users.id, auth.userId)).limit(1);
-  const timestamp = now();
-  if (!existing[0]) {
-    await db.insert(users).values({ id: auth.userId, name: auth.fullName ?? auth.displayName, email: auth.email.toLowerCase(), createdAt: timestamp, updatedAt: timestamp });
-  } else if (existing[0].email !== auth.email.toLowerCase() || existing[0].name !== (auth.fullName ?? auth.displayName)) {
-    await db.update(users).set({ name: auth.fullName ?? auth.displayName, email: auth.email.toLowerCase(), updatedAt: timestamp }).where(eq(users.id, auth.userId));
-  }
-  const invited = await db.select().from(householdMembers).where(and(eq(householdMembers.invitedEmail, auth.email.toLowerCase()), eq(householdMembers.status, "invited"))).limit(1);
-  if (invited[0]) await db.update(householdMembers).set({ userId: auth.userId, status: "active", joinedAt: timestamp }).where(eq(householdMembers.id, invited[0].id));
-  const membership = await db.select().from(householdMembers).where(and(eq(householdMembers.userId, auth.userId), eq(householdMembers.status, "active"))).limit(1);
-  return { auth, db, membership: membership[0] ?? null };
+  const membership = await db.select().from(householdMembers).where(and(eq(householdMembers.userId, user.id), eq(householdMembers.status, "active"))).limit(1);
+  return { auth: { userId: user.id, displayName: user.name, email: user.email }, db, membership: membership[0] ?? null };
 }
 
 async function logChange(db: ReturnType<typeof getDb>, householdId: string, userId: string, action: string, entityType: string, entityId: string, oldData?: unknown, newData?: unknown) {
@@ -71,6 +63,7 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  if (!isSameOriginRequest(request)) return NextResponse.json({ error: "Origem da solicitação inválida." }, { status: 403 });
   try {
     const identity = await currentIdentity();
     if (!identity) return NextResponse.json({ error: "Não autenticado" }, { status: 401 });
@@ -98,6 +91,20 @@ export async function POST(request: Request) {
       await logChange(db, householdId, auth.userId, "create", "household", householdId, undefined, { name: parsed.name });
       return NextResponse.json({ ok: true, id: householdId });
     }
+    if (action === "accept_invite") {
+      if (membership) return NextResponse.json({ error: "Você já pertence a uma família." }, { status: 409 });
+      const parsed = z.object({ inviteCode: z.string().trim().min(16).max(80) }).parse(body);
+      const tokenHash = await digestToken(normalizeRecoveryCode(parsed.inviteCode));
+      const [invite] = await db.select().from(householdInviteTokens).where(eq(householdInviteTokens.tokenHash, tokenHash)).limit(1);
+      if (!invite || new Date(invite.expiresAt) <= new Date()) return NextResponse.json({ error: "Convite inválido ou expirado." }, { status: 400 });
+      const [member] = await db.select().from(householdMembers).where(eq(householdMembers.id, invite.memberId)).limit(1);
+      if (!member || member.status !== "invited" || member.invitedEmail?.toLowerCase() !== auth.email.toLowerCase()) return NextResponse.json({ error: "Este convite não pertence ao seu e-mail." }, { status: 403 });
+      const joinedAt = now();
+      await db.update(householdMembers).set({ userId: auth.userId, status: "active", joinedAt }).where(eq(householdMembers.id, member.id));
+      await db.delete(householdInviteTokens).where(eq(householdInviteTokens.memberId, member.id));
+      await logChange(db, member.householdId, auth.userId, "accept", "household_member", member.id, undefined, { email: auth.email });
+      return NextResponse.json({ ok: true });
+    }
     if (!membership) return NextResponse.json({ error: "Crie ou aceite uma família antes de continuar." }, { status: 409 });
     const householdId = membership.householdId;
 
@@ -105,10 +112,14 @@ export async function POST(request: Request) {
       if (membership.role !== "owner") return NextResponse.json({ error: "Apenas o responsável pode convidar membros." }, { status: 403 });
       const parsed = z.object({ email: z.string().email().transform((value) => value.toLowerCase()) }).parse(body);
       const duplicate = await db.select().from(householdMembers).where(and(eq(householdMembers.householdId, householdId), eq(householdMembers.invitedEmail, parsed.email))).limit(1);
-      if (duplicate[0]) return NextResponse.json({ error: "Este e-mail já foi adicionado." }, { status: 409 });
-      const memberId = uid("member"); await db.insert(householdMembers).values({ id: memberId, householdId, invitedEmail: parsed.email, role: "member", status: "invited", createdAt: now() });
+      if (duplicate[0]?.status === "active") return NextResponse.json({ error: "Este e-mail já pertence à família." }, { status: 409 });
+      const memberId = duplicate[0]?.id ?? uid("member");
+      if (!duplicate[0]) await db.insert(householdMembers).values({ id: memberId, householdId, invitedEmail: parsed.email, role: "member", status: "invited", createdAt: now() });
+      const inviteCode = generateRecoveryCode();
+      const createdAt = now();
+      await db.insert(householdInviteTokens).values({ memberId, tokenHash: await digestToken(normalizeRecoveryCode(inviteCode)), expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), createdAt }).onConflictDoUpdate({ target: householdInviteTokens.memberId, set: { tokenHash: await digestToken(normalizeRecoveryCode(inviteCode)), expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), createdAt } });
       await logChange(db, householdId, auth.userId, "invite", "household_member", memberId, undefined, { email: parsed.email });
-      return NextResponse.json({ ok: true, id: memberId });
+      return NextResponse.json({ ok: true, id: memberId, inviteCode });
     }
 
     if (action === "create_account") {
