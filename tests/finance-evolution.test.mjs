@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { buildInstallmentPlan, invoiceSchedule, parseBrazilianMoney, parseTelegramMessage, simulatePurchase, splitInstallments } from "../lib/finance-rules.mjs";
+import { buildInstallmentPlan, invoiceSchedule, parseBrazilianMoney, simulatePurchase, splitInstallments } from "../lib/finance-rules.mjs";
+import { parseTelegramMessage } from "../lib/telegram-parser.mjs";
 import { digestToken, hmacToken } from "../lib/auth-crypto.mjs";
 
 function database() {
@@ -111,14 +112,14 @@ test("pagamento integral é único e notification_log separa households", () => 
 test("código Telegram usa HMAC secreto, limite e consumo condicional", async () => {
   const digest = await digestToken("123456"); const first = await hmacToken("123456", "secret-a"); const second = await hmacToken("123456", "secret-b");
   assert.notEqual(first, digest); assert.notEqual(first, second);
-  const generator = readFileSync(new URL("../app/api/telegram/link-code/route.ts", import.meta.url), "utf8"); const webhook = readFileSync(new URL("../app/api/telegram/webhook/route.ts", import.meta.url), "utf8");
-  assert.match(generator, /consumeRateLimit\([^,]+, 5, 60 \* 60_000\)/); assert.match(generator, /hmacToken\(code, env\.TELEGRAM_LINK_CODE_SECRET\)/); assert.match(generator, /expiresInSeconds: 600/);
-  assert.match(webhook, /consumeRateLimit\(attemptKey, 5, 10 \* 60_000, 15 \* 60_000\)/); assert.match(webhook, /used_at IS NULL AND expires_at > \?/); assert.match(webhook, /consumed\.meta\.changes/);
+  const generator = readFileSync(new URL("../app/api/telegram/link-code/route.ts", import.meta.url), "utf8"); const linking = readFileSync(new URL("../lib/telegram-link-service.ts", import.meta.url), "utf8"); const handler = readFileSync(new URL("../lib/telegram-handler.ts", import.meta.url), "utf8");
+  assert.match(generator, /consumeRateLimit\([^,]+, 5, 60 \* 60_000\)/); assert.match(linking, /hmacToken\(code, env\.TELEGRAM_LINK_CODE_SECRET\)/); assert.match(linking, /expiresInSeconds: 600/);
+  assert.match(handler, /consumeRateLimit\(attemptKey, 5, 10 \* 60_000, 15 \* 60_000\)/); assert.match(linking, /used_at IS NULL AND expires_at > \?/); assert.match(linking, /codeChanges === 1/);
 });
 
 test("endpoints web forçam origin e validam relações também ao editar transação", () => {
   const advanced = readFileSync(new URL("../app/api/finance/advanced/route.ts", import.meta.url), "utf8"); const finance = readFileSync(new URL("../app/api/finance/route.ts", import.meta.url), "utf8");
-  assert.match(advanced, /origin: "web"/); assert.doesNotMatch(advanced, /origin: z\.enum/); assert.match(advanced, /env\.DB\.batch/);
+  assert.match(advanced, /createCardPurchase\(parsed, \{ householdId, userId: user\.id, origin: "dashboard" \}\)/); assert.doesNotMatch(advanced, /origin: z\.enum/); assert.match(advanced, /env\.DB\.batch/);
   assert.match(finance, /validateTransactionRelations\(db, householdId, parsed\)/); assert.match(finance, /subcategory\.categoryId !== values\.categoryId/);
 });
 

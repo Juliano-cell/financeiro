@@ -1,0 +1,178 @@
+import { env } from "cloudflare:workers";
+import { and, eq, inArray } from "drizzle-orm";
+import { getDb } from "@/db";
+import { accounts, cardInvoices, categories, creditCards, householdMembers, subcategories, telegramProcessedUpdates } from "@/db/schema";
+import { buildInstallmentPlan } from "@/lib/finance-rules.mjs";
+
+export class FinanceValidationError extends Error {}
+export class DuplicateTelegramUpdateError extends Error {}
+
+type Origin = "dashboard" | "telegram";
+type AuditSource = { updateId?: string; originalUpdateId?: string; originalText?: string; telegramUserId?: string };
+
+type TransactionInput = {
+  type: "income" | "expense";
+  amountCents: number;
+  description: string;
+  categoryId?: string | null;
+  subcategoryId?: string | null;
+  transactionDate: string;
+  transactionTime?: string | null;
+  accountId: string;
+  paymentMethod?: string | null;
+  status?: "confirmed" | "pending" | "cancelled";
+  notes?: string | null;
+};
+
+type CardPurchaseInput = {
+  cardId: string;
+  description: string;
+  totalCents: number;
+  purchaseDate: string;
+  installmentCount: number;
+  categoryId?: string | null;
+  notes?: string | null;
+};
+
+type CreationContext = {
+  householdId: string;
+  userId: string;
+  origin: Origin;
+  source?: AuditSource;
+  clearTelegramStateFor?: string;
+};
+
+const uid = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
+const timestamp = () => new Date().toISOString();
+
+function database() {
+  if (!env.DB) throw new Error("D1 binding indisponível");
+  return env.DB;
+}
+
+function assertText(value: string, label: string, maximum = 120) {
+  if (!value.trim() || value.trim().length > maximum) throw new FinanceValidationError(`${label} inválida.`);
+}
+
+function assertMoney(value: number) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 100_000_000_000) throw new FinanceValidationError("Valor inválido.");
+}
+
+function assertDate(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) throw new FinanceValidationError("Data inválida.");
+}
+
+async function validateMembership(householdId: string, userId: string) {
+  const db = getDb();
+  const [membership] = await db.select({ id: householdMembers.id }).from(householdMembers).where(and(eq(householdMembers.householdId, householdId), eq(householdMembers.userId, userId), eq(householdMembers.status, "active"))).limit(1);
+  if (!membership) throw new FinanceValidationError("Usuário não pertence mais a esta família.");
+}
+
+async function validateTransactionRelations(householdId: string, input: TransactionInput) {
+  const db = getDb();
+  const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, input.accountId), eq(accounts.householdId, householdId), eq(accounts.isActive, true))).limit(1);
+  if (!account) throw new FinanceValidationError("Conta inválida.");
+  let category: typeof categories.$inferSelect | undefined;
+  if (input.categoryId) {
+    [category] = await db.select().from(categories).where(and(eq(categories.id, input.categoryId), eq(categories.householdId, householdId), eq(categories.isActive, true))).limit(1);
+    if (!category || (category.type !== input.type && category.type !== "both")) throw new FinanceValidationError("Categoria inválida para este lançamento.");
+  }
+  if (input.subcategoryId) {
+    const [subcategory] = await db.select().from(subcategories).where(and(eq(subcategories.id, input.subcategoryId), eq(subcategories.householdId, householdId), eq(subcategories.isActive, true))).limit(1);
+    if (!subcategory || !category || subcategory.categoryId !== category.id) throw new FinanceValidationError("Subcategoria inválida.");
+  }
+}
+
+function sourcePayload(input: unknown, context: CreationContext) {
+  const source = context.source ? {
+    telegramUpdateId: context.source.updateId,
+    originalTelegramUpdateId: context.source.originalUpdateId,
+    telegramUserId: context.source.telegramUserId,
+    originalText: context.source.originalText?.slice(0, 1_000),
+  } : undefined;
+  return JSON.stringify({ input, ...(source ? { source } : {}) });
+}
+
+function idempotencyStatements(context: CreationContext, at: string) {
+  const d1 = database();
+  const statements: D1PreparedStatement[] = [];
+  if (context.source?.updateId) statements.push(d1.prepare("INSERT INTO telegram_processed_updates (update_id, received_at) VALUES (?, ?)").bind(context.source.updateId, at));
+  return statements;
+}
+
+function finalizeStatements(statements: D1PreparedStatement[], context: CreationContext) {
+  if (context.clearTelegramStateFor) statements.push(database().prepare("DELETE FROM telegram_conversation_states WHERE telegram_user_id = ? AND household_id = ?").bind(context.clearTelegramStateFor, context.householdId));
+  return statements;
+}
+
+async function runCreationBatch(statements: D1PreparedStatement[], updateId?: string) {
+  const d1 = database();
+  try {
+    await d1.batch(statements);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (updateId && /telegram_processed_updates|UNIQUE constraint failed.*update_id/iu.test(message)) throw new DuplicateTelegramUpdateError("Update do Telegram já processado.");
+    throw error;
+  }
+}
+
+export async function isTelegramUpdateProcessed(updateId: string) {
+  const db = getDb();
+  const [processed] = await db.select({ updateId: telegramProcessedUpdates.updateId }).from(telegramProcessedUpdates).where(eq(telegramProcessedUpdates.updateId, updateId)).limit(1);
+  return Boolean(processed);
+}
+
+export async function createTransaction(input: TransactionInput, context: CreationContext) {
+  assertText(input.description, "Descrição");
+  assertMoney(input.amountCents);
+  assertDate(input.transactionDate);
+  await validateMembership(context.householdId, context.userId);
+  await validateTransactionRelations(context.householdId, input);
+  const at = timestamp();
+  const transactionId = uid("transaction");
+  const auditId = uid("audit");
+  const d1 = database();
+  const statements = idempotencyStatements(context, at);
+  statements.push(
+    d1.prepare("INSERT INTO transactions (id, household_id, type, amount_cents, description, category_id, subcategory_id, transaction_date, transaction_time, responsible_user_id, account_id, payment_method, status, origin, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(transactionId, context.householdId, input.type, input.amountCents, input.description.trim(), input.categoryId ?? null, input.subcategoryId ?? null, input.transactionDate, input.transactionTime ?? null, context.userId, input.accountId, input.paymentMethod ?? null, input.status ?? "confirmed", context.origin, input.notes ?? null, at, at),
+    d1.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) VALUES (?, ?, ?, 'create', 'transaction', ?, NULL, ?, ?)").bind(auditId, context.householdId, context.userId, transactionId, sourcePayload(input, context), at),
+  );
+  await runCreationBatch(finalizeStatements(statements, context), context.source?.updateId);
+  return { id: transactionId };
+}
+
+export async function createCardPurchase(input: CardPurchaseInput, context: CreationContext) {
+  assertText(input.description, "Descrição");
+  assertMoney(input.totalCents);
+  assertDate(input.purchaseDate);
+  if (!Number.isInteger(input.installmentCount) || input.installmentCount < 1 || input.installmentCount > 120) throw new FinanceValidationError("Número de parcelas inválido.");
+  await validateMembership(context.householdId, context.userId);
+  const db = getDb();
+  const [card] = await db.select().from(creditCards).where(and(eq(creditCards.id, input.cardId), eq(creditCards.householdId, context.householdId), eq(creditCards.isActive, true))).limit(1);
+  if (!card) throw new FinanceValidationError("Cartão inválido.");
+  if (input.categoryId) {
+    const [category] = await db.select().from(categories).where(and(eq(categories.id, input.categoryId), eq(categories.householdId, context.householdId), eq(categories.isActive, true))).limit(1);
+    if (!category || (category.type !== "expense" && category.type !== "both")) throw new FinanceValidationError("Categoria inválida para esta compra.");
+  }
+  const plan = buildInstallmentPlan({ totalCents: input.totalCents, count: input.installmentCount, purchaseDate: input.purchaseDate, closingDay: card.closingDay, dueDay: card.dueDay });
+  const months = [...new Set(plan.map((part: { referenceMonth: string }) => part.referenceMonth))];
+  const existing = months.length ? await db.select().from(cardInvoices).where(and(eq(cardInvoices.householdId, context.householdId), eq(cardInvoices.cardId, card.id), inArray(cardInvoices.referenceMonth, months))) : [];
+  const invoiceByMonth = new Map(existing.map((invoice) => [invoice.referenceMonth, invoice]));
+  const at = timestamp();
+  const purchaseId = uid("purchase");
+  const d1 = database();
+  const statements = idempotencyStatements(context, at);
+  statements.push(d1.prepare("INSERT INTO card_purchases (id, household_id, card_id, description, total_cents, purchase_date, installment_count, category_id, notes, status, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)").bind(purchaseId, context.householdId, card.id, input.description.trim(), input.totalCents, input.purchaseDate, input.installmentCount, input.categoryId ?? null, input.notes ?? null, context.userId, context.origin === "telegram" ? "telegram" : "web", at, at));
+  for (const part of plan as Array<{ referenceMonth: string; dueDate: string; installmentNumber: number; installmentCount: number; amountCents: number }>) {
+    let invoice = invoiceByMonth.get(part.referenceMonth);
+    if (!invoice) {
+      invoice = { id: uid("invoice"), householdId: context.householdId, cardId: card.id, referenceMonth: part.referenceMonth, dueDate: part.dueDate, status: "open", paidAt: null, createdAt: at, updatedAt: at };
+      invoiceByMonth.set(part.referenceMonth, invoice);
+      statements.push(d1.prepare("INSERT INTO card_invoices (id, household_id, card_id, reference_month, due_date, status, paid_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, ?)").bind(invoice.id, context.householdId, card.id, part.referenceMonth, part.dueDate, at, at));
+    }
+    statements.push(d1.prepare("INSERT INTO card_installments (id, household_id, purchase_id, invoice_id, installment_number, installment_count, amount_cents, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)").bind(uid("installment"), context.householdId, purchaseId, invoice.id, part.installmentNumber, part.installmentCount, part.amountCents, at, at));
+  }
+  statements.push(d1.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) VALUES (?, ?, ?, 'create', 'card_purchase', ?, NULL, ?, ?)").bind(uid("audit"), context.householdId, context.userId, purchaseId, sourcePayload(input, context), at));
+  await runCreationBatch(finalizeStatements(statements, context), context.source?.updateId);
+  return { id: purchaseId, plan, cardName: card.name };
+}

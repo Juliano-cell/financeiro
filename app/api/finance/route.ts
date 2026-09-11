@@ -5,6 +5,7 @@ import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
 import { accounts, auditLogs, categories, householdInviteTokens, householdMembers, households, invoicePayments, subcategories, transactions, users } from "@/db/schema";
 import { digestToken, generateRecoveryCode, normalizeRecoveryCode } from "@/lib/auth-crypto.mjs";
+import { createTransaction, FinanceValidationError } from "@/lib/finance-service";
 
 export const dynamic = "force-dynamic";
 
@@ -167,8 +168,9 @@ export async function POST(request: Request) {
     if (body.subcategoryId === "none") body.subcategoryId = null;
     const transactionInput = z.object({ type: z.enum(["income", "expense"]), amountCents: money.min(1), description: text, categoryId: id.nullable().optional(), subcategoryId: id.nullable().optional(), transactionDate: date, transactionTime: z.string().regex(/^\d{2}:\d{2}$/).nullable().optional(), accountId: id, paymentMethod: z.string().max(60).nullable().optional(), status: z.enum(["confirmed", "pending", "cancelled"]), notes: z.string().max(500).nullable().optional() });
     if (action === "create_transaction") {
-      const parsed = transactionInput.parse(body); const relationError = await validateTransactionRelations(db, householdId, parsed); if (relationError) return NextResponse.json({ error: relationError }, { status: 400 });
-      const entityId = uid("transaction"), timestamp = now(); await db.insert(transactions).values({ id: entityId, householdId, ...parsed, responsibleUserId: auth.userId, origin: "dashboard", createdAt: timestamp, updatedAt: timestamp }); await logChange(db, householdId, auth.userId, "create", "transaction", entityId, undefined, parsed); return NextResponse.json({ ok: true, id: entityId });
+      const parsed = transactionInput.parse(body);
+      const result = await createTransaction(parsed, { householdId, userId: auth.userId, origin: "dashboard" });
+      return NextResponse.json({ ok: true, id: result.id });
     }
     if (action === "update_transaction") {
       const parsed = transactionInput.extend({ id }).parse(body); const [before] = await db.select().from(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))).limit(1); if (!before) return NextResponse.json({ error: "Movimentação não encontrada." }, { status: 404 }); const relationError = await validateTransactionRelations(db, householdId, parsed); if (relationError) return NextResponse.json({ error: relationError }, { status: 400 }); const { id: transactionId, ...values } = parsed; await db.update(transactions).set({ ...values, updatedAt: now() }).where(and(eq(transactions.id, transactionId), eq(transactions.householdId, householdId))); await logChange(db, householdId, auth.userId, "update", "transaction", transactionId, before, values); return NextResponse.json({ ok: true });
@@ -178,6 +180,7 @@ export async function POST(request: Request) {
     }
     return NextResponse.json({ error: "Ação inválida." }, { status: 400 });
   } catch (error) {
+    if (error instanceof FinanceValidationError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof z.ZodError) return NextResponse.json({ error: "Dados inválidos.", details: error.flatten() }, { status: 400 });
     console.error("finance_action_failed", error);
     return NextResponse.json({ error: "Não foi possível concluir a operação." }, { status: 500 });

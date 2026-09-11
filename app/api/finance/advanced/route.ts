@@ -6,6 +6,7 @@ import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
 import { accounts, bills, cardInstallments, cardInvoices, cardPurchases, categories, creditCards, householdMembers, invoicePayments, notificationPreferences, recurringBillSeries, transactions } from "@/db/schema";
 import { addMonths, buildInstallmentPlan, simulatePurchase } from "@/lib/finance-rules.mjs";
+import { createCardPurchase, FinanceValidationError } from "@/lib/finance-service";
 
 export const dynamic = "force-dynamic";
 
@@ -23,14 +24,6 @@ async function identity() {
   const db = getDb();
   const [membership] = await db.select().from(householdMembers).where(and(eq(householdMembers.userId, user.id), eq(householdMembers.status, "active"))).limit(1);
   return membership ? { db, user, householdId: membership.householdId } : null;
-}
-
-async function getInvoice(db: ReturnType<typeof getDb>, householdId: string, cardId: string, referenceMonth: string, dueDate: string, timestamp: string) {
-  const [existing] = await db.select().from(cardInvoices).where(and(eq(cardInvoices.cardId, cardId), eq(cardInvoices.referenceMonth, referenceMonth), eq(cardInvoices.householdId, householdId))).limit(1);
-  if (existing) return existing;
-  const invoice = { id: uid("invoice"), householdId, cardId, referenceMonth, dueDate, status: "open" as const, createdAt: timestamp, updatedAt: timestamp };
-  await db.insert(cardInvoices).values(invoice);
-  return invoice;
 }
 
 export async function GET(request: Request) {
@@ -105,12 +98,8 @@ export async function POST(request: Request) {
     }
     if (action === "create_card_purchase") {
       const parsed = z.object({ cardId: id, description: shortText, totalCents: money, purchaseDate: dateSchema, installmentCount: z.number().int().min(1).max(120), categoryId: id.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
-      const [card] = await db.select().from(creditCards).where(and(eq(creditCards.id, parsed.cardId), eq(creditCards.householdId, householdId), eq(creditCards.isActive, true))).limit(1); if (!card) return NextResponse.json({ error: "Cartão inválido." }, { status: 400 });
-      if (parsed.categoryId) { const [category] = await db.select().from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
-      const purchaseId = uid("purchase"); await db.insert(cardPurchases).values({ ...parsed, id: purchaseId, householdId, createdByUserId: user.id, status: "active", origin: "web", createdAt: timestamp, updatedAt: timestamp });
-      const plan = buildInstallmentPlan({ totalCents: parsed.totalCents, count: parsed.installmentCount, purchaseDate: parsed.purchaseDate, closingDay: card.closingDay, dueDay: card.dueDay });
-      for (const part of plan) { const invoice = await getInvoice(db, householdId, card.id, part.referenceMonth, part.dueDate, timestamp); await db.insert(cardInstallments).values({ id: uid("installment"), householdId, purchaseId, invoiceId: invoice.id, installmentNumber: part.installmentNumber, installmentCount: part.installmentCount, amountCents: part.amountCents, status: "pending", createdAt: timestamp, updatedAt: timestamp }); }
-      return NextResponse.json({ ok: true, id: purchaseId, plan });
+      const result = await createCardPurchase(parsed, { householdId, userId: user.id, origin: "dashboard" });
+      return NextResponse.json({ ok: true, id: result.id, plan: result.plan });
     }
     if (action === "delete_card_purchase") {
       const parsed = z.object({ id }).parse(body); const [purchase] = await db.select().from(cardPurchases).where(and(eq(cardPurchases.id, parsed.id), eq(cardPurchases.householdId, householdId))).limit(1); if (!purchase) return NextResponse.json({ error: "Compra não encontrada." }, { status: 404 });
@@ -200,6 +189,7 @@ export async function POST(request: Request) {
     }
     return NextResponse.json({ error: "Ação inválida." }, { status: 400 });
   } catch (error) {
+    if (error instanceof FinanceValidationError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof z.ZodError) return NextResponse.json({ error: error.issues[0]?.message ?? "Dados inválidos.", details: error.flatten() }, { status: 400 });
     console.error("advanced_finance_failed", error); return NextResponse.json({ error: "Não foi possível concluir a operação." }, { status: 500 });
   }
