@@ -21,6 +21,9 @@
 # misc
 .DS_Store
 *.pem
+*.key
+*.p12
+*.pfx
 
 # debug
 npm-debug.log*
@@ -31,8 +34,20 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 !.env.example
+.dev.vars*
+!.dev.vars.example
 /migration-backups/
 /migration-import.sql
+/backups/
+
+# local databases
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
 
 # vercel
 .vercel
