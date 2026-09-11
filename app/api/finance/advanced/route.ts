@@ -1,0 +1,206 @@
+import { env } from "cloudflare:workers";
+import { NextResponse } from "next/server";
+import { and, asc, eq } from "drizzle-orm";
+import { z } from "zod";
+import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
+import { getDb } from "@/db";
+import { accounts, bills, cardInstallments, cardInvoices, cardPurchases, categories, creditCards, householdMembers, invoicePayments, notificationPreferences, recurringBillSeries, transactions } from "@/db/schema";
+import { addMonths, buildInstallmentPlan, simulatePurchase } from "@/lib/finance-rules.mjs";
+
+export const dynamic = "force-dynamic";
+
+const now = () => new Date().toISOString();
+const uid = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
+const id = z.string().min(1).max(100);
+const monthSchema = z.string().regex(/^\d{4}-\d{2}$/);
+const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+const money = z.number().int().safe().min(1).max(100_000_000_000);
+const shortText = z.string().trim().min(1).max(120);
+
+async function identity() {
+  const user = await getCurrentUser();
+  if (!user) return null;
+  const db = getDb();
+  const [membership] = await db.select().from(householdMembers).where(and(eq(householdMembers.userId, user.id), eq(householdMembers.status, "active"))).limit(1);
+  return membership ? { db, user, householdId: membership.householdId } : null;
+}
+
+async function getInvoice(db: ReturnType<typeof getDb>, householdId: string, cardId: string, referenceMonth: string, dueDate: string, timestamp: string) {
+  const [existing] = await db.select().from(cardInvoices).where(and(eq(cardInvoices.cardId, cardId), eq(cardInvoices.referenceMonth, referenceMonth), eq(cardInvoices.householdId, householdId))).limit(1);
+  if (existing) return existing;
+  const invoice = { id: uid("invoice"), householdId, cardId, referenceMonth, dueDate, status: "open" as const, createdAt: timestamp, updatedAt: timestamp };
+  await db.insert(cardInvoices).values(invoice);
+  return invoice;
+}
+
+export async function GET(request: Request) {
+  const current = await identity();
+  if (!current) return NextResponse.json({ error: "Não autenticado" }, { status: 401 });
+  const selectedMonth = new URL(request.url).searchParams.get("month") ?? new Date().toISOString().slice(0, 7);
+  if (!monthSchema.safeParse(selectedMonth).success) return NextResponse.json({ error: "Mês inválido." }, { status: 400 });
+  const { db, householdId } = current;
+  const [cardRows, purchaseRows, invoiceRows, installmentRows, billRows, paymentRows, accountRows, transactionRows, preferenceRows] = await Promise.all([
+    db.select().from(creditCards).where(eq(creditCards.householdId, householdId)).orderBy(asc(creditCards.name)),
+    db.select().from(cardPurchases).where(eq(cardPurchases.householdId, householdId)),
+    db.select().from(cardInvoices).where(eq(cardInvoices.householdId, householdId)),
+    db.select().from(cardInstallments).where(eq(cardInstallments.householdId, householdId)),
+    db.select().from(bills).where(eq(bills.householdId, householdId)).orderBy(asc(bills.dueDate)),
+    db.select().from(invoicePayments).where(eq(invoicePayments.householdId, householdId)),
+    db.select().from(accounts).where(eq(accounts.householdId, householdId)),
+    db.select().from(transactions).where(eq(transactions.householdId, householdId)),
+    db.select().from(notificationPreferences).where(eq(notificationPreferences.householdId, householdId)),
+  ]);
+  const purchaseById = new Map(purchaseRows.map((item) => [item.id, item]));
+  const invoiceById = new Map(invoiceRows.map((item) => [item.id, item]));
+  const installments = installmentRows.map((item) => ({ ...item, purchase: purchaseById.get(item.purchaseId), invoice: invoiceById.get(item.invoiceId), card: cardRows.find((card) => card.id === purchaseById.get(item.purchaseId)?.cardId) }));
+  const invoices = invoiceRows.map((invoice) => {
+    const parts = installments.filter((item) => item.invoiceId === invoice.id && item.status !== "cancelled");
+    return { ...invoice, totalCents: parts.reduce((sum, item) => sum + item.amountCents, 0), installments: parts };
+  });
+  const cards = cardRows.map((card) => {
+    const activeParts = installments.filter((item) => item.card?.id === card.id && item.status === "pending" && item.purchase?.status === "active");
+    const usedCents = activeParts.reduce((sum, item) => sum + item.amountCents, 0);
+    return { ...card, usedCents, availableCents: card.limitCents - usedCents, currentInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === selectedMonth)?.totalCents ?? 0, nextInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === addMonths(selectedMonth, 1))?.totalCents ?? 0, installmentPurchaseCount: new Set(activeParts.filter((item) => item.installmentCount > 1).map((item) => item.purchaseId)).size };
+  });
+  const accountBalances = new Map(accountRows.map((account) => [account.id, account.initialBalanceCents]));
+  for (const item of transactionRows) if (item.status === "confirmed") accountBalances.set(item.accountId, (accountBalances.get(item.accountId) ?? 0) + (item.type === "income" ? item.amountCents : -item.amountCents));
+  for (const payment of paymentRows) accountBalances.set(payment.accountId, (accountBalances.get(payment.accountId) ?? 0) - payment.amountCents);
+  const availableCents = accountRows.filter((item) => item.isActive).reduce((sum, item) => sum + (accountBalances.get(item.id) ?? 0), 0);
+  const monthTransactions = transactionRows.filter((item) => item.status === "confirmed" && item.transactionDate.startsWith(selectedMonth));
+  const monthInstallments = installments.filter((item) => item.invoice?.referenceMonth === selectedMonth && item.status !== "cancelled" && item.purchase?.status === "active");
+  const monthBills = billRows.filter((item) => item.dueDate.startsWith(selectedMonth) && item.status !== "cancelled");
+  const today = new Date().toISOString().slice(0, 10);
+  const pendingBillsCents = monthBills.filter((item) => item.status === "pending").reduce((sum, item) => sum + item.amountCents, 0);
+  const incomeCents = monthTransactions.filter((item) => item.type === "income").reduce((sum, item) => sum + item.amountCents, 0);
+  const cashExpenseCents = monthTransactions.filter((item) => item.type === "expense").reduce((sum, item) => sum + item.amountCents, 0);
+  const cardExpenseCents = monthInstallments.reduce((sum, item) => sum + item.amountCents, 0);
+  const preference = preferenceRows[0]; let notificationOffsets = [7, 3, 1, 0, -1]; try { if (preference) notificationOffsets = JSON.parse(preference.offsetsJson); } catch { /* defaults */ }
+  return NextResponse.json({ selectedMonth, cards, purchases: purchaseRows, invoices, installments, bills: billRows.map((bill) => ({ ...bill, displayStatus: bill.status === "pending" && bill.dueDate < today ? "overdue" : bill.status })), notificationSettings: { enabled: preference?.enabled ?? true, offsets: notificationOffsets }, summary: { availableCents, incomeCents, expenseCents: cashExpenseCents + cardExpenseCents, paidBillsCents: monthBills.filter((item) => item.status === "paid").reduce((sum, item) => sum + item.amountCents, 0), pendingBillsCents, cardCents: cardExpenseCents, installmentCents: monthInstallments.filter((item) => item.installmentCount > 1).reduce((sum, item) => sum + item.amountCents, 0), commitmentsCents: pendingBillsCents + cardExpenseCents, projectedCents: availableCents + (selectedMonth > new Date().toISOString().slice(0, 7) ? incomeCents : 0) - pendingBillsCents - cardExpenseCents } });
+}
+
+export async function POST(request: Request) {
+  if (!isSameOriginRequest(request)) return NextResponse.json({ error: "Origem da solicitação inválida." }, { status: 403 });
+  const current = await identity();
+  if (!current) return NextResponse.json({ error: "Não autenticado" }, { status: 401 });
+  try {
+    const body = await request.json() as Record<string, unknown>;
+    const action = z.string().parse(body.action);
+    const { db, householdId, user } = current;
+    const timestamp = now();
+    if (action === "create_card" || action === "update_card") {
+      const parsed = z.object({ id: id.optional(), name: shortText, institution: shortText, holder: shortText, limitCents: z.number().int().min(0), closingDay: z.number().int().min(1).max(31), dueDay: z.number().int().min(1).max(31), isActive: z.boolean().default(true), notes: z.string().trim().max(500).nullable().optional() }).parse(body);
+      if (action === "create_card") { const entityId = uid("card"); await db.insert(creditCards).values({ ...parsed, id: entityId, householdId, createdAt: timestamp, updatedAt: timestamp }); return NextResponse.json({ ok: true, id: entityId }); }
+      const [owned] = await db.select().from(creditCards).where(and(eq(creditCards.id, parsed.id!), eq(creditCards.householdId, householdId))).limit(1);
+      if (!owned) return NextResponse.json({ error: "Cartão não encontrado." }, { status: 404 });
+      const { id: entityId, ...changes } = parsed; await db.update(creditCards).set({ ...changes, updatedAt: timestamp }).where(and(eq(creditCards.id, entityId!), eq(creditCards.householdId, householdId))); return NextResponse.json({ ok: true });
+    }
+    if (action === "update_notification_settings") {
+      const parsed = z.object({ enabled: z.boolean(), offsets: z.array(z.union([z.literal(7), z.literal(3), z.literal(1), z.literal(0), z.literal(-1)])).max(5) }).parse(body); await db.insert(notificationPreferences).values({ householdId, enabled: parsed.enabled, offsetsJson: JSON.stringify([...new Set(parsed.offsets)]), updatedAt: timestamp }).onConflictDoUpdate({ target: notificationPreferences.householdId, set: { enabled: parsed.enabled, offsetsJson: JSON.stringify([...new Set(parsed.offsets)]), updatedAt: timestamp } }); return NextResponse.json({ ok: true });
+    }
+    if (action === "delete_card") {
+      const parsed = z.object({ id }).parse(body); const [owned] = await db.select().from(creditCards).where(and(eq(creditCards.id, parsed.id), eq(creditCards.householdId, householdId))).limit(1); if (!owned) return NextResponse.json({ error: "Cartão não encontrado." }, { status: 404 });
+      const [used] = await db.select({ id: cardPurchases.id }).from(cardPurchases).where(and(eq(cardPurchases.cardId, parsed.id), eq(cardPurchases.householdId, householdId))).limit(1);
+      if (used) { await db.update(creditCards).set({ isActive: false, updatedAt: timestamp }).where(and(eq(creditCards.id, parsed.id), eq(creditCards.householdId, householdId))); return NextResponse.json({ ok: true, inactivated: true }); }
+      await db.delete(creditCards).where(and(eq(creditCards.id, parsed.id), eq(creditCards.householdId, householdId))); return NextResponse.json({ ok: true });
+    }
+    if (action === "create_card_purchase") {
+      const parsed = z.object({ cardId: id, description: shortText, totalCents: money, purchaseDate: dateSchema, installmentCount: z.number().int().min(1).max(120), categoryId: id.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      const [card] = await db.select().from(creditCards).where(and(eq(creditCards.id, parsed.cardId), eq(creditCards.householdId, householdId), eq(creditCards.isActive, true))).limit(1); if (!card) return NextResponse.json({ error: "Cartão inválido." }, { status: 400 });
+      if (parsed.categoryId) { const [category] = await db.select().from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
+      const purchaseId = uid("purchase"); await db.insert(cardPurchases).values({ ...parsed, id: purchaseId, householdId, createdByUserId: user.id, status: "active", origin: "web", createdAt: timestamp, updatedAt: timestamp });
+      const plan = buildInstallmentPlan({ totalCents: parsed.totalCents, count: parsed.installmentCount, purchaseDate: parsed.purchaseDate, closingDay: card.closingDay, dueDay: card.dueDay });
+      for (const part of plan) { const invoice = await getInvoice(db, householdId, card.id, part.referenceMonth, part.dueDate, timestamp); await db.insert(cardInstallments).values({ id: uid("installment"), householdId, purchaseId, invoiceId: invoice.id, installmentNumber: part.installmentNumber, installmentCount: part.installmentCount, amountCents: part.amountCents, status: "pending", createdAt: timestamp, updatedAt: timestamp }); }
+      return NextResponse.json({ ok: true, id: purchaseId, plan });
+    }
+    if (action === "delete_card_purchase") {
+      const parsed = z.object({ id }).parse(body); const [purchase] = await db.select().from(cardPurchases).where(and(eq(cardPurchases.id, parsed.id), eq(cardPurchases.householdId, householdId))).limit(1); if (!purchase) return NextResponse.json({ error: "Compra não encontrada." }, { status: 404 });
+      const related = await db.select().from(cardInstallments).where(and(eq(cardInstallments.purchaseId, parsed.id), eq(cardInstallments.householdId, householdId))); const paidInvoiceIds = new Set((await db.select().from(cardInvoices).where(eq(cardInvoices.householdId, householdId))).filter((invoice) => invoice.status === "paid").map((invoice) => invoice.id));
+      if (related.some((part) => paidInvoiceIds.has(part.invoiceId))) return NextResponse.json({ error: "A compra possui parcela em fatura paga e não pode ser excluída." }, { status: 409 });
+      await db.delete(cardInstallments).where(and(eq(cardInstallments.purchaseId, parsed.id), eq(cardInstallments.householdId, householdId))); await db.delete(cardPurchases).where(and(eq(cardPurchases.id, parsed.id), eq(cardPurchases.householdId, householdId))); return NextResponse.json({ ok: true });
+    }
+    if (action === "pay_invoice") {
+      const parsed = z.object({ invoiceId: id, accountId: id, paidAt: dateSchema }).parse(body); const [invoice] = await db.select().from(cardInvoices).where(and(eq(cardInvoices.id, parsed.invoiceId), eq(cardInvoices.householdId, householdId))).limit(1); const [account] = await db.select().from(accounts).where(and(eq(accounts.id, parsed.accountId), eq(accounts.householdId, householdId))).limit(1); if (!invoice || !account) return NextResponse.json({ error: "Fatura ou conta inválida." }, { status: 400 }); if (invoice.status === "paid") return NextResponse.json({ error: "Esta fatura já foi paga." }, { status: 409 });
+      const parts = await db.select().from(cardInstallments).where(and(eq(cardInstallments.invoiceId, invoice.id), eq(cardInstallments.householdId, householdId))); const amountCents = parts.filter((item) => item.status !== "cancelled").reduce((sum, item) => sum + item.amountCents, 0); if (!amountCents) return NextResponse.json({ error: "A fatura não possui valor para pagamento." }, { status: 409 });
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO invoice_payments (id, household_id, invoice_id, account_id, amount_cents, paid_at, created_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(uid("invoice_payment"), householdId, invoice.id, account.id, amountCents, parsed.paidAt, user.id, timestamp),
+        env.DB.prepare("UPDATE card_invoices SET status = 'paid', paid_at = ?, updated_at = ? WHERE id = ? AND household_id = ? AND status <> 'paid'").bind(parsed.paidAt, timestamp, invoice.id, householdId),
+        env.DB.prepare("UPDATE card_installments SET status = 'paid', updated_at = ? WHERE invoice_id = ? AND household_id = ? AND status <> 'cancelled'").bind(timestamp, invoice.id, householdId),
+      ]);
+      return NextResponse.json({ ok: true, amountCents });
+    }
+    if (action === "create_bill") {
+      const parsed = z.object({ description: shortText, amountCents: money, dueDate: dateSchema, categoryId: id.nullable().optional(), accountId: id.nullable().optional(), recurrence: z.enum(["none", "monthly"]).default("none"), recurrenceEndDate: dateSchema.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      if (parsed.recurrence === "monthly" && parsed.recurrenceEndDate && parsed.recurrenceEndDate < parsed.dueDate) return NextResponse.json({ error: "A data final da recorrência não pode ser anterior ao primeiro vencimento." }, { status: 400 });
+      const recurrenceEndDate = parsed.recurrence === "monthly" ? (parsed.recurrenceEndDate ?? null) : null;
+      if (parsed.accountId) { const [account] = await db.select().from(accounts).where(and(eq(accounts.id, parsed.accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); }
+      if (parsed.categoryId) { const [category] = await db.select().from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
+      const seriesId = parsed.recurrence === "monthly" ? uid("bill_series") : null; const maxMonths = parsed.recurrence === "monthly" ? 24 : 1; const created: string[] = []; const occurrences: Array<{ id: string; dueDate: string }> = [];
+      for (let index = 0; index < maxMonths; index++) { const dueMonth = addMonths(parsed.dueDate.slice(0, 7), index); const dueDay = Math.min(Number(parsed.dueDate.slice(8)), new Date(Date.UTC(Number(dueMonth.slice(0, 4)), Number(dueMonth.slice(5, 7)), 0)).getUTCDate()); const dueDate = `${dueMonth}-${String(dueDay).padStart(2, "0")}`; if (recurrenceEndDate && dueDate > recurrenceEndDate) break; const entityId = uid("bill"); created.push(entityId); occurrences.push({ id: entityId, dueDate }); }
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const statements: D1PreparedStatement[] = [];
+      if (seriesId) statements.push(env.DB.prepare("INSERT INTO recurring_bill_series (id, household_id, description, amount_cents, category_id, account_id, day_of_month, starts_on, ends_on, is_active, notes, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'web', ?, ?)").bind(seriesId, householdId, parsed.description, parsed.amountCents, parsed.categoryId ?? null, parsed.accountId ?? null, Number(parsed.dueDate.slice(8)), parsed.dueDate, recurrenceEndDate, parsed.notes ?? null, user.id, timestamp, timestamp));
+      for (const occurrence of occurrences) statements.push(env.DB.prepare("INSERT INTO bills (id, household_id, description, amount_cents, category_id, due_date, account_id, recurrence, recurrence_series_id, recurrence_end_date, notes, status, paid_at, payment_transaction_id, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, 'web', ?, ?)").bind(occurrence.id, householdId, parsed.description, parsed.amountCents, parsed.categoryId ?? null, occurrence.dueDate, parsed.accountId ?? null, parsed.recurrence, seriesId, recurrenceEndDate, parsed.notes ?? null, user.id, timestamp, timestamp));
+      await env.DB.batch(statements);
+      return NextResponse.json({ ok: true, ids: created });
+    }
+    if (action === "update_bill_occurrence") {
+      const parsed = z.object({ id, description: shortText, amountCents: money, dueDate: dateSchema, categoryId: id.nullable().optional(), accountId: id.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      const [bill] = await db.select().from(bills).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))).limit(1); if (!bill) return NextResponse.json({ error: "Conta a pagar não encontrada." }, { status: 404 }); if (bill.status !== "pending") return NextResponse.json({ error: "Somente ocorrências pendentes podem ser editadas." }, { status: 409 });
+      if (parsed.accountId) { const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, parsed.accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); }
+      if (parsed.categoryId) { const [category] = await db.select({ id: categories.id }).from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
+      await db.update(bills).set({ description: parsed.description, amountCents: parsed.amountCents, dueDate: parsed.dueDate, categoryId: parsed.categoryId ?? null, accountId: parsed.accountId ?? null, notes: parsed.notes ?? null, updatedAt: timestamp }).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId), eq(bills.status, "pending"))); return NextResponse.json({ ok: true });
+    }
+    if (action === "cancel_bill_occurrence") {
+      const parsed = z.object({ id }).parse(body); const [bill] = await db.select().from(bills).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))).limit(1); if (!bill) return NextResponse.json({ error: "Conta a pagar não encontrada." }, { status: 404 }); if (bill.status === "paid") return NextResponse.json({ error: "Uma ocorrência paga não pode ser cancelada." }, { status: 409 }); await db.update(bills).set({ status: "cancelled", updatedAt: timestamp }).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))); return NextResponse.json({ ok: true });
+    }
+    if (action === "update_recurring_bill_series") {
+      const parsed = z.object({ id, description: shortText, amountCents: money, dayOfMonth: z.number().int().min(1).max(31), categoryId: id.nullable().optional(), accountId: id.nullable().optional(), endsOn: dateSchema.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      const [series] = await db.select().from(recurringBillSeries).where(and(eq(recurringBillSeries.id, parsed.id), eq(recurringBillSeries.householdId, householdId))).limit(1); if (!series) return NextResponse.json({ error: "Série recorrente não encontrada." }, { status: 404 }); if (!series.isActive) return NextResponse.json({ error: "A série recorrente está cancelada." }, { status: 409 });
+      if (parsed.endsOn && parsed.endsOn < series.startsOn) return NextResponse.json({ error: "A data final da recorrência não pode ser anterior ao início." }, { status: 400 });
+      if (parsed.accountId) { const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, parsed.accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); }
+      if (parsed.categoryId) { const [category] = await db.select({ id: categories.id }).from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
+      const today = timestamp.slice(0, 10); const future = (await db.select().from(bills).where(and(eq(bills.householdId, householdId), eq(bills.recurrenceSeriesId, parsed.id), eq(bills.status, "pending")))).filter((item) => item.dueDate >= today);
+      if (!env.DB) throw new Error("D1 binding indisponível"); const statements: D1PreparedStatement[] = [env.DB.prepare("UPDATE recurring_bill_series SET description = ?, amount_cents = ?, category_id = ?, account_id = ?, day_of_month = ?, ends_on = ?, notes = ?, updated_at = ? WHERE id = ? AND household_id = ? AND is_active = 1").bind(parsed.description, parsed.amountCents, parsed.categoryId ?? null, parsed.accountId ?? null, parsed.dayOfMonth, parsed.endsOn ?? null, parsed.notes ?? null, timestamp, parsed.id, householdId)];
+      for (const occurrence of future) { const month = occurrence.dueDate.slice(0, 7); const lastDay = new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate(); const dueDate = `${month}-${String(Math.min(parsed.dayOfMonth, lastDay)).padStart(2, "0")}`; if (parsed.endsOn && dueDate > parsed.endsOn) statements.push(env.DB.prepare("UPDATE bills SET status = 'cancelled', updated_at = ? WHERE id = ? AND household_id = ? AND status = 'pending'").bind(timestamp, occurrence.id, householdId)); else statements.push(env.DB.prepare("UPDATE bills SET description = ?, amount_cents = ?, category_id = ?, account_id = ?, due_date = ?, recurrence_end_date = ?, notes = ?, updated_at = ? WHERE id = ? AND household_id = ? AND status = 'pending'").bind(parsed.description, parsed.amountCents, parsed.categoryId ?? null, parsed.accountId ?? null, dueDate, parsed.endsOn ?? null, parsed.notes ?? null, timestamp, occurrence.id, householdId)); }
+      await env.DB.batch(statements); return NextResponse.json({ ok: true, updatedOccurrences: future.length });
+    }
+    if (action === "cancel_recurring_bill_series") {
+      const parsed = z.object({ id }).parse(body); const [series] = await db.select().from(recurringBillSeries).where(and(eq(recurringBillSeries.id, parsed.id), eq(recurringBillSeries.householdId, householdId))).limit(1); if (!series) return NextResponse.json({ error: "Série recorrente não encontrada." }, { status: 404 }); if (!env.DB) throw new Error("D1 binding indisponível"); const today = timestamp.slice(0, 10); await env.DB.batch([env.DB.prepare("UPDATE recurring_bill_series SET is_active = 0, updated_at = ? WHERE id = ? AND household_id = ?").bind(timestamp, parsed.id, householdId), env.DB.prepare("UPDATE bills SET status = 'cancelled', updated_at = ? WHERE recurrence_series_id = ? AND household_id = ? AND status = 'pending' AND due_date >= ?").bind(timestamp, parsed.id, householdId, today)]); return NextResponse.json({ ok: true });
+    }
+    if (action === "pay_bill") {
+      const parsed = z.object({ id, accountId: id.optional() }).parse(body); const [bill] = await db.select().from(bills).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))).limit(1); if (!bill) return NextResponse.json({ error: "Conta a pagar não encontrada." }, { status: 404 }); if (bill.status === "paid") return NextResponse.json({ error: "Esta conta já foi paga." }, { status: 409 }); const accountId = parsed.accountId ?? bill.accountId; if (!accountId) return NextResponse.json({ error: "Selecione a conta usada no pagamento." }, { status: 400 }); const [account] = await db.select().from(accounts).where(and(eq(accounts.id, accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); const transactionId = uid("transaction"); await db.insert(transactions).values({ id: transactionId, householdId, type: "expense", amountCents: bill.amountCents, description: bill.description, categoryId: bill.categoryId, transactionDate: timestamp.slice(0, 10), responsibleUserId: user.id, accountId, paymentMethod: "conta_a_pagar", status: "confirmed", origin: "dashboard", notes: bill.notes, createdAt: timestamp, updatedAt: timestamp }); await db.update(bills).set({ status: "paid", paidAt: timestamp, accountId, paymentTransactionId: transactionId, updatedAt: timestamp }).where(and(eq(bills.id, bill.id), eq(bills.householdId, householdId))); return NextResponse.json({ ok: true, transactionId });
+    }
+    if (action === "simulate_purchase") {
+      const parsed = z.object({ description: shortText, purchaseCents: money, purchaseDate: dateSchema, paymentMethod: z.enum(["cash", "credit_card"]), installmentCount: z.number().int().min(1).max(120), cardId: id.nullable().optional() }).parse(body);
+      let firstImpactMonth = parsed.purchaseDate.slice(0, 7);
+      if (parsed.paymentMethod === "credit_card") {
+        if (!parsed.cardId) return NextResponse.json({ error: "Selecione o cartão para simular." }, { status: 400 });
+        const [card] = await db.select().from(creditCards).where(and(eq(creditCards.id, parsed.cardId), eq(creditCards.householdId, householdId), eq(creditCards.isActive, true))).limit(1);
+        if (!card) return NextResponse.json({ error: "Cartão inválido." }, { status: 400 });
+        firstImpactMonth = buildInstallmentPlan({ totalCents: parsed.purchaseCents, count: parsed.installmentCount, purchaseDate: parsed.purchaseDate, closingDay: card.closingDay, dueDay: card.dueDay })[0].referenceMonth;
+      }
+      const [accountRows, transactionRows, paymentRows, billRows, invoiceRows, installmentRows] = await Promise.all([
+        db.select().from(accounts).where(eq(accounts.householdId, householdId)), db.select().from(transactions).where(eq(transactions.householdId, householdId)), db.select().from(invoicePayments).where(eq(invoicePayments.householdId, householdId)), db.select().from(bills).where(eq(bills.householdId, householdId)), db.select().from(cardInvoices).where(eq(cardInvoices.householdId, householdId)), db.select().from(cardInstallments).where(eq(cardInstallments.householdId, householdId)),
+      ]);
+      const today = timestamp.slice(0, 10); const currentMonth = today.slice(0, 7); const balances = new Map(accountRows.map((account) => [account.id, account.initialBalanceCents]));
+      for (const item of transactionRows) if (item.status === "confirmed" && item.transactionDate <= today) balances.set(item.accountId, (balances.get(item.accountId) ?? 0) + (item.type === "income" ? item.amountCents : -item.amountCents));
+      for (const payment of paymentRows) if (payment.paidAt <= today) balances.set(payment.accountId, (balances.get(payment.accountId) ?? 0) - payment.amountCents);
+      const availableCents = accountRows.filter((account) => account.isActive).reduce((sum, account) => sum + (balances.get(account.id) ?? 0), 0);
+      const invoiceById = new Map(invoiceRows.map((invoice) => [invoice.id, invoice])); const horizon = Math.max(12, parsed.installmentCount); const months = Array.from({ length: horizon }, (_, index) => addMonths(currentMonth, index)).map((month) => {
+        const monthTransactions = transactionRows.filter((item) => item.status === "confirmed" && item.transactionDate.startsWith(month) && item.transactionDate > today);
+        const incomeCents = monthTransactions.filter((item) => item.type === "income").reduce((sum, item) => sum + item.amountCents, 0);
+        const plannedCashExpenses = monthTransactions.filter((item) => item.type === "expense").reduce((sum, item) => sum + item.amountCents, 0);
+        const billsCents = billRows.filter((item) => item.status === "pending" && item.dueDate.startsWith(month)).reduce((sum, item) => sum + item.amountCents, 0);
+        const cardCents = installmentRows.filter((item) => item.status === "pending" && invoiceById.get(item.invoiceId)?.referenceMonth === month).reduce((sum, item) => sum + item.amountCents, 0);
+        return { month, incomeCents, commitmentCents: plannedCashExpenses + billsCents + cardCents };
+      });
+      const result = simulatePurchase({ startMonth: currentMonth, availableCents, purchaseCents: parsed.purchaseCents, installmentCount: parsed.paymentMethod === "cash" ? 1 : parsed.installmentCount, firstImpactMonth, months });
+      return NextResponse.json({ ...result, description: parsed.description, firstImpactMonth });
+    }
+    return NextResponse.json({ error: "Ação inválida." }, { status: 400 });
+  } catch (error) {
+    if (error instanceof z.ZodError) return NextResponse.json({ error: error.issues[0]?.message ?? "Dados inválidos.", details: error.flatten() }, { status: 400 });
+    console.error("advanced_finance_failed", error); return NextResponse.json({ error: "Não foi possível concluir a operação." }, { status: 500 });
+  }
+}

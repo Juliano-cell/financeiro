@@ -40,6 +40,7 @@ Nenhum desses comandos deve apontar para o banco antigo. Confirme sempre o `data
 | Item | Onde é usado | Obrigatório |
 | --- | --- | --- |
 | `LEGACY_ACCOUNT_CLAIM_SECRET` | Segredo de runtime para o primeiro vínculo de contas importadas | Temporário durante a migração |
+| `TELEGRAM_LINK_CODE_SECRET` | Chave HMAC dos códigos de seis dígitos de vinculação do Telegram | Sim, se o Telegram estiver ativo |
 | `CLOUDFLARE_API_TOKEN` | Automação/CI de build, migração e deploy | Somente em CI |
 | `CLOUDFLARE_ACCOUNT_ID` | Seleção da conta em automações que não consigam inferi-la | Conforme o ambiente |
 | `database_id` | Binding `DB` em `wrangler.production.jsonc`; é um identificador de recurso, não uma credencial | Sim |

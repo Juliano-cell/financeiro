@@ -9,7 +9,7 @@ import { digestToken, generateRecoveryCode, hashPassword, normalizeEmail, normal
 
 export const dynamic = "force-dynamic";
 
-const passwordSchema = z.string().min(12, "Use pelo menos 12 caracteres.").max(128, "A senha é muito longa.");
+const passwordSchema = z.string().min(8, "Use pelo menos 8 caracteres.").max(128, "A senha é muito longa.");
 const credentialsSchema = z.object({ email: z.string().email().transform(normalizeEmail), password: passwordSchema });
 const DUMMY_PASSWORD_HASH = "pbkdf2-sha256$310000$Qe93BgMITluBPHwUZN5WpQ$0LFKj3CvebZyTC5WH6x2jlBF6WXVdDyN2O7YlDW_wlI";
 const timestamp = () => new Date().toISOString();

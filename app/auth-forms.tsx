@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Check, Copy, KeyRound } from "lucide-react";
+import { Check, Copy, Eye, EyeOff, KeyRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -41,8 +41,8 @@ export function AuthForm({ mode }: { mode: Mode }) {
     {mode === "register" && <Field label="Nome" name="name" autoComplete="name" required placeholder="Seu nome" />}
     <Field label="E-mail" name="email" type="email" autoComplete="email" required placeholder="voce@exemplo.com" />
     {mode === "reset" && <Field label="Código de recuperação" name="recoveryCode" autoComplete="off" required placeholder="XXXX-XXXX-XXXX-XXXX" />}
-    <Field label={mode === "reset" ? "Nova senha" : "Senha"} name="password" type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} required minLength={12} placeholder="Mínimo de 12 caracteres" />
-    {mode !== "login" && <Field label="Confirmar senha" name="passwordConfirmation" type="password" autoComplete="new-password" required minLength={12} />}
+    <PasswordField label={mode === "reset" ? "Nova senha" : "Senha"} name="password" autoComplete={mode === "login" ? "current-password" : "new-password"} required minLength={8} placeholder="Mínimo de 8 caracteres" />
+    {mode !== "login" && <PasswordField label="Confirmar senha" name="passwordConfirmation" autoComplete="new-password" required minLength={8} />}
     {mode === "register" && activationRequired && <div className="rounded-2xl border border-[#e4c675] bg-[#fff9e8] p-4"><p className="text-sm leading-6 text-[#735f29]">Este e-mail já possui dados da Fase 1. Use o código de ativação fornecido pelo responsável da publicação.</p><div className="mt-3"><Field label="Código de ativação" name="legacyClaimCode" autoComplete="off" required /></div></div>}
     {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
     <Button className="h-11 w-full" disabled={busy}>{busy ? "Verificando..." : mode === "register" ? "Criar conta" : mode === "reset" ? "Redefinir senha" : "Entrar"}</Button>
@@ -51,3 +51,8 @@ export function AuthForm({ mode }: { mode: Mode }) {
 }
 
 function Field({ label, name, ...props }: { label: string; name: string } & React.ComponentProps<typeof Input>) { return <div><Label htmlFor={name}>{label}</Label><Input id={name} name={name} className="mt-2 h-11" {...props} /></div>; }
+
+function PasswordField({ label, name, ...props }: { label: string; name: string } & React.ComponentProps<typeof Input>) {
+  const [visible, setVisible] = useState(false);
+  return <div><Label htmlFor={name}>{label}</Label><div className="relative mt-2"><Input id={name} name={name} type={visible ? "text" : "password"} className="h-11 pr-11" {...props} /><button type="button" className="absolute inset-y-0 right-0 grid w-11 place-items-center rounded-r-md text-[#657873] hover:text-[#173c35] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#397f72]" onClick={() => setVisible((value) => !value)} aria-label={visible ? `Ocultar ${label.toLowerCase()}` : `Mostrar ${label.toLowerCase()}`} aria-pressed={visible}>{visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div></div>;
+}
