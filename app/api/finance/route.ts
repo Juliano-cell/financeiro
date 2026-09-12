@@ -3,8 +3,10 @@ import { and, asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { accounts, auditLogs, categories, householdInviteTokens, householdMembers, households, invoicePayments, subcategories, transactions, users } from "@/db/schema";
+import { accounts, auditLogs, categories, householdInviteTokens, householdMembers, households, subcategories, transactions, users } from "@/db/schema";
 import { digestToken, generateRecoveryCode, normalizeRecoveryCode } from "@/lib/auth-crypto.mjs";
+import { dateInTimeZone } from "@/lib/finance-analytics.mjs";
+import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
 import { createTransaction, FinanceValidationError } from "@/lib/finance-service";
 
 export const dynamic = "force-dynamic";
@@ -60,12 +62,10 @@ export async function GET() {
       paymentMethod: transactions.paymentMethod, status: transactions.status, origin: transactions.origin, notes: transactions.notes, createdAt: transactions.createdAt, updatedAt: transactions.updatedAt,
       accountName: accounts.name, categoryName: categories.name, responsibleName: users.name,
     }).from(transactions).leftJoin(accounts, eq(transactions.accountId, accounts.id)).leftJoin(categories, eq(transactions.categoryId, categories.id)).leftJoin(users, eq(transactions.responsibleUserId, users.id)).where(eq(transactions.householdId, householdId)).orderBy(desc(transactions.transactionDate), desc(transactions.createdAt)).limit(200);
-    const invoicePaymentRows = await db.select().from(invoicePayments).where(eq(invoicePayments.householdId, householdId));
-    const balances = new Map(accountRows.map((account) => [account.id, account.initialBalanceCents]));
-    for (const item of transactionRows) if (item.status === "confirmed") balances.set(item.accountId, (balances.get(item.accountId) ?? 0) + (item.type === "income" ? item.amountCents : -item.amountCents));
-    for (const payment of invoicePaymentRows) balances.set(payment.accountId, (balances.get(payment.accountId) ?? 0) - payment.amountCents);
+    const balanceRows = await getCurrentAccountBalances(householdId, dateInTimeZone());
+    const balances = new Map(balanceRows.map((account) => [account.accountId, account.currentBalanceCents]));
     const accountsWithBalance = accountRows.map((account) => ({ ...account, currentBalanceCents: balances.get(account.id) ?? account.initialBalanceCents }));
-    const month = new Date().toISOString().slice(0, 7);
+    const month = dateInTimeZone().slice(0, 7);
     const confirmedThisMonth = transactionRows.filter((item) => item.status === "confirmed" && item.transactionDate.startsWith(month));
     const incomeCents = confirmedThisMonth.filter((item) => item.type === "income").reduce((sum, item) => sum + item.amountCents, 0);
     const expenseCents = confirmedThisMonth.filter((item) => item.type === "expense").reduce((sum, item) => sum + item.amountCents, 0);
