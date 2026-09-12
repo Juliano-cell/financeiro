@@ -79,7 +79,19 @@ export type AnalyticsDetail = {
 export type AccountMovementRanking = {
   accountId: string;
   accountName: string;
+  incomeCents: number;
+  expenseCents: number;
+  netMovementCents: number;
   movementCents: number;
+  movementCount: number;
+};
+
+export type ResponsibleMovementRanking = {
+  responsibleUserId: string | null;
+  responsibleName: string;
+  incomeCents: number;
+  expenseCents: number;
+  netMovementCents: number;
   movementCount: number;
 };
 
@@ -123,6 +135,7 @@ export type AnalyticsResponse = {
     subcategoryVariations: AnalyticsBreakdown[];
     largestExpenses: AnalyticsDetail[];
     accountMovements: AccountMovementRanking[];
+    responsibleMovements: ResponsibleMovementRanking[];
   };
   history: {
     months: string[];

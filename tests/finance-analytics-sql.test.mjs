@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { CURRENT_ACCOUNT_BALANCES_SQL, FINANCIAL_EVENTS_CTE } from "../lib/finance-analytics.mjs";
+import { ACCOUNT_MOVEMENTS_CTE, CURRENT_ACCOUNT_BALANCES_SQL, FINANCIAL_EVENTS_CTE } from "../lib/finance-analytics.mjs";
 
 const AT = "2026-09-12T12:00:00.000Z";
 
@@ -127,6 +127,89 @@ test("saldo não depende das últimas 200 movimentações", () => {
   for (let index = 0; index < 205; index++) insertTransaction(db, { id: `expense_${index}`, householdId: a.household, type: "expense", amountCents: 100, description: `Expense ${index}`, date: "2026-09-01", userId: a.user, accountId: a.account });
   const [balance] = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-12", a.household, "2026-09-12", a.household);
   assert.equal(balance.current_balance_cents, 79_500);
+});
+
+test("agregação por conta separa entradas, saídas reais e movimento líquido sem misturar households", () => {
+  const { db, a, b } = seedAnalyticsScenario();
+  const query = `${ACCOUNT_MOVEMENTS_CTE}
+    SELECT
+      a.id AS account_id,
+      SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE 0 END) AS income_cents,
+      SUM(CASE WHEN am.type IN ('expense', 'settlement') THEN am.amount_cents ELSE 0 END) AS expense_cents,
+      SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE -am.amount_cents END) AS net_movement_cents,
+      SUM(am.amount_cents) AS movement_cents,
+      COUNT(*) AS movement_count
+    FROM account_movements am
+    INNER JOIN accounts a ON a.household_id = am.household_id AND a.id = am.account_id
+    WHERE am.event_date BETWEEN ? AND ?
+    GROUP BY a.id
+    ORDER BY a.id`;
+  const rows = db.prepare(query).all(a.household, a.household, "2026-09-01", "2026-09-30");
+  const active = rows.find((row) => row.account_id === a.account);
+  assert.deepEqual({ ...active }, {
+    account_id: a.account,
+    income_cents: 200_000,
+    expense_cents: 45_000,
+    net_movement_cents: 155_000,
+    movement_cents: 245_000,
+    movement_count: 5,
+  });
+  assert.deepEqual({ ...rows.find((row) => row.account_id === "account_a_inactive") }, {
+    account_id: "account_a_inactive",
+    income_cents: 0,
+    expense_cents: 1_000,
+    net_movement_cents: -1_000,
+    movement_cents: 1_000,
+    movement_count: 1,
+  });
+  assert.ok(!rows.some((row) => row.account_id === b.account));
+});
+
+test("agregação por responsável representa autoria financeira e permanece isolada por household", () => {
+  const { db, a, b } = seedAnalyticsScenario();
+  insertTransaction(db, { id: "cross-household-responsible", householdId: a.household, type: "expense", amountCents: 7_000, description: "Responsável externo", categoryId: a.category, date: "2026-09-05", userId: b.user, accountId: a.account });
+  const query = `${FINANCIAL_EVENTS_CTE}
+    SELECT
+      hm.user_id AS responsible_user_id,
+      COALESCE(u.name, 'Usuário indisponível') AS responsible_name,
+      SUM(CASE WHEN e.type = 'income' THEN e.amount_cents ELSE 0 END) AS income_cents,
+      SUM(CASE WHEN e.type = 'expense' THEN e.amount_cents ELSE 0 END) AS expense_cents,
+      SUM(CASE WHEN e.type = 'income' THEN e.amount_cents ELSE -e.amount_cents END) AS net_movement_cents,
+      COUNT(*) AS movement_count
+    FROM financial_events e
+    LEFT JOIN household_members hm ON hm.household_id = e.household_id AND hm.user_id = e.responsible_user_id
+    LEFT JOIN users u ON u.id = hm.user_id
+    WHERE e.event_date BETWEEN ? AND ?
+    GROUP BY hm.user_id, u.name
+    ORDER BY hm.user_id`;
+  const rows = db.prepare(query).all(a.household, a.household, "2026-09-01", "2026-09-30");
+  assert.deepEqual({ ...rows.find((row) => row.responsible_user_id === a.user) }, {
+    responsible_user_id: a.user,
+    responsible_name: "User a",
+    income_cents: 200_000,
+    expense_cents: 41_000,
+    net_movement_cents: 159_000,
+    movement_count: 5,
+  });
+  assert.deepEqual({ ...rows.find((row) => row.responsible_user_id === "user_a2") }, {
+    responsible_user_id: "user_a2",
+    responsible_name: "Second A",
+    income_cents: 0,
+    expense_cents: 5_000,
+    net_movement_cents: -5_000,
+    movement_count: 1,
+  });
+  assert.deepEqual({ ...rows.find((row) => row.responsible_user_id === null) }, {
+    responsible_user_id: null,
+    responsible_name: "Usuário indisponível",
+    income_cents: 0,
+    expense_cents: 7_000,
+    net_movement_cents: -7_000,
+    movement_count: 1,
+  });
+  assert.ok(!rows.some((row) => row.responsible_user_id === b.user));
+  assert.ok(!rows.some((row) => row.responsible_name === "User b"));
+  assert.equal(rows.reduce((sum, row) => sum + row.expense_cents, 0), 53_000);
 });
 
 test("paginação é estável e respostas vazias permanecem vazias", () => {

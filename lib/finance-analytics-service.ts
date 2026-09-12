@@ -26,6 +26,7 @@ import type {
   AnalyticsResponse,
   AnalyticsTimelinePoint,
   DateRange,
+  ResponsibleMovementRanking,
 } from "@/lib/finance-analytics-types";
 
 type AnalyticsContext = {
@@ -329,7 +330,14 @@ export async function getFinanceAnalytics(context: AnalyticsContext, filters: An
 
   const movementDimensions = accountMovementDimensions(filters);
   const accountMovements = database().prepare(`${ACCOUNT_MOVEMENTS_CTE}
-    SELECT a.id AS account_id, a.name AS account_name, SUM(am.amount_cents) AS movement_cents, COUNT(*) AS movement_count
+    SELECT
+      a.id AS account_id,
+      a.name AS account_name,
+      COALESCE(SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE 0 END), 0) AS income_cents,
+      COALESCE(SUM(CASE WHEN am.type IN ('expense', 'settlement') THEN am.amount_cents ELSE 0 END), 0) AS expense_cents,
+      COALESCE(SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE -am.amount_cents END), 0) AS net_movement_cents,
+      COALESCE(SUM(am.amount_cents), 0) AS movement_cents,
+      COUNT(*) AS movement_count
     FROM account_movements am
     INNER JOIN accounts a ON a.household_id = am.household_id AND a.id = am.account_id
     WHERE am.event_date BETWEEN ? AND ?${movementDimensions.sql}
@@ -338,7 +346,23 @@ export async function getFinanceAnalytics(context: AnalyticsContext, filters: An
     LIMIT 10
   `).bind(context.householdId, context.householdId, period.current.start, period.current.end, ...movementDimensions.bindings);
 
-  const statements: D1PreparedStatement[] = [totals, categories, subcategories, timeline, history, largestExpenses, accountMovements];
+  const responsibleMovements = eventStatement(context.householdId, `
+    SELECT
+      hm.user_id AS responsible_user_id,
+      COALESCE(u.name, '${NO_RESPONSIBLE}') AS responsible_name,
+      COALESCE(SUM(CASE WHEN e.type = 'income' THEN e.amount_cents ELSE 0 END), 0) AS income_cents,
+      COALESCE(SUM(CASE WHEN e.type = 'expense' THEN e.amount_cents ELSE 0 END), 0) AS expense_cents,
+      COALESCE(SUM(CASE WHEN e.type = 'income' THEN e.amount_cents ELSE -e.amount_cents END), 0) AS net_movement_cents,
+      COUNT(*) AS movement_count
+    FROM financial_events e
+    LEFT JOIN household_members hm ON hm.household_id = e.household_id AND hm.user_id = e.responsible_user_id
+    LEFT JOIN users u ON u.id = hm.user_id
+    WHERE e.event_date BETWEEN ? AND ?${dimension.sql}
+    GROUP BY hm.user_id, u.name
+    ORDER BY expense_cents DESC, income_cents DESC, responsible_name
+  `, [period.current.start, period.current.end, ...dimension.bindings]);
+
+  const statements: D1PreparedStatement[] = [totals, categories, subcategories, timeline, history, largestExpenses, accountMovements, responsibleMovements];
   if (filters.view === "report") {
     statements.push(
       eventStatement(context.householdId, `SELECT COUNT(*) AS total_items FROM financial_events e WHERE e.event_date BETWEEN ? AND ?${dimension.sql}`, [period.current.start, period.current.end, ...dimension.bindings]),
@@ -372,16 +396,27 @@ export async function getFinanceAnalytics(context: AnalyticsContext, filters: An
   const accountMovementRows: AccountMovementRanking[] = resultRows(queryResults[6]).map((row) => ({
     accountId: String(row.account_id),
     accountName: String(row.account_name),
+    incomeCents: integer(row, "income_cents"),
+    expenseCents: integer(row, "expense_cents"),
+    netMovementCents: integer(row, "net_movement_cents"),
     movementCents: integer(row, "movement_cents"),
+    movementCount: integer(row, "movement_count"),
+  }));
+  const responsibleMovementRows: ResponsibleMovementRanking[] = resultRows(queryResults[7]).map((row) => ({
+    responsibleUserId: nullableString(row.responsible_user_id),
+    responsibleName: String(row.responsible_name ?? NO_RESPONSIBLE),
+    incomeCents: integer(row, "income_cents"),
+    expenseCents: integer(row, "expense_cents"),
+    netMovementCents: integer(row, "net_movement_cents"),
     movementCount: integer(row, "movement_count"),
   }));
 
   const eligibleHistoryMonths = historyMonths.filter((month) => endOfMonth(`${month}-01`) >= context.householdCreatedAt.slice(0, 10));
   let details: AnalyticsResponse["details"] = null;
   if (filters.view === "report") {
-    const totalItems = integer(resultRows(queryResults[7])[0], "total_items");
+    const totalItems = integer(resultRows(queryResults[8])[0], "total_items");
     details = {
-      items: resultRows(queryResults[8]).map(mapDetail),
+      items: resultRows(queryResults[9]).map(mapDetail),
       page: filters.page,
       limit: filters.limit,
       totalItems,
@@ -421,6 +456,7 @@ export async function getFinanceAnalytics(context: AnalyticsContext, filters: An
       subcategoryVariations: variations(subcategoryBreakdown),
       largestExpenses: largestExpenseRows,
       accountMovements: accountMovementRows,
+      responsibleMovements: responsibleMovementRows,
     },
     history: { months: historyMonths, eligibleMonths: eligibleHistoryMonths, sufficient: eligibleHistoryMonths.length >= 2 },
     details,
