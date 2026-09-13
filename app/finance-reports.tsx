@@ -3,11 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowDownLeft, ArrowUp, ArrowUpRight, BarChart3, ChevronLeft, ChevronRight, CircleDollarSign, CreditCard, Lightbulb, Minus, RefreshCw, RotateCcw, Tags, UserRound, Wallet, X } from "lucide-react";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { toast } from "sonner";
 import { FinancePeriodFilter, type FinancePeriodSelection } from "@/app/finance-period-filter";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import type { AnalyticsBreakdown, AnalyticsComparison, AnalyticsDetail, AnalyticsResponse, AnalyticsTrend } from "@/lib/finance-analytics-types";
+import { applyReportCategoryFilter, applyReportSubcategoryFilter, reportMovementMode } from "@/lib/finance-ui-rules.mjs";
 
 type ReportAccount = { id: string; name: string; isActive: boolean };
 type ReportSubcategory = { id: string; name: string; categoryId: string };
@@ -51,7 +54,7 @@ async function requestReport(url: string, signal: AbortSignal) {
   return payload;
 }
 
-export function FinanceReports({ accounts, categories, members }: { accounts: ReportAccount[]; categories: ReportCategory[]; members: ReportMember[] }) {
+export function FinanceReports({ accounts, categories, members, refreshKey, onOpenTransaction }: { accounts: ReportAccount[]; categories: ReportCategory[]; members: ReportMember[]; refreshKey: number; onOpenTransaction: (transactionId: string) => Promise<boolean> }) {
   const [selection, setSelection] = useState<FinancePeriodSelection>({ period: "this_month" });
   const [filters, setFilters] = useState<ReportFilters>(emptyFilters);
   const [page, setPage] = useState(1);
@@ -59,6 +62,8 @@ export function FinanceReports({ accounts, categories, members }: { accounts: Re
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [reload, setReload] = useState(0);
+  const [readonlyMovement, setReadonlyMovement] = useState<AnalyticsDetail | null>(null);
+  const [openingMovement, setOpeningMovement] = useState("");
   const requestId = useRef(0);
 
   useEffect(() => {
@@ -73,7 +78,7 @@ export function FinanceReports({ accounts, categories, members }: { accounts: Re
       })
       .finally(() => { if (!controller.signal.aborted && currentRequest === requestId.current) setLoading(false); });
     return () => controller.abort();
-  }, [filters, page, reload, selection]);
+  }, [filters, page, refreshKey, reload, selection]);
 
   const refresh = () => {
     setLoading(true);
@@ -97,14 +102,29 @@ export function FinanceReports({ accounts, categories, members }: { accounts: Re
     if (selectedCategory && type !== "all" && selectedCategory.type !== "both" && selectedCategory.type !== type) return { ...current, type, categoryId: "", subcategoryId: "" };
     return { ...current, type };
   });
-  const updateCategory = (categoryId: string) => updateFilters((current) => {
-    const keepsSubcategory = categories.find((item) => item.id === categoryId)?.subcategories.some((item) => item.id === current.subcategoryId);
-    return { ...current, categoryId, subcategoryId: keepsSubcategory ? current.subcategoryId : "" };
-  });
-  const applyCategory = (categoryId: string) => updateCategory(categoryId);
+  const updateCategory = (categoryId: string) => updateFilters((current) => applyReportCategoryFilter(current, categoryId, categories));
+  const applyCategory = (categoryId: string) => {
+    updateCategory(categoryId);
+    toast.success("Filtro de categoria aplicado.");
+  };
   const applySubcategory = (subcategoryId: string) => {
-    const category = categories.find((item) => item.subcategories.some((subcategory) => subcategory.id === subcategoryId));
-    updateFilters((current) => ({ ...current, categoryId: category?.id ?? "", subcategoryId }));
+    updateFilters((current) => applyReportSubcategoryFilter(current, subcategoryId, categories));
+    toast.success("Filtro de subcategoria aplicado.");
+  };
+  const openMovement = async (item: AnalyticsDetail) => {
+    if (reportMovementMode(item) === "readonly") {
+      setReadonlyMovement(item);
+      return;
+    }
+    const movementKey = `${item.entityType}-${item.id}`;
+    setOpeningMovement(movementKey);
+    try {
+      if (!await onOpenTransaction(item.id)) setReadonlyMovement(item);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Não foi possível abrir a movimentação.");
+    } finally {
+      setOpeningMovement((current) => current === movementKey ? "" : current);
+    }
   };
 
   const availableCategories = categories.filter((item) => filters.type === "all" || item.type === "both" || item.type === filters.type);
@@ -164,8 +184,8 @@ export function FinanceReports({ accounts, categories, members }: { accounts: Re
       </div>
 
       <div className="grid gap-5 xl:grid-cols-2">
-        <RankingSection title="Categorias" description="Onde a família concentrou as despesas" items={data.rankings.categories} empty="Nenhuma categoria encontrada neste relatório." onSelect={applyCategory} />
-        <RankingSection title="Subcategorias" description="Gastos concretos e comportamento histórico" items={data.rankings.subcategories} empty="Nenhuma subcategoria encontrada neste relatório." onSelect={applySubcategory} showHistory />
+        <RankingSection title="Categorias" description="Onde a família concentrou as despesas" items={data.rankings.categories} empty="Nenhuma categoria encontrada neste relatório." onSelect={applyCategory} activeId={filters.categoryId} />
+        <RankingSection title="Subcategorias" description="Gastos concretos e comportamento histórico" items={data.rankings.subcategories} empty="Nenhuma subcategoria encontrada neste relatório." onSelect={applySubcategory} activeId={filters.subcategoryId} showHistory />
       </div>
 
       <div className="grid gap-5 xl:grid-cols-2">
@@ -187,9 +207,10 @@ export function FinanceReports({ accounts, categories, members }: { accounts: Re
 
       <article className="rounded-[24px] border bg-white p-4 sm:p-6">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between"><SectionHeading title="Movimentações do relatório" description="Ordem mais recente fornecida pelo relatório" />{details && <p className="text-xs text-[#71837e]">{details.totalItems} {details.totalItems === 1 ? "resultado" : "resultados"}</p>}</div>
-        {details?.items.length ? <div className="mt-4 divide-y">{details.items.map((item) => <ReportMovement key={`${item.entityType}-${item.id}`} item={item} />)}</div> : <EmptyBlock icon={CreditCard} title="Nenhuma movimentação encontrada" text="Tente ampliar o período ou remover algum filtro." />}
+        {details?.items.length ? <div className="mt-4 divide-y">{details.items.map((item) => <ReportMovement key={`${item.entityType}-${item.id}`} item={item} busy={openingMovement === `${item.entityType}-${item.id}`} onOpen={() => void openMovement(item)} />)}</div> : <EmptyBlock icon={CreditCard} title="Nenhuma movimentação encontrada" text="Tente ampliar o período ou remover algum filtro." />}
         {details && details.totalPages > 1 && <div className="mt-4 flex items-center justify-between gap-2 border-t pt-4"><Button variant="outline" size="sm" disabled={loading || details.page <= 1} onClick={() => { setLoading(true); setError(""); setPage(details.page - 1); }}><ChevronLeft className="h-4 w-4" /> Anterior</Button><span className="text-xs text-[#71837e]">Página {details.page} de {details.totalPages}</span><Button variant="outline" size="sm" disabled={loading || details.page >= details.totalPages} onClick={() => { setLoading(true); setError(""); setPage(details.page + 1); }}>Próxima <ChevronRight className="h-4 w-4" /></Button></div>}
       </article>
+      <ReadonlyMovementDialog item={readonlyMovement} onOpenChange={(open) => { if (!open) setReadonlyMovement(null); }} />
     </section>
   );
 }
@@ -213,8 +234,8 @@ function ComparisonText({ comparison }: { comparison: AnalyticsComparison }) {
   return <>{increase ? <ArrowUp className="mr-1 inline h-3.5 w-3.5" /> : <ArrowDown className="mr-1 inline h-3.5 w-3.5" />}{value}</>;
 }
 
-function RankingSection({ title, description, items, empty, onSelect, showHistory = false }: { title: string; description: string; items: AnalyticsBreakdown[]; empty: string; onSelect: (id: string) => void; showHistory?: boolean }) {
-  return <article className="rounded-[24px] border bg-white p-4 sm:p-6"><SectionHeading title={title} description={description} />{items.length ? <ol className="mt-4 space-y-2">{items.map((item, index) => <li key={`${item.id ?? "none"}-${item.name}`}><button type="button" disabled={!item.id} onClick={() => item.id && onSelect(item.id)} className="w-full rounded-2xl px-2 py-3 text-left transition enabled:hover:bg-[#f5f8f6] disabled:cursor-default"><div className="flex min-w-0 items-center gap-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-[#edf3f0] text-sm font-semibold text-[#58706a]">{index + 1}</span><span className="min-w-0 flex-1 truncate font-medium">{item.name}</span><span className="shrink-0 text-right"><strong className="block text-sm sm:text-base">{brl(item.currentCents)}</strong><span className="text-xs text-[#71837e]">{percent.format(finite(item.sharePercent))}%</span></span>{item.id && <ChevronRight className="h-4 w-4 shrink-0 text-[#96a6a2]" />}</div><div className="ml-11 mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-[#71837e]"><ComparisonText comparison={item.comparison} />{showHistory && item.historicalAverage.sufficientHistory && item.historicalAverage.averageCents !== null && <><span>Média: {brl(item.historicalAverage.averageCents)}</span><HistoricalAverageLabel comparison={item.historicalAverage.comparison} /></>}{showHistory && <TrendLabel trend={item.trend} />}</div></button></li>)}</ol> : <EmptyBlock icon={Tags} title={empty} text="Tente ampliar o período ou remover algum filtro." compact />}</article>;
+function RankingSection({ title, description, items, empty, onSelect, activeId, showHistory = false }: { title: string; description: string; items: AnalyticsBreakdown[]; empty: string; onSelect: (id: string) => void; activeId: string; showHistory?: boolean }) {
+  return <article className="rounded-[24px] border bg-white p-4 sm:p-6"><SectionHeading title={title} description={description} />{items.length ? <ol className="mt-4 space-y-2">{items.map((item, index) => { const selected = Boolean(item.id && item.id === activeId); return <li key={`${item.id ?? "none"}-${item.name}`}><button type="button" disabled={!item.id} aria-pressed={item.id ? selected : undefined} onClick={() => item.id && onSelect(item.id)} className={`w-full rounded-2xl px-2 py-3 text-left transition enabled:cursor-pointer enabled:hover:bg-[#f5f8f6] disabled:cursor-default ${selected ? "bg-[#eaf2ef] ring-1 ring-[#8fb3aa]" : ""}`}><div className="flex min-w-0 items-center gap-3"><span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-[#edf3f0] text-sm font-semibold text-[#58706a]">{index + 1}</span><span className="min-w-0 flex-1 truncate font-medium">{item.name}</span><span className="shrink-0 text-right"><strong className="block text-sm sm:text-base">{brl(item.currentCents)}</strong><span className="text-xs text-[#71837e]">{percent.format(finite(item.sharePercent))}%</span></span>{item.id && <ChevronRight className="h-4 w-4 shrink-0 text-[#96a6a2]" />}</div><div className="ml-11 mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-[#71837e]"><ComparisonText comparison={item.comparison} />{showHistory && item.historicalAverage.sufficientHistory && item.historicalAverage.averageCents !== null && <><span>Média: {brl(item.historicalAverage.averageCents)}</span><HistoricalAverageLabel comparison={item.historicalAverage.comparison} /></>}{showHistory && <TrendLabel trend={item.trend} />}</div></button></li>; })}</ol> : <EmptyBlock icon={Tags} title={empty} text="Tente ampliar o período ou remover algum filtro." compact />}</article>;
 }
 
 function HistoricalAverageLabel({ comparison }: { comparison: AnalyticsComparison | null }) {
@@ -245,9 +266,19 @@ function comparisonValue(comparison: AnalyticsComparison) {
   return `${comparison.direction === "decrease" ? "−" : "+"}${value}`;
 }
 
-function ReportMovement({ item }: { item: AnalyticsDetail }) {
+function ReportMovement({ item, busy, onOpen }: { item: AnalyticsDetail; busy: boolean; onOpen: () => void }) {
   const income = item.type === "income";
-  return <article className="min-w-0 py-4"><div className="flex min-w-0 items-start gap-3"><span className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl ${income ? "bg-[#eff8e9] text-[#39742c]" : "bg-[#fff1df] text-[#95591d]"}`}>{income ? <ArrowDownLeft className="h-4 w-4" /> : <ArrowUpRight className="h-4 w-4" />}</span><div className="min-w-0 flex-1"><div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-3"><div className="min-w-0"><p className="font-medium sm:truncate">{item.description}</p><p className="mt-1 text-xs text-[#748681]">{dateLabel(item.date)}</p></div><strong className={`shrink-0 ${income ? "text-[#39742c]" : "text-[#965a1d]"}`}>{income ? "+" : "−"} {brl(item.amountCents)}</strong></div><div className="mt-3 flex flex-wrap gap-2 text-xs text-[#627872]"><Badge variant="outline">{income ? "Entrada" : "Despesa"}</Badge><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.categoryName}</span><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.subcategoryName}</span><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.accountName}</span><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.responsibleName}</span>{item.entityType === "card_installment" && <span className="rounded-full bg-[#eee8ff] px-2.5 py-1 text-[#6848a3]">Cartão · parcela {item.installmentNumber}/{item.installmentCount}</span>}</div></div></div></article>;
+  return <button type="button" disabled={busy} onClick={onOpen} className="block w-full min-w-0 py-4 text-left transition hover:bg-[#f8faf9] disabled:opacity-60"><div className="flex min-w-0 items-start gap-3"><span className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl ${income ? "bg-[#eff8e9] text-[#39742c]" : "bg-[#fff1df] text-[#95591d]"}`}>{income ? <ArrowDownLeft className="h-4 w-4" /> : <ArrowUpRight className="h-4 w-4" />}</span><div className="min-w-0 flex-1"><div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-3"><div className="min-w-0"><p className="font-medium sm:truncate">{item.description}</p><p className="mt-1 text-xs text-[#748681]">{dateLabel(item.date)}</p></div><div className="flex shrink-0 items-center gap-2"><strong className={income ? "text-[#39742c]" : "text-[#965a1d]"}>{income ? "+" : "−"} {brl(item.amountCents)}</strong><ChevronRight className="h-4 w-4 text-[#96a6a2]" /></div></div><div className="mt-3 flex flex-wrap gap-2 text-xs text-[#627872]"><Badge variant="outline">{income ? "Entrada" : "Despesa"}</Badge><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.categoryName}</span><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.subcategoryName}</span><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.accountName}</span><span className="rounded-full bg-[#f1f5f3] px-2.5 py-1">{item.responsibleName}</span>{item.entityType === "card_installment" && <span className="rounded-full bg-[#eee8ff] px-2.5 py-1 text-[#6848a3]">Cartão · parcela {item.installmentNumber}/{item.installmentCount}</span>}</div></div></div></button>;
+}
+
+function ReadonlyMovementDialog({ item, onOpenChange }: { item: AnalyticsDetail | null; onOpenChange: (open: boolean) => void }) {
+  if (!item) return null;
+  const card = item.entityType === "card_installment";
+  return <Dialog open onOpenChange={onOpenChange}><DialogContent className="sm:max-w-lg"><DialogHeader><DialogTitle>{item.description}</DialogTitle><DialogDescription>{card ? "Parcela de cartão exibida somente para consulta. Edite a compra na área de cartões." : "Pagamento de conta exibido somente para consulta. Edite a conta na área de vencimentos."}</DialogDescription></DialogHeader><div className="grid gap-3 rounded-2xl bg-[#f5f8f6] p-4 text-sm sm:grid-cols-2"><ReadonlyField label="Valor" value={`${item.type === "income" ? "+" : "−"} ${brl(item.amountCents)}`} /><ReadonlyField label="Data" value={dateLabel(item.date)} /><ReadonlyField label="Categoria" value={item.categoryName} /><ReadonlyField label="Subcategoria" value={item.subcategoryName} /><ReadonlyField label="Conta" value={item.accountName} /><ReadonlyField label="Responsável" value={item.responsibleName} />{card && <ReadonlyField label="Parcela" value={`${item.installmentNumber}/${item.installmentCount}`} />}</div></DialogContent></Dialog>;
+}
+
+function ReadonlyField({ label, value }: { label: string; value: string }) {
+  return <div className="min-w-0"><p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#71837e]">{label}</p><p className="mt-1 break-words font-medium">{value}</p></div>;
 }
 
 function buildActiveFilters(filters: ReportFilters, accounts: ReportAccount[], categories: ReportCategory[], members: Array<ReportMember & { userId: string }>) {

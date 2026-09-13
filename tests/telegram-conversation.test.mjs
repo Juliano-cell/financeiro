@@ -83,6 +83,15 @@ test("alteração de categoria limpa somente a subcategoria dependente", () => {
   assert.deepEqual(updateTelegramIntentField(baseIntent, "category", "category-home"), { ...baseIntent, categoryId: "category-home", subcategoryId: null, subcategorySkipped: false });
 });
 
+test("handler exige subcategoria ativa e não oferece pular quando a categoria possui opções", () => {
+  const handler = readFileSync(new URL("../lib/telegram-handler.ts", import.meta.url), "utf8");
+  assert.match(handler, /subcategoryCandidates\.length && !prepared\.subcategoryId/);
+  assert.match(handler, /missing\.add\("subcategoria"\)/);
+  assert.match(handler, /telegramSelectionButtons\(kind, items, page\.page, \{ allowNone: false/);
+  assert.match(handler, /const selected = resolveTelegramSelection\(items, callback\.id\)/);
+  assert.doesNotMatch(handler, /subcategorySkipped\)\s*missing\.add\("subcategoria"\)/);
+});
+
 test("alteração de subcategoria preserva categoria e demais campos", () => {
   assert.deepEqual(updateTelegramIntentField(baseIntent, "subcategory", "subcategory-restaurant"), { ...baseIntent, subcategoryId: "subcategory-restaurant", subcategorySkipped: false });
 });

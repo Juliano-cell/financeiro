@@ -3,7 +3,7 @@ import { and, asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { accounts, auditLogs, categories, householdInviteTokens, householdMembers, households, subcategories, transactions, users } from "@/db/schema";
+import { accounts, auditLogs, bills, categories, householdInviteTokens, householdMembers, households, subcategories, transactions, users } from "@/db/schema";
 import { digestToken, generateRecoveryCode, normalizeRecoveryCode } from "@/lib/auth-crypto.mjs";
 import { dateInTimeZone } from "@/lib/finance-analytics.mjs";
 import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
@@ -30,15 +30,21 @@ async function logChange(db: ReturnType<typeof getDb>, householdId: string, user
   await db.insert(auditLogs).values({ id: uid("audit"), householdId, userId, action, entityType, entityId, oldData: oldData ? JSON.stringify(oldData) : null, newData: newData ? JSON.stringify(newData) : null, createdAt: now() });
 }
 
-async function validateTransactionRelations(db: ReturnType<typeof getDb>, householdId: string, values: { accountId: string; categoryId?: string | null; subcategoryId?: string | null }) {
+async function validateTransactionRelations(db: ReturnType<typeof getDb>, householdId: string, values: { type: "income" | "expense"; accountId: string; categoryId?: string | null; subcategoryId?: string | null }) {
   const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, values.accountId), eq(accounts.householdId, householdId))).limit(1);
   if (!account) return "Conta inválida.";
+  if (values.type === "expense" && !values.categoryId) return "Selecione uma categoria para a despesa.";
+  let category: { id: string; type: "income" | "expense" | "both" } | undefined;
   if (values.categoryId) {
-    const [category] = await db.select({ id: categories.id }).from(categories).where(and(eq(categories.id, values.categoryId), eq(categories.householdId, householdId))).limit(1);
-    if (!category) return "Categoria inválida.";
+    [category] = await db.select({ id: categories.id, type: categories.type }).from(categories).where(and(eq(categories.id, values.categoryId), eq(categories.householdId, householdId), eq(categories.isActive, true))).limit(1);
+    if (!category || (category.type !== values.type && category.type !== "both")) return "Categoria inválida para este lançamento.";
   }
+  const categorySubcategories = category
+    ? await db.select({ id: subcategories.id }).from(subcategories).where(and(eq(subcategories.householdId, householdId), eq(subcategories.categoryId, category.id), eq(subcategories.isActive, true)))
+    : [];
+  if (values.type === "expense" && categorySubcategories.length && !values.subcategoryId) return "Selecione uma subcategoria para esta despesa.";
   if (values.subcategoryId) {
-    const [subcategory] = await db.select({ id: subcategories.id, categoryId: subcategories.categoryId }).from(subcategories).where(and(eq(subcategories.id, values.subcategoryId), eq(subcategories.householdId, householdId))).limit(1);
+    const [subcategory] = await db.select({ id: subcategories.id, categoryId: subcategories.categoryId }).from(subcategories).where(and(eq(subcategories.id, values.subcategoryId), eq(subcategories.householdId, householdId), eq(subcategories.isActive, true))).limit(1);
     if (!subcategory || !values.categoryId || subcategory.categoryId !== values.categoryId) return "Subcategoria inválida para esta família ou categoria.";
   }
   return null;
@@ -125,6 +131,19 @@ export async function POST(request: Request) {
     if (!membership) return NextResponse.json({ error: "Crie ou aceite uma família antes de continuar." }, { status: 409 });
     const householdId = membership.householdId;
 
+    if (action === "get_transaction") {
+      const parsed = z.object({ action: z.literal("get_transaction"), id }).strict().parse(body);
+      const [transaction] = await db.select({
+        id: transactions.id, type: transactions.type, amountCents: transactions.amountCents, description: transactions.description,
+        categoryId: transactions.categoryId, subcategoryId: transactions.subcategoryId, transactionDate: transactions.transactionDate,
+        transactionTime: transactions.transactionTime, responsibleUserId: transactions.responsibleUserId, accountId: transactions.accountId,
+        paymentMethod: transactions.paymentMethod, status: transactions.status, origin: transactions.origin, notes: transactions.notes,
+      }).from(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))).limit(1);
+      if (!transaction) return NextResponse.json({ error: "Movimentação não encontrada." }, { status: 404 });
+      const [billPayment] = await db.select({ id: bills.id }).from(bills).where(and(eq(bills.householdId, householdId), eq(bills.paymentTransactionId, transaction.id))).limit(1);
+      return NextResponse.json({ transaction, editable: !billPayment });
+    }
+
     if (action === "invite_member") {
       if (membership.role !== "owner") return NextResponse.json({ error: "Apenas o responsável pode convidar membros." }, { status: 403 });
       const parsed = z.object({ email: z.string().email().transform((value) => value.toLowerCase()) }).parse(body);
@@ -173,10 +192,10 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: true, id: result.id });
     }
     if (action === "update_transaction") {
-      const parsed = transactionInput.extend({ id }).parse(body); const [before] = await db.select().from(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))).limit(1); if (!before) return NextResponse.json({ error: "Movimentação não encontrada." }, { status: 404 }); const relationError = await validateTransactionRelations(db, householdId, parsed); if (relationError) return NextResponse.json({ error: relationError }, { status: 400 }); const { id: transactionId, ...values } = parsed; await db.update(transactions).set({ ...values, updatedAt: now() }).where(and(eq(transactions.id, transactionId), eq(transactions.householdId, householdId))); await logChange(db, householdId, auth.userId, "update", "transaction", transactionId, before, values); return NextResponse.json({ ok: true });
+      const parsed = transactionInput.extend({ id }).parse(body); const [before] = await db.select().from(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))).limit(1); if (!before) return NextResponse.json({ error: "Movimentação não encontrada." }, { status: 404 }); const [billPayment] = await db.select({ id: bills.id }).from(bills).where(and(eq(bills.householdId, householdId), eq(bills.paymentTransactionId, parsed.id))).limit(1); if (billPayment) return NextResponse.json({ error: "O pagamento de uma conta deve ser alterado pela própria conta." }, { status: 409 }); const relationError = await validateTransactionRelations(db, householdId, parsed); if (relationError) return NextResponse.json({ error: relationError }, { status: 400 }); const { id: transactionId, ...values } = parsed; await db.update(transactions).set({ ...values, updatedAt: now() }).where(and(eq(transactions.id, transactionId), eq(transactions.householdId, householdId))); await logChange(db, householdId, auth.userId, "update", "transaction", transactionId, before, values); return NextResponse.json({ ok: true });
     }
     if (action === "delete_transaction") {
-      const parsed = z.object({ id }).parse(body); const [before] = await db.select().from(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))).limit(1); if (!before) return NextResponse.json({ error: "Movimentação não encontrada." }, { status: 404 }); await db.delete(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))); await logChange(db, householdId, auth.userId, "delete", "transaction", parsed.id, before); return NextResponse.json({ ok: true });
+      const parsed = z.object({ id }).parse(body); const [before] = await db.select().from(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))).limit(1); if (!before) return NextResponse.json({ error: "Movimentação não encontrada." }, { status: 404 }); const [billPayment] = await db.select({ id: bills.id }).from(bills).where(and(eq(bills.householdId, householdId), eq(bills.paymentTransactionId, parsed.id))).limit(1); if (billPayment) return NextResponse.json({ error: "O pagamento de uma conta deve ser gerenciado pela própria conta." }, { status: 409 }); await db.delete(transactions).where(and(eq(transactions.id, parsed.id), eq(transactions.householdId, householdId))); await logChange(db, householdId, auth.userId, "delete", "transaction", parsed.id, before); return NextResponse.json({ ok: true });
     }
     return NextResponse.json({ error: "Ação inválida." }, { status: 400 });
   } catch (error) {

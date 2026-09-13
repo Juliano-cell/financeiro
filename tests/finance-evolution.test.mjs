@@ -123,6 +123,33 @@ test("endpoints web forçam origin e validam relações também ao editar transa
   assert.match(finance, /validateTransactionRelations\(db, householdId, parsed\)/); assert.match(finance, /subcategory\.categoryId !== values\.categoryId/);
 });
 
+test("despesa comum exige categoria e subcategoria ativa no backend de criação e edição", () => {
+  const service = readFileSync(new URL("../lib/finance-service.ts", import.meta.url), "utf8");
+  const finance = readFileSync(new URL("../app/api/finance/route.ts", import.meta.url), "utf8");
+  for (const source of [service, finance]) {
+    assert.match(source, /type === "expense" && ![^\n]*categoryId/);
+    assert.match(source, /Selecione uma categoria para a despesa/);
+    assert.match(source, /subcategories\.isActive, true/);
+    assert.match(source, /Selecione uma subcategoria para (?:a|esta) despesa/);
+  }
+  assert.match(service, /eq\(categories\.householdId, householdId\)/);
+  assert.match(service, /eq\(subcategories\.householdId, householdId\)/);
+  assert.match(finance, /eq\(categories\.householdId, householdId\)/);
+  assert.match(finance, /eq\(subcategories\.householdId, householdId\)/);
+});
+
+test("abertura de movimentação do relatório é estrita, isolada e protege pagamentos de conta", () => {
+  const finance = readFileSync(new URL("../app/api/finance/route.ts", import.meta.url), "utf8");
+  const reports = readFileSync(new URL("../app/finance-reports.tsx", import.meta.url), "utf8");
+  assert.match(finance, /z\.object\(\{ action: z\.literal\("get_transaction"\), id \}\)\.strict\(\)/);
+  assert.match(finance, /eq\(transactions\.id, parsed\.id\), eq\(transactions\.householdId, householdId\)/);
+  assert.doesNotMatch(finance, /get_transaction[\s\S]{0,1200}householdId:\s*transactions\.householdId/);
+  assert.match(finance, /eq\(bills\.paymentTransactionId, transaction\.id\)/);
+  assert.match(finance, /editable: !billPayment/);
+  assert.match(reports, /onOpenTransaction\(item\.id\)/);
+  assert.match(reports, /reportMovementMode\(item\) === "readonly"/);
+});
+
 test("senha mínima está alinhada em oito caracteres no frontend e backend", () => {
   const backend = readFileSync(new URL("../app/api/auth/route.ts", import.meta.url), "utf8"); const frontend = readFileSync(new URL("../app/auth-forms.tsx", import.meta.url), "utf8"); assert.match(backend, /\.min\(8,/); assert.match(frontend, /minLength=\{8\}/); assert.doesNotMatch(frontend, /minLength=\{12\}/);
 });

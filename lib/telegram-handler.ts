@@ -175,11 +175,12 @@ function prepareIntent(intent: FinancialIntent, context: HouseholdContext) {
     prepared.subcategoryId = null;
     prepared.subcategorySkipped = false;
   }
-  if (prepared.type && categoryCandidates.length && !prepared.categoryId) missing.add("categoria");
+  if (prepared.type === "expense" && !prepared.categoryId) missing.add("categoria");
+  else if (prepared.type && categoryCandidates.length && !prepared.categoryId) missing.add("categoria");
   if (prepared.categoryId && !prepared.cardId) {
     const subcategoryCandidates = eligibleSubcategories(prepared, context);
     if (prepared.subcategoryId && !subcategoryCandidates.some((subcategory) => subcategory.id === prepared.subcategoryId)) prepared.subcategoryId = null;
-    if (subcategoryCandidates.length && !prepared.subcategoryId && !prepared.subcategorySkipped) missing.add("subcategoria");
+    if (subcategoryCandidates.length && !prepared.subcategoryId) missing.add("subcategoria");
   }
   prepared.missing = [...missing];
   prepared.ambiguous = missing.size > 0;
@@ -196,7 +197,7 @@ function selectionResponse(kind: ChoiceKind, state: ConversationState, context: 
   const page = paginateTelegramOptions(items, state.page ?? 0);
   const field = kind === "account" ? "conta" : kind === "card" ? "cartão" : kind === "category" ? "categoria" : "subcategoria";
   const message = items.length ? `${prefix ? `${prefix}\n\n` : ""}${questionFor(field, state.financialIntent)}${page.totalPages > 1 ? ` Página ${page.page + 1} de ${page.totalPages}.` : ""}` : `Nenhuma ${field} ativa está disponível para este lançamento.`;
-  return { text: message, buttons: telegramSelectionButtons(kind, items, page.page, { allowNone: kind === "subcategory", allowCategoryBack: kind === "subcategory" }) };
+  return { text: message, buttons: telegramSelectionButtons(kind, items, page.page, { allowNone: false, allowCategoryBack: kind === "subcategory" }) };
 }
 
 async function presentIntent(updateId: string, telegramUserId: string, householdId: string, baseState: ConversationState, context: HouseholdContext, prefix?: string): Promise<TelegramHandlerResult> {
@@ -399,8 +400,7 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
       return { text: "Essa seleção não está mais disponível." };
     }
     const items = selectionItems(kind, state.financialIntent, context);
-    const allowNone = kind === "subcategory" && callback.id === "none";
-    const selected = allowNone ? { id: "none" } : resolveTelegramSelection(items, callback.id);
+    const selected = resolveTelegramSelection(items, callback.id);
     if (!selected) {
       const reply = selectionResponse(kind, state, context, "A opção escolhida é inválida ou não pertence mais à sua família.");
       await saveState(updateId, telegramUserId, link.householdId, state);
@@ -478,7 +478,7 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
   if (state && (state.phase === "choosing_edit_field" || Boolean(kindByPhase[state.phase]))) {
     const buttons = state.phase === "choosing_edit_field"
       ? telegramEditButtons({ isCard: Boolean(state.financialIntent.cardId), hasSubcategories: eligibleSubcategories(state.financialIntent, context).length > 0 })
-      : telegramSelectionButtons(kindByPhase[state.phase]!, selectionItems(kindByPhase[state.phase]!, state.financialIntent, context), state.page ?? 0, { allowNone: state.phase === "selecting_subcategory", allowCategoryBack: state.phase === "selecting_subcategory" });
+      : telegramSelectionButtons(kindByPhase[state.phase]!, selectionItems(kindByPhase[state.phase]!, state.financialIntent, context), state.page ?? 0, { allowNone: false, allowCategoryBack: state.phase === "selecting_subcategory" });
     await saveState(updateId, telegramUserId, link.householdId, state);
     return { text: "Use os botões da mensagem para continuar ou cancelar.", buttons };
   }

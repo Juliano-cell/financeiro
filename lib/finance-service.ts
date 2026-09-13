@@ -73,10 +73,15 @@ async function validateTransactionRelations(householdId: string, input: Transact
   const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, input.accountId), eq(accounts.householdId, householdId), eq(accounts.isActive, true))).limit(1);
   if (!account) throw new FinanceValidationError("Conta inválida.");
   let category: typeof categories.$inferSelect | undefined;
+  if (input.type === "expense" && !input.categoryId) throw new FinanceValidationError("Selecione uma categoria para a despesa.");
   if (input.categoryId) {
     [category] = await db.select().from(categories).where(and(eq(categories.id, input.categoryId), eq(categories.householdId, householdId), eq(categories.isActive, true))).limit(1);
     if (!category || (category.type !== input.type && category.type !== "both")) throw new FinanceValidationError("Categoria inválida para este lançamento.");
   }
+  const categorySubcategories = category
+    ? await db.select({ id: subcategories.id }).from(subcategories).where(and(eq(subcategories.householdId, householdId), eq(subcategories.categoryId, category.id), eq(subcategories.isActive, true)))
+    : [];
+  if (input.type === "expense" && categorySubcategories.length && !input.subcategoryId) throw new FinanceValidationError("Selecione uma subcategoria para esta despesa.");
   if (input.subcategoryId) {
     const [subcategory] = await db.select().from(subcategories).where(and(eq(subcategories.id, input.subcategoryId), eq(subcategories.householdId, householdId), eq(subcategories.isActive, true))).limit(1);
     if (!subcategory || !category || subcategory.categoryId !== category.id) throw new FinanceValidationError("Subcategoria inválida.");
