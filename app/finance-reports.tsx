@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { initializeReportFromDashboard, type DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import type { AnalyticsBreakdown, AnalyticsComparison, AnalyticsDetail, AnalyticsResponse, AnalyticsTrend } from "@/lib/finance-analytics-types";
 import { applyReportCategoryFilter, applyReportSubcategoryFilter, reportMovementMode } from "@/lib/finance-ui-rules.mjs";
 
@@ -54,10 +55,11 @@ async function requestReport(url: string, signal: AbortSignal) {
   return payload;
 }
 
-export function FinanceReports({ accounts, categories, members, refreshKey, onOpenTransaction }: { accounts: ReportAccount[]; categories: ReportCategory[]; members: ReportMember[]; refreshKey: number; onOpenTransaction: (transactionId: string) => Promise<boolean> }) {
-  const [selection, setSelection] = useState<FinancePeriodSelection>({ period: "this_month" });
-  const [filters, setFilters] = useState<ReportFilters>(emptyFilters);
-  const [page, setPage] = useState(1);
+export function FinanceReports({ accounts, categories, members, refreshKey, navigationIntent, onNavigationIntentConsumed, onOpenTransaction }: { accounts: ReportAccount[]; categories: ReportCategory[]; members: ReportMember[]; refreshKey: number; navigationIntent: DashboardNavigationIntent | null; onNavigationIntentConsumed: () => void; onOpenTransaction: (transactionId: string) => Promise<boolean> }) {
+  const initialNavigation = initializeReportFromDashboard(navigationIntent);
+  const [selection, setSelection] = useState<FinancePeriodSelection>(initialNavigation?.selection ?? { period: "this_month" });
+  const [filters, setFilters] = useState<ReportFilters>(initialNavigation?.filters ?? emptyFilters);
+  const [page, setPage] = useState(initialNavigation?.page ?? 1);
   const [data, setData] = useState<AnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -65,6 +67,10 @@ export function FinanceReports({ accounts, categories, members, refreshKey, onOp
   const [readonlyMovement, setReadonlyMovement] = useState<AnalyticsDetail | null>(null);
   const [openingMovement, setOpeningMovement] = useState("");
   const requestId = useRef(0);
+
+  useEffect(() => {
+    if (navigationIntent) onNavigationIntentConsumed();
+  }, [navigationIntent, onNavigationIntentConsumed]);
 
   useEffect(() => {
     const controller = new AbortController();

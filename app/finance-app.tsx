@@ -15,6 +15,7 @@ import { AdvancedFinanceView, advancedApi, type AdvancedSnapshot, type AdvancedV
 import { FinanceDashboard } from "@/app/finance-dashboard";
 import { FinanceReports } from "@/app/finance-reports";
 import { SubcategoryManager } from "@/app/subcategory-manager";
+import type { DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import { activeSubcategories, changeTransactionCategory, changeTransactionType, transactionClassificationError } from "@/lib/finance-ui-rules.mjs";
 
 type View = "dashboard" | "reports" | "transactions" | "accounts" | "categories" | "family" | AdvancedView;
@@ -63,6 +64,7 @@ export function FinanceApp() {
   const [categoryOpen, setCategoryOpen] = useState(false);
   const [editingCategory, setEditingCategory] = useState<Category | null>(null);
   const [reportRevision, setReportRevision] = useState(0);
+  const [dashboardNavigationIntent, setDashboardNavigationIntent] = useState<DashboardNavigationIntent | null>(null);
   const advancedRequestId = useRef(0);
   const mounted = useRef(false);
   const needsAdvanced = advancedViews.includes(view as AdvancedView) || transactionOpen;
@@ -94,6 +96,7 @@ export function FinanceApp() {
   }, [selectedMonth]);
   useEffect(() => { if (setupComplete && needsAdvanced) void Promise.resolve().then(loadAdvanced); }, [loadAdvanced, needsAdvanced, setupComplete]);
   const refresh = useCallback(async () => { if (needsAdvanced) await Promise.all([load(), loadAdvanced()]); else await load(); }, [load, loadAdvanced, needsAdvanced]);
+  const consumeDashboardNavigationIntent = useCallback(() => setDashboardNavigationIntent(null), []);
 
   useEffect(() => {
     const context = document.modelContext;
@@ -125,7 +128,12 @@ export function FinanceApp() {
     setTransactionOpen(true);
     return true;
   };
-  const navigate = (next: View) => { setView(next); setMobileOpen(false); };
+  const navigate = (next: View) => { if (next !== "reports") setDashboardNavigationIntent(null); setView(next); setMobileOpen(false); };
+  const navigateFromDashboard = (intent: DashboardNavigationIntent) => {
+    if (intent.target === "accounts") { setDashboardNavigationIntent(null); navigate("accounts"); return; }
+    setDashboardNavigationIntent(intent);
+    navigate("reports");
+  };
   const title = { dashboard: "Visão geral", reports: "Relatórios", transactions: "Movimentações", accounts: "Contas e carteiras", categories: "Categorias", family: "Família", cards: "Cartões", installments: "Parcelas", bills: "Contas e vencimentos", simulator: "Simulador", settings: "Configurações" }[view];
 
   return (
@@ -139,8 +147,8 @@ export function FinanceApp() {
         </header>
         <div className="mx-auto max-w-[1460px] p-4 md:p-8">
           {(view === "transactions" || advancedViews.includes(view as AdvancedView)) && <div className="mb-6 flex justify-end"><MonthNavigator month={selectedMonth} onChange={setSelectedMonth} /></div>}
-          {view === "dashboard" && <FinanceDashboard />}
-          {view === "reports" && <FinanceReports accounts={accounts} categories={categories} members={data.members ?? []} refreshKey={reportRevision} onOpenTransaction={openReportTransaction} />}
+          {view === "dashboard" && <FinanceDashboard onNavigate={navigateFromDashboard} />}
+          {view === "reports" && <FinanceReports accounts={accounts} categories={categories} members={data.members ?? []} refreshKey={reportRevision} navigationIntent={dashboardNavigationIntent} onNavigationIntentConsumed={consumeDashboardNavigationIntent} onOpenTransaction={openReportTransaction} />}
           {view === "transactions" && <TransactionsView items={transactions.filter((item) => item.transactionDate.startsWith(selectedMonth))} onNew={() => openTransaction()} onEdit={openTransaction} onDelete={async (item) => { await api({ action: "delete_transaction", id: item.id }); toast.success("Movimentação excluída e saldo recalculado."); await refresh(); }} />}
           {view === "accounts" && <AccountsView accounts={accounts} onNew={() => { setEditingAccount(null); setAccountOpen(true); }} onEdit={(item) => { setEditingAccount(item); setAccountOpen(true); }} onDelete={async (item) => { await api({ action: "delete_account", id: item.id }); toast.success("Conta excluída."); await load(); }} />}
           {view === "categories" && <CategoriesView categories={categories} onNew={() => { setEditingCategory(null); setCategoryOpen(true); }} onEdit={(item) => { setEditingCategory(item); setCategoryOpen(true); }} onDelete={async (item) => { await api({ action: "delete_category", id: item.id }); toast.success("Categoria excluída."); await load(); }} onChanged={load} />}

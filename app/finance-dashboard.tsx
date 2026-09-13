@@ -7,6 +7,7 @@ import { FinancePeriodFilter, type FinancePeriodSelection } from "@/app/finance-
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { createDashboardNavigationIntent, type DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import type { AnalyticsBreakdown, AnalyticsComparison, AnalyticsDetail, AnalyticsResponse } from "@/lib/finance-analytics-types";
 
 const currency = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
@@ -46,7 +47,7 @@ async function requestAnalytics(url: string, signal: AbortSignal) {
   return payload;
 }
 
-export function FinanceDashboard() {
+export function FinanceDashboard({ onNavigate }: { onNavigate: (intent: DashboardNavigationIntent) => void }) {
   const [selection, setSelection] = useState<FinancePeriodSelection>({ period: "this_month" });
   const [data, setData] = useState<AnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -130,10 +131,10 @@ export function FinanceDashboard() {
       {error && <div role="alert" className="flex flex-col gap-3 rounded-2xl border border-[#e9c98e] bg-[#fff8e9] p-4 text-sm text-[#7d5618] sm:flex-row sm:items-center sm:justify-between"><span>Os dados anteriores continuam visíveis, mas a atualização falhou: {error}</span><Button size="sm" variant="outline" onClick={() => { setLoading(true); setError(""); setReload((value) => value + 1); }}><RefreshCw className="h-4 w-4" /> Tentar novamente</Button></div>}
 
       <div className={`grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-4 ${loading ? "opacity-60" : ""}`} aria-busy={loading}>
-        <KpiCard label="Saldo atual" value={data.balance.currentCents} icon={<Wallet className="h-5 w-5" />} tone="dark" note="Disponível nas contas ativas" />
-        <KpiCard label="Entradas" value={data.totals.income.currentCents} comparison={data.totals.income} icon={<ArrowDownLeft className="h-5 w-5" />} tone="green" />
-        <KpiCard label="Despesas" value={data.totals.expense.currentCents} comparison={data.totals.expense} icon={<ArrowUpRight className="h-5 w-5" />} tone="orange" onClick={() => { setDetail(null); setDetailLoading(true); setDetailError(""); setDrilldown({ title: "Despesas do período", page: 1 }); }} />
-        <KpiCard label="Resultado" value={data.totals.result.currentCents} comparison={data.totals.result} icon={<CircleDollarSign className="h-5 w-5" />} tone="blue" />
+        <KpiCard label="Saldo atual" value={data.balance.currentCents} icon={<Wallet className="h-5 w-5" />} tone="dark" note="Disponível nas contas ativas" actionLabel="Abrir contas" ariaLabel="Abrir Contas para consultar o saldo" onClick={() => onNavigate(createDashboardNavigationIntent("balance", selection))} />
+        <KpiCard label="Entradas" value={data.totals.income.currentCents} comparison={data.totals.income} icon={<ArrowDownLeft className="h-5 w-5" />} tone="green" actionLabel="Ver entradas" ariaLabel="Abrir relatório de entradas deste período" onClick={() => onNavigate(createDashboardNavigationIntent("income", selection))} />
+        <KpiCard label="Despesas" value={data.totals.expense.currentCents} comparison={data.totals.expense} icon={<ArrowUpRight className="h-5 w-5" />} tone="orange" actionLabel="Ver despesas" ariaLabel="Abrir relatório de despesas deste período" onClick={() => onNavigate(createDashboardNavigationIntent("expense", selection))} />
+        <KpiCard label="Resultado" value={data.totals.result.currentCents} comparison={data.totals.result} icon={<CircleDollarSign className="h-5 w-5" />} tone="blue" actionLabel="Ver relatório" ariaLabel="Abrir relatório completo deste período" onClick={() => onNavigate(createDashboardNavigationIntent("result", selection))} />
       </div>
 
       <div className="grid min-w-0 gap-5 xl:grid-cols-[1.35fr_.85fr]">
@@ -177,10 +178,10 @@ export function FinanceDashboard() {
   );
 }
 
-function KpiCard({ label, value, comparison, icon, tone, note, onClick }: { label: string; value: number; comparison?: AnalyticsComparison; icon: React.ReactNode; tone: "dark" | "green" | "orange" | "blue"; note?: string; onClick?: () => void }) {
+function KpiCard({ label, value, comparison, icon, tone, note, actionLabel, ariaLabel, onClick }: { label: string; value: number; comparison?: AnalyticsComparison; icon: React.ReactNode; tone: "dark" | "green" | "orange" | "blue"; note?: string; actionLabel: string; ariaLabel: string; onClick: () => void }) {
   const colors = { dark: "bg-[#123a33] text-white", green: "bg-[#eff8e9] text-[#315f29]", orange: "bg-[#fff3e2] text-[#89521b]", blue: "bg-[#eaf3f1] text-[#355f58]" };
   const content = <><span className={`grid h-10 w-10 place-items-center rounded-xl ${tone === "dark" ? "bg-white/10" : "bg-white/70"}`}>{icon}</span><span className={`mt-5 block text-xs font-semibold uppercase tracking-[0.1em] ${tone === "dark" ? "text-white/60" : "opacity-70"}`}>{label}</span><strong className="mt-2 block break-words text-2xl tracking-[-0.04em] sm:text-3xl">{brl(value)}</strong><span className={`mt-3 block min-h-5 text-xs ${tone === "dark" ? "text-white/60" : "opacity-75"}`}>{comparison ? <ComparisonInline comparison={comparison} /> : note}</span></>;
-  return onClick ? <button type="button" onClick={onClick} className={`min-w-0 rounded-[22px] p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${colors[tone]}`}>{content}<span className="mt-4 flex items-center gap-1 text-xs font-semibold">Ver detalhes <ArrowRight className="h-3.5 w-3.5" /></span></button> : <article className={`min-w-0 rounded-[22px] p-5 shadow-sm ${colors[tone]}`}>{content}</article>;
+  return <button type="button" onClick={onClick} aria-label={ariaLabel} title={ariaLabel} className={`min-w-0 cursor-pointer rounded-[22px] p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#639b32] focus-visible:ring-offset-2 ${colors[tone]}`}>{content}<span className="mt-4 flex items-center gap-1 text-xs font-semibold">{actionLabel} <ArrowRight className="h-3.5 w-3.5" /></span></button>;
 }
 
 function ComparisonInline({ comparison, suffix = " vs. período anterior" }: { comparison: AnalyticsComparison; suffix?: string }) {
