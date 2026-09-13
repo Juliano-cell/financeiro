@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { CalendarClock, ChevronLeft, ChevronRight, CreditCard, Link2, Plus, Receipt, Sparkles, Trash2 } from "lucide-react";
+import { useRef, useState } from "react";
+import { CalendarClock, ChevronLeft, ChevronRight, CreditCard, Pencil, Link2, Plus, Receipt, RotateCcw, Sparkles, Trash2, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,14 +9,16 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { activeBillCategories, activeBillSubcategories, billActions, billClassificationError, buildBillPaymentPayload, changeBillCategory, friendlyBillPaymentError, initialBillPaymentAccountId, normalizeBillAccountId } from "@/lib/bill-ui-rules.mjs";
 
 export type AdvancedView = "cards" | "installments" | "bills" | "simulator" | "settings";
 type Account = { id: string; name: string; currentBalanceCents: number; isActive: boolean };
-type Category = { id: string; name: string; isActive: boolean };
+type Subcategory = { id: string; name: string; categoryId: string; isActive?: boolean };
+type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: Subcategory[] };
 type Card = { id: string; name: string; institution: string; holder: string; limitCents: number; closingDay: number; dueDay: number; isActive: boolean; notes: string | null; usedCents: number; availableCents: number; currentInvoiceCents: number; nextInvoiceCents: number; installmentPurchaseCount: number };
 type Installment = { id: string; purchaseId: string; invoiceId: string; installmentNumber: number; installmentCount: number; amountCents: number; status: string; purchase?: { description: string; status: string }; invoice?: { referenceMonth: string; dueDate: string; status: string }; card?: { name: string } };
 type Invoice = { id: string; cardId: string; referenceMonth: string; dueDate: string; status: "open" | "closed" | "paid"; totalCents: number; installments: Installment[] };
-type Bill = { id: string; description: string; amountCents: number; dueDate: string; recurrence: "none" | "monthly"; status: string; displayStatus: "pending" | "paid" | "cancelled" | "overdue"; accountId: string | null; notes: string | null };
+type Bill = { id: string; description: string; amountCents: number; dueDate: string; categoryId: string | null; subcategoryId: string | null; recurrence: "none" | "monthly"; recurrenceSeriesId: string | null; recurrenceEndDate: string | null; status: "pending" | "paid" | "cancelled"; displayStatus: "pending" | "paid" | "cancelled" | "overdue"; accountId: string | null; notes: string | null };
 export type AdvancedSnapshot = { selectedMonth: string; cards: Card[]; invoices: Invoice[]; installments: Installment[]; bills: Bill[]; notificationSettings: { enabled: boolean; offsets: number[] }; summary: { availableCents: number; incomeCents: number; expenseCents: number; paidBillsCents: number; pendingBillsCents: number; cardCents: number; installmentCents: number; commitmentsCents: number; projectedCents: number } };
 
 const brl = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
@@ -24,10 +26,14 @@ const monthLabel = (month: string) => new Intl.DateTimeFormat("pt-BR", { month: 
 const addMonth = (month: string, amount: number) => { const [year, value] = month.split("-").map(Number); const date = new Date(Date.UTC(year, value - 1 + amount, 1)); return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`; };
 const cents = (value: FormDataEntryValue | null) => { const normalized = String(value ?? "").trim().replace(/\./g, "").replace(",", "."); return Math.round(Number(normalized) * 100); };
 
+export class AdvancedApiError extends Error {
+  constructor(message: string, public code?: string) { super(message); this.name = "AdvancedApiError"; }
+}
+
 export async function advancedApi(body?: Record<string, unknown>, month?: string) {
   const response = await fetch(body ? "/api/finance/advanced" : `/api/finance/advanced?month=${encodeURIComponent(month ?? new Date().toISOString().slice(0, 7))}`, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : undefined);
-  const data = await response.json() as { error?: string } & Record<string, unknown>;
-  if (!response.ok) throw new Error(data.error ?? "Não foi possível concluir a operação.");
+  const data = await response.json() as { error?: string; code?: string } & Record<string, unknown>;
+  if (!response.ok) throw new AdvancedApiError(data.error ?? "Não foi possível concluir a operação.", data.code);
   return data;
 }
 
@@ -65,10 +71,140 @@ function InstallmentsView({ data }: { data: AdvancedSnapshot }) {
 }
 
 function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSnapshot; accounts: Account[]; categories: Category[]; onChanged: () => Promise<void> }) {
-  const [open, setOpen] = useState(false); const rows = data.bills.filter((item) => item.dueDate.startsWith(data.selectedMonth) && item.status !== "cancelled");
-  const save = async (event: React.FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = new FormData(event.currentTarget); try { await advancedApi({ action: "create_bill", description: form.get("description"), amountCents: cents(form.get("amount")), dueDate: form.get("dueDate"), categoryId: form.get("categoryId") === "none" ? null : form.get("categoryId"), accountId: form.get("accountId") === "none" ? null : form.get("accountId"), recurrence: form.get("recurrence"), recurrenceEndDate: form.get("recurrenceEndDate") || null, notes: form.get("notes") || null }); setOpen(false); toast.success("Conta a pagar criada."); await onChanged(); } catch (error) { toast.error(error instanceof Error ? error.message : "Falha."); } };
-  return <section><Heading title="Contas e vencimentos" text="Pendências, recorrências e pagamentos ligados a uma única movimentação." action={<Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Nova conta</Button>} /><div className="mt-6 grid gap-3">{rows.length ? rows.map((item) => <div key={item.id} className="grid gap-3 rounded-2xl border bg-white p-4 sm:grid-cols-[1.5fr_1fr_auto_auto] sm:items-center"><div><p className="font-medium">{item.description}</p><p className="text-xs text-[#71837e]">{item.recurrence === "monthly" ? "Recorrente mensal" : "Conta avulsa"}</p></div><span>Vence {new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(new Date(`${item.dueDate}T00:00:00Z`))}</span><strong>{brl(item.amountCents)}</strong>{item.status === "paid" ? <Badge>Pago</Badge> : <Button size="sm" variant={item.displayStatus === "overdue" ? "destructive" : "default"} disabled={!accounts.some((account) => account.isActive)} onClick={async () => { const account = accounts.find((value) => value.id === item.accountId) ?? accounts.find((value) => value.isActive); if (!account) return; try { await advancedApi({ action: "pay_bill", id: item.id, accountId: account.id }); toast.success(`Conta paga usando ${account.name}.`); await onChanged(); } catch (error) { toast.error(error instanceof Error ? error.message : "Falha."); } }}>{item.displayStatus === "overdue" ? "Vencida · pagar" : "Marcar paga"}</Button>}</div>) : <Empty icon={CalendarClock} text="Nenhuma conta a pagar neste mês." />}</div><Dialog open={open} onOpenChange={setOpen}><DialogContent><DialogHeader><DialogTitle>Nova conta a pagar</DialogTitle><DialogDescription>Uma recorrência mensal gera até 24 ocorrências ou termina na data informada.</DialogDescription></DialogHeader><form onSubmit={save} className="grid gap-4 sm:grid-cols-2"><div className="sm:col-span-2"><Field name="description" label="Descrição" required /></div><Field name="amount" label="Valor (R$)" inputMode="decimal" required /><Field name="dueDate" label="Vencimento" type="date" required /><SelectField name="categoryId" label="Categoria" items={[{ value: "none", label: "Sem categoria" }, ...categories.map((item) => ({ value: item.id, label: item.name }))]} /><SelectField name="accountId" label="Conta para pagamento" items={[{ value: "none", label: "Definir ao pagar" }, ...accounts.filter((item) => item.isActive).map((item) => ({ value: item.id, label: item.name }))]} /><SelectField name="recurrence" label="Recorrência" items={[{ value: "none", label: "Não recorrente" }, { value: "monthly", label: "Todo mês" }]} /><Field name="recurrenceEndDate" label="Repetir até (opcional)" type="date" /><div className="sm:col-span-2"><Field name="notes" label="Observação" /></div><DialogFooter className="sm:col-span-2"><Button type="button" variant="outline" onClick={() => setOpen(false)}>Cancelar</Button><Button type="submit">Criar conta</Button></DialogFooter></form></DialogContent></Dialog></section>;
+  const [editor, setEditor] = useState<{ item: Bill | null; session: number } | null>(null);
+  const [payment, setPayment] = useState<{ bill: Bill; session: number } | null>(null);
+  const [confirmation, setConfirmation] = useState<{ bill: Bill; kind: "cancel" | "undo"; session: number } | null>(null);
+  const session = useRef(0);
+  const rows = data.bills.filter((item) => item.dueDate.startsWith(data.selectedMonth));
+  const categoryName = (bill: Bill) => categories.find((category) => category.id === bill.categoryId)?.name ?? "Sem categoria";
+  const subcategoryName = (bill: Bill) => categories.flatMap((category) => category.subcategories ?? []).find((subcategory) => subcategory.id === bill.subcategoryId)?.name ?? "Sem subcategoria";
+  const accountName = (bill: Bill) => accounts.find((account) => account.id === bill.accountId)?.name ?? "Definir ao pagar";
+  const nextSession = () => { session.current += 1; return session.current; };
+  const openEditor = (item: Bill | null) => setEditor({ item, session: nextSession() });
+  const openPayment = (bill: Bill) => setPayment({ bill, session: nextSession() });
+
+  return <section>
+    <Heading title="Contas e vencimentos" text="Pendências, recorrências e pagamentos ligados a uma única movimentação." action={<Button onClick={() => openEditor(null)}><Plus className="h-4 w-4" /> Nova conta</Button>} />
+    <div className="mt-6 grid gap-3">{rows.length ? rows.map((item) => {
+      const actions = billActions(item.status);
+      const status = item.status === "paid" ? "Pago" : item.status === "cancelled" ? "Cancelado" : item.displayStatus === "overdue" ? "Vencido" : "Pendente";
+      return <article key={item.id} className={`rounded-2xl border bg-white p-4 ${item.status === "cancelled" ? "opacity-70" : ""}`}>
+        <div className="grid gap-4 sm:grid-cols-[minmax(0,1.5fr)_auto_auto] sm:items-start">
+          <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><p className="truncate font-medium" title={item.description}>{item.description}</p><Badge variant={item.status === "cancelled" || item.displayStatus === "overdue" ? "destructive" : item.status === "paid" ? "secondary" : "outline"}>{status}</Badge></div><p className="mt-1 text-xs text-[#71837e]">{item.recurrence === "monthly" ? "Recorrente mensal" : "Conta avulsa"} · {categoryName(item)} · {subcategoryName(item)}</p><p className="mt-1 text-xs text-[#71837e]">Conta: {accountName(item)}</p></div>
+          <span className="text-sm">Vence {formatBillDate(item.dueDate)}</span><strong className="text-lg sm:text-right">{brl(item.amountCents)}</strong>
+        </div>
+        {actions.length > 0 && <div className="mt-4 flex flex-wrap justify-end gap-2 border-t pt-3">
+          {actions.includes("pay") && <Button size="sm" variant={item.displayStatus === "overdue" ? "destructive" : "default"} onClick={() => openPayment(item)}>{item.displayStatus === "overdue" ? "Pagar vencida" : "Pagar"}</Button>}
+          {actions.includes("edit") && <Button size="sm" variant="outline" onClick={() => openEditor(item)}><Pencil className="h-4 w-4" /> Editar</Button>}
+          {actions.includes("cancel") && <Button size="sm" variant="ghost" onClick={() => setConfirmation({ bill: item, kind: "cancel", session: nextSession() })}><XCircle className="h-4 w-4" /> Cancelar</Button>}
+          {actions.includes("undo") && <Button size="sm" variant="outline" onClick={() => setConfirmation({ bill: item, kind: "undo", session: nextSession() })}><RotateCcw className="h-4 w-4" /> Desfazer pagamento</Button>}
+        </div>}
+      </article>;
+    }) : <Empty icon={CalendarClock} text="Nenhum vencimento neste mês." />}</div>
+    {editor && <BillEditorDialog key={editor.session} open item={editor.item} accounts={accounts} categories={categories} onOpenChange={(open) => { if (!open) setEditor(null); }} onChanged={onChanged} />}
+    {payment && <BillPaymentDialog key={payment.session} open bill={payment.bill} accounts={accounts} categories={categories} onOpenChange={(open) => { if (!open) setPayment(null); }} onChanged={onChanged} onEdit={() => { const bill = payment.bill; setPayment(null); openEditor(bill); }} />}
+    {confirmation && <BillConfirmationDialog key={confirmation.session} open bill={confirmation.bill} kind={confirmation.kind} onOpenChange={(open) => { if (!open) setConfirmation(null); }} onChanged={onChanged} />}
+  </section>;
 }
+
+function BillEditorDialog({ open, item, accounts, categories, onOpenChange, onChanged }: { open: boolean; item: Bill | null; accounts: Account[]; categories: Category[]; onOpenChange: (open: boolean) => void; onChanged: () => Promise<void> }) {
+  const availableCategories = activeBillCategories(categories) as Category[];
+  const initialCategoryId = availableCategories.some((category) => category.id === item?.categoryId) ? item?.categoryId ?? null : null;
+  const initialSubcategories = activeBillSubcategories(categories, initialCategoryId) as Subcategory[];
+  const [classification, setClassification] = useState({ categoryId: initialCategoryId, subcategoryId: initialSubcategories.some((subcategory) => subcategory.id === item?.subcategoryId) ? item?.subcategoryId ?? null : null });
+  const [accountId, setAccountId] = useState(accounts.some((account) => account.id === item?.accountId && account.isActive) ? item?.accountId ?? null : null);
+  const [recurrence, setRecurrence] = useState<"none" | "monthly">(item?.recurrence ?? "none");
+  const [scope, setScope] = useState<"occurrence" | "future">("occurrence");
+  const [busy, setBusy] = useState(false);
+  const recurringEdit = Boolean(item?.recurrenceSeriesId);
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const classificationMessage = billClassificationError(classification, categories);
+    if (classificationMessage) { toast.error(classificationMessage); return; }
+    const form = new FormData(event.currentTarget);
+    setBusy(true);
+    let completed = false;
+    try {
+      if (!item) {
+        await advancedApi({ action: "create_bill", description: form.get("description"), amountCents: cents(form.get("amount")), dueDate: form.get("dueDate"), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, recurrence, recurrenceEndDate: recurrence === "monthly" ? form.get("recurrenceEndDate") || null : null, notes: form.get("notes") || null });
+        toast.success("Vencimento criado.");
+      } else if (scope === "future" && item.recurrenceSeriesId) {
+        await advancedApi({ action: "update_recurring_bill_series", id: item.recurrenceSeriesId, description: form.get("description"), amountCents: cents(form.get("amount")), dayOfMonth: Number(form.get("dayOfMonth")), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, endsOn: form.get("recurrenceEndDate") || null, notes: form.get("notes") || null });
+        toast.success("Série e vencimentos futuros atualizados.");
+      } else {
+        await advancedApi({ action: "update_bill_occurrence", id: item.id, description: form.get("description"), amountCents: cents(form.get("amount")), dueDate: form.get("dueDate"), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, notes: form.get("notes") || null });
+        toast.success("Vencimento atualizado.");
+      }
+      await onChanged();
+      completed = true;
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Não foi possível salvar o vencimento."); }
+    finally { setBusy(false); if (completed) onOpenChange(false); }
+  };
+  return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}><DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-xl"><DialogHeader><DialogTitle>{item ? "Editar vencimento" : "Novo vencimento"}</DialogTitle><DialogDescription>{item ? "Apenas vencimentos pendentes podem ter dados financeiros alterados." : "Cadastre a classificação e escolha uma conta ou deixe para definir no pagamento."}</DialogDescription></DialogHeader><form onSubmit={submit} className="grid gap-4 sm:grid-cols-2">
+    {recurringEdit && <div className="sm:col-span-2"><Label>Aplicar alteração</Label><Select value={scope} onValueChange={(value) => setScope(value as "occurrence" | "future")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="occurrence">Somente esta ocorrência</SelectItem><SelectItem value="future">Todos os vencimentos futuros da série</SelectItem></SelectContent></Select></div>}
+    <div className="sm:col-span-2"><Field name="description" label="Descrição" defaultValue={item?.description ?? ""} required /></div><Field name="amount" label="Valor (R$)" defaultValue={item ? (item.amountCents / 100).toFixed(2).replace(".", ",") : ""} inputMode="decimal" required />
+    {scope === "future" && recurringEdit ? <Field name="dayOfMonth" label="Dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : <Field name="dueDate" label="Vencimento" type="date" defaultValue={item?.dueDate} required />}
+    <BillClassificationFields categories={availableCategories} classification={classification} onChange={setClassification} />
+    <div><Label>Conta para pagamento</Label><Select value={accountId ?? "none"} onValueChange={(value) => setAccountId(normalizeBillAccountId(value))}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">Definir ao pagar</SelectItem>{accounts.filter((account) => account.isActive).map((account) => <SelectItem key={account.id} value={account.id}>{account.name}</SelectItem>)}</SelectContent></Select></div>
+    {!item && <div><Label>Recorrência</Label><Select value={recurrence} onValueChange={(value) => setRecurrence(value as "none" | "monthly")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">Não recorrente</SelectItem><SelectItem value="monthly">Todo mês</SelectItem></SelectContent></Select></div>}
+    {((!item && recurrence === "monthly") || (scope === "future" && recurringEdit)) && <Field name="recurrenceEndDate" label="Repetir até (opcional)" type="date" defaultValue={item?.recurrenceEndDate ?? ""} />}
+    <div className="sm:col-span-2"><Field name="notes" label="Observação" defaultValue={item?.notes ?? ""} /></div><DialogFooter className="sm:col-span-2"><Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>Cancelar</Button><Button type="submit" disabled={busy}>{busy ? "Salvando..." : item ? "Salvar alterações" : "Criar vencimento"}</Button></DialogFooter>
+  </form></DialogContent></Dialog>;
+}
+
+function BillClassificationFields({ categories, classification, onChange }: { categories: Category[]; classification: { categoryId: string | null; subcategoryId: string | null }; onChange: (value: { categoryId: string | null; subcategoryId: string | null }) => void }) {
+  const subcategories = activeBillSubcategories(categories, classification.categoryId) as Subcategory[];
+  return <><div><Label>Categoria *</Label><Select value={classification.categoryId ?? "none"} onValueChange={(value) => onChange(changeBillCategory(classification, value === "none" ? null : value))}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none" disabled>Selecione uma categoria</SelectItem>{categories.map((category) => <SelectItem key={category.id} value={category.id}>{category.name}</SelectItem>)}</SelectContent></Select></div>{classification.categoryId && subcategories.length > 0 ? <div><Label>Subcategoria *</Label><Select value={classification.subcategoryId ?? "none"} onValueChange={(value) => onChange({ ...classification, subcategoryId: value === "none" ? null : value })}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none" disabled>Selecione uma subcategoria</SelectItem>{subcategories.map((subcategory) => <SelectItem key={subcategory.id} value={subcategory.id}>{subcategory.name}</SelectItem>)}</SelectContent></Select></div> : classification.categoryId ? <div className="self-end rounded-xl bg-[#f4f7f5] px-3 py-3 text-sm text-[#71837e]">Esta categoria não possui subcategorias ativas.</div> : null}</>;
+}
+
+function BillPaymentDialog({ open, bill, accounts, categories, onOpenChange, onChanged, onEdit }: { open: boolean; bill: Bill; accounts: Account[]; categories: Category[]; onOpenChange: (open: boolean) => void; onChanged: () => Promise<void>; onEdit: () => void }) {
+  const activeAccounts = accounts.filter((account) => account.isActive);
+  const [accountId, setAccountId] = useState<string | null>(initialBillPaymentAccountId(bill, accounts));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<{ message: string; classification: boolean } | null>(null);
+  const category = categories.find((item) => item.id === bill.categoryId);
+  const subcategory = category?.subcategories.find((item) => item.id === bill.subcategoryId);
+  const confirm = async () => {
+    if (!accountId || busy) return;
+    setBusy(true); setError(null);
+    let completed = false;
+    try {
+      await advancedApi(buildBillPaymentPayload(bill.id, accountId));
+      toast.success(`Vencimento pago usando ${accounts.find((account) => account.id === accountId)?.name ?? "a conta selecionada"}.`);
+      await onChanged();
+      completed = true;
+    } catch (cause) {
+      const code = cause instanceof AdvancedApiError ? cause.code : undefined;
+      const message = friendlyBillPaymentError(code, cause instanceof Error ? cause.message : undefined);
+      setError({ message, classification: code === "BILL_CLASSIFICATION_REQUIRED" });
+    } finally { setBusy(false); if (completed) onOpenChange(false); }
+  };
+  return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}><DialogContent><DialogHeader><DialogTitle>Confirmar pagamento</DialogTitle><DialogDescription>Confira os dados e escolha explicitamente a conta que será utilizada.</DialogDescription></DialogHeader><div className="grid gap-3 rounded-2xl bg-[#f4f7f5] p-4 text-sm sm:grid-cols-2"><BillDetail label="Descrição" value={bill.description} /><BillDetail label="Valor" value={brl(bill.amountCents)} /><BillDetail label="Vencimento" value={formatBillDate(bill.dueDate)} /><BillDetail label="Categoria" value={category?.name ?? "Sem categoria"} /><BillDetail label="Subcategoria" value={subcategory?.name ?? "Sem subcategoria"} /></div><div><Label>Conta utilizada *</Label><Select value={accountId ?? "none"} onValueChange={(value) => { setAccountId(normalizeBillAccountId(value)); setError(null); }}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none" disabled>Selecione uma conta</SelectItem>{activeAccounts.map((account) => <SelectItem key={account.id} value={account.id}>{account.name} · {brl(account.currentBalanceCents)}</SelectItem>)}</SelectContent></Select>{bill.accountId && accountId === bill.accountId && <p className="mt-2 text-xs text-[#71837e]">Conta previamente definida para este vencimento. Você pode alterá-la antes de confirmar.</p>}{bill.accountId && !accountId && <p className="mt-2 text-xs text-[#9b5b17]">A conta anteriormente definida não está ativa. Selecione outra conta para pagar.</p>}{!activeAccounts.length && <p className="mt-2 text-xs text-[#9b5b17]">Não existe uma conta ativa disponível para este pagamento.</p>}</div>{error && <div className="rounded-xl border border-[#e7b9b9] bg-[#fff4f4] p-3 text-sm text-[#8c3434]"><p>{error.message}</p>{error.classification && <Button className="mt-2" size="sm" variant="outline" onClick={onEdit}>Editar classificação</Button>}</div>}<DialogFooter><Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>Voltar</Button><Button type="button" disabled={busy || !accountId} onClick={confirm}>{busy ? "Pagando..." : "Confirmar pagamento"}</Button></DialogFooter></DialogContent></Dialog>;
+}
+
+function BillConfirmationDialog({ open, bill, kind, onOpenChange, onChanged }: { open: boolean; bill: Bill; kind: "cancel" | "undo"; onOpenChange: (open: boolean) => void; onChanged: () => Promise<void> }) {
+  const [busy, setBusy] = useState(false);
+  const [scope, setScope] = useState<"occurrence" | "future">("occurrence");
+  const recurring = Boolean(bill.recurrenceSeriesId);
+  const confirm = async () => {
+    if (busy) return;
+    setBusy(true);
+    let completed = false;
+    try {
+      if (kind === "undo") await advancedApi({ action: "undo_bill_payment", id: bill.id });
+      else if (scope === "future" && bill.recurrenceSeriesId) await advancedApi({ action: "cancel_recurring_bill_series", id: bill.recurrenceSeriesId });
+      else await advancedApi({ action: "cancel_bill_occurrence", id: bill.id });
+      toast.success(kind === "undo" ? "Pagamento desfeito. O vencimento voltou para pendente." : scope === "future" && recurring ? "Série e vencimentos futuros cancelados." : "Vencimento cancelado.");
+      await onChanged();
+      completed = true;
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Não foi possível concluir a operação."); }
+    finally { setBusy(false); if (completed) onOpenChange(false); }
+  };
+  return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}><DialogContent><DialogHeader><DialogTitle>{kind === "undo" ? "Desfazer pagamento?" : "Cancelar vencimento?"}</DialogTitle><DialogDescription>{kind === "undo" ? "O vencimento voltará para pendente, a transação financeira vinculada será removida e o efeito no saldo será revertido." : "O vencimento cancelado não poderá ser pago e não será tratado como despesa realizada."}</DialogDescription></DialogHeader>{kind === "cancel" && recurring && <div><Label>Alcance do cancelamento</Label><Select value={scope} onValueChange={(value) => setScope(value as "occurrence" | "future")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="occurrence">Somente esta ocorrência</SelectItem><SelectItem value="future">Todos os vencimentos futuros da série</SelectItem></SelectContent></Select></div>}<DialogFooter><Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>Voltar</Button><Button type="button" variant={kind === "cancel" ? "destructive" : "default"} disabled={busy} onClick={confirm}>{busy ? kind === "undo" ? "Desfazendo..." : "Cancelando..." : kind === "undo" ? "Desfazer pagamento" : "Confirmar cancelamento"}</Button></DialogFooter></DialogContent></Dialog>;
+}
+
+function BillDetail({ label, value }: { label: string; value: string }) { return <div><p className="text-xs text-[#71837e]">{label}</p><p className="mt-1 font-medium">{value}</p></div>; }
+function formatBillDate(date: string) { return new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(new Date(`${date}T00:00:00Z`)); }
 
 function SimulatorView({ data }: { data: AdvancedSnapshot }) {
   const [result, setResult] = useState<{ rating: string | null; label?: string; reasons: string[]; installmentCents?: number; lowestBalanceCents?: number; months: Array<{ month: string; projectedBalanceCents: number; simulatedCents: number }> } | null>(null);
