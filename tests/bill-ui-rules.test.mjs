@@ -6,6 +6,7 @@ import {
   billActions,
   billClassificationError,
   buildBillPaymentPayload,
+  buildRecurringBillCalendarPayload,
   changeBillCategory,
   eligibleRecurringBillIds,
   friendlyBillPaymentError,
@@ -92,6 +93,18 @@ test("seleção manual normaliza duplicados, bloqueia inelegíveis e permite alt
   assert.deepEqual(toggleRecurringBillSelection(["one"], "paid", true, eligible), ["one"]);
 });
 
+test("payload recorrente só envia calendário quando a opção correspondente está marcada", () => {
+  const valueOnly = buildRecurringBillCalendarPayload({ scope: "future", changeDueDate: false, changeRecurrenceEnd: false, dayOfMonth: "14", endsOn: "2026-12-13" });
+  assert.deepEqual(valueOnly, { changeDueDate: false, changeRecurrenceEnd: false });
+  assert.equal("dayOfMonth" in valueOnly, false);
+  assert.equal("endsOn" in valueOnly, false);
+
+  assert.deepEqual(buildRecurringBillCalendarPayload({ scope: "future", changeDueDate: true, changeRecurrenceEnd: false, dayOfMonth: "14", endsOn: "2026-12-13" }), { changeDueDate: true, changeRecurrenceEnd: false, dayOfMonth: 14 });
+  assert.deepEqual(buildRecurringBillCalendarPayload({ scope: "future", changeDueDate: false, changeRecurrenceEnd: true, dayOfMonth: "14", endsOn: "2026-12-13" }), { changeDueDate: false, changeRecurrenceEnd: true, endsOn: "2026-12-13" });
+  assert.deepEqual(buildRecurringBillCalendarPayload({ scope: "future", changeDueDate: true, changeRecurrenceEnd: true, dayOfMonth: "14", endsOn: "" }), { changeDueDate: true, changeRecurrenceEnd: true, dayOfMonth: 14, endsOn: null });
+  assert.deepEqual(buildRecurringBillCalendarPayload({ scope: "selected", changeDueDate: false, changeRecurrenceEnd: true, dayOfMonth: "14", endsOn: "2026-12-13" }), { changeDueDate: false, changeRecurrenceEnd: false });
+});
+
 test("erro de classificação recebe mensagem amigável", () => {
   assert.equal(friendlyBillPaymentError("BILL_CLASSIFICATION_REQUIRED", "erro técnico"), "Antes de pagar este vencimento, informe a categoria e a subcategoria.");
   assert.equal(friendlyBillPaymentError(undefined, "Conta inválida."), "Conta inválida.");
@@ -109,7 +122,10 @@ test("interface abre confirmação e delega operações sem fallback automático
   assert.match(source, /action: "update_recurring_bill_series"/);
   assert.match(source, /anchorBillId: item\.id/);
   assert.match(source, /occurrenceIds/);
-  assert.match(source, /changeDueDate: scope === "future" \|\| changeSelectedDueDate/);
+  assert.match(source, /buildRecurringBillCalendarPayload/);
+  assert.doesNotMatch(source, /changeDueDate: scope === "future" \|\| changeSelectedDueDate/);
+  assert.match(source, /Alterar também o dia de vencimento/);
+  assert.match(source, /Alterar também a data limite da recorrência/);
   assert.match(source, /Alterar também o dia do vencimento/);
   assert.match(source, /cada ocorrência mantém sua própria data/);
   assert.match(source, /Este e os próximos vencimentos pendentes/);

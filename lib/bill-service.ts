@@ -37,9 +37,10 @@ export type UpdateRecurringBillSeriesInput = BillClassification & {
   scope: "future" | "selected";
   occurrenceIds: string[];
   changeDueDate: boolean;
+  changeRecurrenceEnd: boolean;
   description: string;
   amountCents: number;
-  dayOfMonth: number;
+  dayOfMonth?: number;
   accountId?: string | null;
   endsOn?: string | null;
   notes?: string | null;
@@ -171,10 +172,12 @@ async function validateRecurringDueDates(
   input: UpdateRecurringBillSeriesInput,
   context: BillContext,
   occurrences: Array<{ id: string; due_date: string }>,
+  shouldCancelAfterEnd: boolean,
 ) {
+  if (!input.changeDueDate) return;
   const resultingDates = occurrences.map((occurrence) => {
-    const adjustedDueDate = input.changeDueDate ? dueDateWithDay(occurrence.due_date, input.dayOfMonth) : occurrence.due_date;
-    return input.scope === "future" && input.endsOn && adjustedDueDate > input.endsOn ? occurrence.due_date : adjustedDueDate;
+    const adjustedDueDate = dueDateWithDay(occurrence.due_date, input.dayOfMonth!);
+    return shouldCancelAfterEnd && input.endsOn && adjustedDueDate > input.endsOn ? occurrence.due_date : adjustedDueDate;
   });
   if (new Set(resultingDates).size !== resultingDates.length) throw recurrenceDateConflict();
   const distinctDates = [...new Set(resultingDates)];
@@ -190,6 +193,7 @@ function recurringOccurrenceUpdate(
   anchorDueDate: string,
   expectedCount: number,
   timestamp: string,
+  shouldCancelAfterEnd: boolean,
 ) {
   const requestedCte = requestedIdsCte(input.occurrenceIds);
   const futureCondition = input.scope === "future" ? "AND b.due_date >= ?" : "";
@@ -205,7 +209,7 @@ function recurringOccurrenceUpdate(
       WHERE b.household_id = ? AND b.recurrence_series_id = ? AND b.status = 'pending' ${futureCondition}
     ),
     adjusted AS (SELECT id, due_date, ${adjustedDueDate} AS adjusted_due_date FROM eligible),
-    planned AS (SELECT id, due_date, adjusted_due_date, CASE WHEN ? IS NOT NULL AND adjusted_due_date > ? THEN 1 ELSE 0 END AS cancel FROM adjusted)
+    planned AS (SELECT id, due_date, adjusted_due_date, CASE WHEN ? = 1 AND ? IS NOT NULL AND adjusted_due_date > ? THEN 1 ELSE 0 END AS cancel FROM adjusted)
     UPDATE bills SET
       description = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN description ELSE ? END,
       amount_cents = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN amount_cents ELSE ? END,
@@ -213,7 +217,7 @@ function recurringOccurrenceUpdate(
       subcategory_id = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN subcategory_id ELSE ? END,
       account_id = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN account_id ELSE ? END,
       due_date = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN due_date ELSE (SELECT adjusted_due_date FROM planned WHERE planned.id = bills.id) END,
-      recurrence_end_date = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 OR ? = 'selected' THEN recurrence_end_date ELSE ? END,
+      recurrence_end_date = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 OR ? = 0 THEN recurrence_end_date ELSE ? END,
       notes = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN notes ELSE ? END,
       status = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN 'cancelled' ELSE status END,
       updated_at = ?
@@ -228,15 +232,16 @@ function recurringOccurrenceUpdate(
     input.id,
     ...(input.scope === "future" ? [anchorDueDate] : []),
     input.changeDueDate ? 1 : 0,
-    input.dayOfMonth,
-    input.scope === "future" ? input.endsOn ?? null : null,
-    input.scope === "future" ? input.endsOn ?? null : null,
+    input.dayOfMonth ?? 1,
+    shouldCancelAfterEnd ? 1 : 0,
+    input.changeRecurrenceEnd ? input.endsOn ?? null : null,
+    input.changeRecurrenceEnd ? input.endsOn ?? null : null,
     input.description.trim(),
     input.amountCents,
     input.categoryId,
     input.subcategoryId ?? null,
     input.accountId ?? null,
-    input.scope,
+    input.changeRecurrenceEnd ? 1 : 0,
     input.endsOn ?? null,
     input.notes ?? null,
     timestamp,
@@ -310,18 +315,19 @@ export async function cancelBillOccurrence(billId: string, context: BillContext)
 export async function updateRecurringBillSeries(input: UpdateRecurringBillSeriesInput, context: BillContext) {
   assertText(input.description);
   assertMoney(input.amountCents);
-  if (!Number.isInteger(input.dayOfMonth) || input.dayOfMonth < 1 || input.dayOfMonth > 31) throw new BillServiceError("Dia de vencimento inválido.");
-  if (input.scope === "future" && !input.changeDueDate) throw new BillServiceError("A edição dos próximos vencimentos exige um dia de vencimento válido.");
-  if (input.endsOn) assertDate(input.endsOn);
+  if (input.changeDueDate && (!Number.isInteger(input.dayOfMonth) || input.dayOfMonth! < 1 || input.dayOfMonth! > 31)) throw new BillServiceError("Dia de vencimento inválido.");
+  if (input.scope === "selected" && input.changeRecurrenceEnd) throw new BillServiceError("A data limite só pode ser alterada para este e os próximos vencimentos.");
+  if (input.changeRecurrenceEnd && input.endsOn === undefined) throw new BillServiceError("Informe explicitamente a nova data limite da recorrência.");
+  if (input.changeRecurrenceEnd && input.endsOn) assertDate(input.endsOn);
   assertOccurrenceIds(input.occurrenceIds);
   await assertActiveMembership(context);
   const anchor = await getBill(context, input.anchorBillId);
   if (!anchor || anchor.recurrence_series_id !== input.id) throw new BillServiceError("Vencimento recorrente não encontrado.", 404);
   if (anchor.status !== "pending") throw new BillServiceError("Este vencimento não está mais pendente. Atualize os dados e tente novamente.", 409, "BILL_RECURRENCE_SELECTION_CHANGED");
-  const series = await context.d1.prepare("SELECT id, starts_on, is_active FROM recurring_bill_series WHERE id = ? AND household_id = ? LIMIT 1").bind(input.id, context.householdId).first<{ id: string; starts_on: string; is_active: number }>();
+  const series = await context.d1.prepare("SELECT id, starts_on, ends_on, day_of_month, is_active FROM recurring_bill_series WHERE id = ? AND household_id = ? LIMIT 1").bind(input.id, context.householdId).first<{ id: string; starts_on: string; ends_on: string | null; day_of_month: number; is_active: number }>();
   if (!series) throw new BillServiceError("Série recorrente não encontrada.", 404);
   if (!series.is_active) throw new BillServiceError("A série recorrente está cancelada.", 409);
-  if (input.endsOn && input.endsOn < series.starts_on) throw new BillServiceError("A data final da recorrência não pode ser anterior ao início.");
+  if (input.changeRecurrenceEnd && input.endsOn && input.endsOn < series.starts_on) throw new BillServiceError("A data final da recorrência não pode ser anterior ao início.");
   await validateClassification(context, input);
   await validateAccount(context, input.accountId);
   const timestamp = isoTimestamp(context);
@@ -336,9 +342,10 @@ export async function updateRecurringBillSeries(input: UpdateRecurringBillSeries
       throw new BillServiceError("Os vencimentos futuros foram alterados. Atualize os dados e tente novamente.", 409, "BILL_RECURRENCE_SELECTION_CHANGED");
     }
   }
-  await validateRecurringDueDates(input, context, selectedResult.results);
+  const shouldCancelAfterEnd = input.scope === "future" && input.changeRecurrenceEnd && Boolean(input.endsOn) && (series.ends_on === null || input.endsOn! < series.ends_on);
+  await validateRecurringDueDates(input, context, selectedResult.results, shouldCancelAfterEnd);
 
-  const occurrenceUpdate = recurringOccurrenceUpdate(input, context, anchor.due_date, input.occurrenceIds.length, timestamp);
+  const occurrenceUpdate = recurringOccurrenceUpdate(input, context, anchor.due_date, input.occurrenceIds.length, timestamp, shouldCancelAfterEnd);
   if (input.scope === "selected") {
     let result: D1Result;
     try {
@@ -353,7 +360,7 @@ export async function updateRecurringBillSeries(input: UpdateRecurringBillSeries
 
   const requestedCte = requestedIdsCte(input.occurrenceIds);
   const seriesUpdate = context.d1.prepare(`WITH ${requestedCte}
-    UPDATE recurring_bill_series SET description = ?, amount_cents = ?, category_id = ?, subcategory_id = ?, account_id = ?, day_of_month = ?, ends_on = ?, notes = ?, updated_at = ?
+    UPDATE recurring_bill_series SET description = ?, amount_cents = ?, category_id = ?, subcategory_id = ?, account_id = ?, day_of_month = CASE WHEN ? = 1 THEN ? ELSE day_of_month END, ends_on = CASE WHEN ? = 1 THEN ? ELSE ends_on END, notes = ?, updated_at = ?
     WHERE id = ? AND household_id = ? AND is_active = 1
       AND EXISTS (SELECT 1 FROM bills AS anchor WHERE anchor.id = ? AND anchor.household_id = ? AND anchor.recurrence_series_id = ? AND anchor.status = 'pending')
       AND (SELECT count(*) FROM bills AS selected INNER JOIN requested AS request ON request.id = selected.id WHERE selected.household_id = ? AND selected.recurrence_series_id = ? AND selected.status = 'pending' AND selected.due_date >= ?) = ?
@@ -364,8 +371,10 @@ export async function updateRecurringBillSeries(input: UpdateRecurringBillSeries
     input.categoryId,
     input.subcategoryId ?? null,
     input.accountId ?? null,
-    input.dayOfMonth,
-    input.endsOn ?? null,
+    input.changeDueDate ? 1 : 0,
+    input.dayOfMonth ?? series.day_of_month,
+    input.changeRecurrenceEnd ? 1 : 0,
+    input.changeRecurrenceEnd ? input.endsOn ?? null : series.ends_on,
     input.notes ?? null,
     timestamp,
     input.id,

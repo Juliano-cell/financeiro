@@ -19,6 +19,26 @@ const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const money = z.number().int().safe().min(1).max(100_000_000_000);
 const shortText = z.string().trim().min(1).max(120);
 const occurrenceIds = z.array(id).min(1).max(48).refine((values) => new Set(values).size === values.length, "A seleção contém vencimentos duplicados.");
+const recurringUpdateSchema = z.object({
+  id,
+  anchorBillId: id,
+  scope: z.enum(["future", "selected"]),
+  occurrenceIds,
+  changeDueDate: z.boolean(),
+  changeRecurrenceEnd: z.boolean(),
+  description: shortText,
+  amountCents: money,
+  dayOfMonth: z.number().int().min(1).max(31).optional(),
+  categoryId: id,
+  subcategoryId: id.nullable().optional(),
+  accountId: id.nullable().optional(),
+  endsOn: dateSchema.nullable().optional(),
+  notes: z.string().max(500).nullable().optional(),
+}).superRefine((value, issue) => {
+  if (value.changeDueDate && value.dayOfMonth === undefined) issue.addIssue({ code: z.ZodIssueCode.custom, path: ["dayOfMonth"], message: "Informe o novo dia de vencimento." });
+  if (value.changeRecurrenceEnd && value.endsOn === undefined) issue.addIssue({ code: z.ZodIssueCode.custom, path: ["endsOn"], message: "Informe explicitamente a nova data limite da recorrência." });
+  if (value.scope === "selected" && value.changeRecurrenceEnd) issue.addIssue({ code: z.ZodIssueCode.custom, path: ["changeRecurrenceEnd"], message: "A data limite só pode ser alterada para este e os próximos vencimentos." });
+});
 
 async function identity() {
   const user = await getCurrentUser();
@@ -137,7 +157,7 @@ export async function POST(request: Request) {
     }
     if (action === "update_recurring_bill_series") {
       if (!env.DB) throw new Error("D1 binding indisponível");
-      const parsed = z.object({ id, anchorBillId: id, scope: z.enum(["future", "selected"]), occurrenceIds, changeDueDate: z.boolean(), description: shortText, amountCents: money, dayOfMonth: z.number().int().min(1).max(31), categoryId: id, subcategoryId: id.nullable().optional(), accountId: id.nullable().optional(), endsOn: dateSchema.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      const parsed = recurringUpdateSchema.parse(body);
       const result = await updateRecurringBillSeries(parsed, { d1: env.DB, householdId, userId: user.id, timestamp }); return NextResponse.json({ ok: true, updatedOccurrences: result.updatedOccurrences });
     }
     if (action === "cancel_recurring_bill_series") {
