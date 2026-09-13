@@ -4,7 +4,8 @@ import { and, asc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { accounts, bills, cardInstallments, cardInvoices, cardPurchases, categories, creditCards, householdMembers, invoicePayments, notificationPreferences, recurringBillSeries, transactions } from "@/db/schema";
+import { accounts, bills, cardInstallments, cardInvoices, cardPurchases, creditCards, householdMembers, invoicePayments, notificationPreferences, transactions } from "@/db/schema";
+import { BillServiceError, cancelBillOccurrence, cancelRecurringBillSeries, createBill, payBill, undoBillPayment, updateBillOccurrence, updateRecurringBillSeries } from "@/lib/bill-service";
 import { addMonths, buildInstallmentPlan, simulatePurchase } from "@/lib/finance-rules.mjs";
 import { createCardPurchase, FinanceValidationError } from "@/lib/finance-service";
 
@@ -119,46 +120,36 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: true, amountCents });
     }
     if (action === "create_bill") {
-      const parsed = z.object({ description: shortText, amountCents: money, dueDate: dateSchema, categoryId: id.nullable().optional(), accountId: id.nullable().optional(), recurrence: z.enum(["none", "monthly"]).default("none"), recurrenceEndDate: dateSchema.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
-      if (parsed.recurrence === "monthly" && parsed.recurrenceEndDate && parsed.recurrenceEndDate < parsed.dueDate) return NextResponse.json({ error: "A data final da recorrência não pode ser anterior ao primeiro vencimento." }, { status: 400 });
-      const recurrenceEndDate = parsed.recurrence === "monthly" ? (parsed.recurrenceEndDate ?? null) : null;
-      if (parsed.accountId) { const [account] = await db.select().from(accounts).where(and(eq(accounts.id, parsed.accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); }
-      if (parsed.categoryId) { const [category] = await db.select().from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
-      const seriesId = parsed.recurrence === "monthly" ? uid("bill_series") : null; const maxMonths = parsed.recurrence === "monthly" ? 24 : 1; const created: string[] = []; const occurrences: Array<{ id: string; dueDate: string }> = [];
-      for (let index = 0; index < maxMonths; index++) { const dueMonth = addMonths(parsed.dueDate.slice(0, 7), index); const dueDay = Math.min(Number(parsed.dueDate.slice(8)), new Date(Date.UTC(Number(dueMonth.slice(0, 4)), Number(dueMonth.slice(5, 7)), 0)).getUTCDate()); const dueDate = `${dueMonth}-${String(dueDay).padStart(2, "0")}`; if (recurrenceEndDate && dueDate > recurrenceEndDate) break; const entityId = uid("bill"); created.push(entityId); occurrences.push({ id: entityId, dueDate }); }
       if (!env.DB) throw new Error("D1 binding indisponível");
-      const statements: D1PreparedStatement[] = [];
-      if (seriesId) statements.push(env.DB.prepare("INSERT INTO recurring_bill_series (id, household_id, description, amount_cents, category_id, account_id, day_of_month, starts_on, ends_on, is_active, notes, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'web', ?, ?)").bind(seriesId, householdId, parsed.description, parsed.amountCents, parsed.categoryId ?? null, parsed.accountId ?? null, Number(parsed.dueDate.slice(8)), parsed.dueDate, recurrenceEndDate, parsed.notes ?? null, user.id, timestamp, timestamp));
-      for (const occurrence of occurrences) statements.push(env.DB.prepare("INSERT INTO bills (id, household_id, description, amount_cents, category_id, due_date, account_id, recurrence, recurrence_series_id, recurrence_end_date, notes, status, paid_at, payment_transaction_id, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, 'web', ?, ?)").bind(occurrence.id, householdId, parsed.description, parsed.amountCents, parsed.categoryId ?? null, occurrence.dueDate, parsed.accountId ?? null, parsed.recurrence, seriesId, recurrenceEndDate, parsed.notes ?? null, user.id, timestamp, timestamp));
-      await env.DB.batch(statements);
-      return NextResponse.json({ ok: true, ids: created });
+      const parsed = z.object({ description: shortText, amountCents: money, dueDate: dateSchema, categoryId: id, subcategoryId: id.nullable().optional(), accountId: id.nullable().optional(), recurrence: z.enum(["none", "monthly"]).default("none"), recurrenceEndDate: dateSchema.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      const result = await createBill(parsed, { d1: env.DB, householdId, userId: user.id, timestamp });
+      return NextResponse.json({ ok: true, ids: result.ids });
     }
     if (action === "update_bill_occurrence") {
-      const parsed = z.object({ id, description: shortText, amountCents: money, dueDate: dateSchema, categoryId: id.nullable().optional(), accountId: id.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
-      const [bill] = await db.select().from(bills).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))).limit(1); if (!bill) return NextResponse.json({ error: "Conta a pagar não encontrada." }, { status: 404 }); if (bill.status !== "pending") return NextResponse.json({ error: "Somente ocorrências pendentes podem ser editadas." }, { status: 409 });
-      if (parsed.accountId) { const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, parsed.accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); }
-      if (parsed.categoryId) { const [category] = await db.select({ id: categories.id }).from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
-      await db.update(bills).set({ description: parsed.description, amountCents: parsed.amountCents, dueDate: parsed.dueDate, categoryId: parsed.categoryId ?? null, accountId: parsed.accountId ?? null, notes: parsed.notes ?? null, updatedAt: timestamp }).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId), eq(bills.status, "pending"))); return NextResponse.json({ ok: true });
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ id, description: shortText, amountCents: money, dueDate: dateSchema, categoryId: id, subcategoryId: id.nullable().optional(), accountId: id.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      await updateBillOccurrence(parsed, { d1: env.DB, householdId, userId: user.id, timestamp }); return NextResponse.json({ ok: true });
     }
     if (action === "cancel_bill_occurrence") {
-      const parsed = z.object({ id }).parse(body); const [bill] = await db.select().from(bills).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))).limit(1); if (!bill) return NextResponse.json({ error: "Conta a pagar não encontrada." }, { status: 404 }); if (bill.status === "paid") return NextResponse.json({ error: "Uma ocorrência paga não pode ser cancelada." }, { status: 409 }); await db.update(bills).set({ status: "cancelled", updatedAt: timestamp }).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))); return NextResponse.json({ ok: true });
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ id }).parse(body); await cancelBillOccurrence(parsed.id, { d1: env.DB, householdId, userId: user.id, timestamp }); return NextResponse.json({ ok: true });
     }
     if (action === "update_recurring_bill_series") {
-      const parsed = z.object({ id, description: shortText, amountCents: money, dayOfMonth: z.number().int().min(1).max(31), categoryId: id.nullable().optional(), accountId: id.nullable().optional(), endsOn: dateSchema.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
-      const [series] = await db.select().from(recurringBillSeries).where(and(eq(recurringBillSeries.id, parsed.id), eq(recurringBillSeries.householdId, householdId))).limit(1); if (!series) return NextResponse.json({ error: "Série recorrente não encontrada." }, { status: 404 }); if (!series.isActive) return NextResponse.json({ error: "A série recorrente está cancelada." }, { status: 409 });
-      if (parsed.endsOn && parsed.endsOn < series.startsOn) return NextResponse.json({ error: "A data final da recorrência não pode ser anterior ao início." }, { status: 400 });
-      if (parsed.accountId) { const [account] = await db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.id, parsed.accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); }
-      if (parsed.categoryId) { const [category] = await db.select({ id: categories.id }).from(categories).where(and(eq(categories.id, parsed.categoryId), eq(categories.householdId, householdId))).limit(1); if (!category) return NextResponse.json({ error: "Categoria inválida." }, { status: 400 }); }
-      const today = timestamp.slice(0, 10); const future = (await db.select().from(bills).where(and(eq(bills.householdId, householdId), eq(bills.recurrenceSeriesId, parsed.id), eq(bills.status, "pending")))).filter((item) => item.dueDate >= today);
-      if (!env.DB) throw new Error("D1 binding indisponível"); const statements: D1PreparedStatement[] = [env.DB.prepare("UPDATE recurring_bill_series SET description = ?, amount_cents = ?, category_id = ?, account_id = ?, day_of_month = ?, ends_on = ?, notes = ?, updated_at = ? WHERE id = ? AND household_id = ? AND is_active = 1").bind(parsed.description, parsed.amountCents, parsed.categoryId ?? null, parsed.accountId ?? null, parsed.dayOfMonth, parsed.endsOn ?? null, parsed.notes ?? null, timestamp, parsed.id, householdId)];
-      for (const occurrence of future) { const month = occurrence.dueDate.slice(0, 7); const lastDay = new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate(); const dueDate = `${month}-${String(Math.min(parsed.dayOfMonth, lastDay)).padStart(2, "0")}`; if (parsed.endsOn && dueDate > parsed.endsOn) statements.push(env.DB.prepare("UPDATE bills SET status = 'cancelled', updated_at = ? WHERE id = ? AND household_id = ? AND status = 'pending'").bind(timestamp, occurrence.id, householdId)); else statements.push(env.DB.prepare("UPDATE bills SET description = ?, amount_cents = ?, category_id = ?, account_id = ?, due_date = ?, recurrence_end_date = ?, notes = ?, updated_at = ? WHERE id = ? AND household_id = ? AND status = 'pending'").bind(parsed.description, parsed.amountCents, parsed.categoryId ?? null, parsed.accountId ?? null, dueDate, parsed.endsOn ?? null, parsed.notes ?? null, timestamp, occurrence.id, householdId)); }
-      await env.DB.batch(statements); return NextResponse.json({ ok: true, updatedOccurrences: future.length });
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ id, description: shortText, amountCents: money, dayOfMonth: z.number().int().min(1).max(31), categoryId: id, subcategoryId: id.nullable().optional(), accountId: id.nullable().optional(), endsOn: dateSchema.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      const result = await updateRecurringBillSeries(parsed, { d1: env.DB, householdId, userId: user.id, timestamp }); return NextResponse.json({ ok: true, updatedOccurrences: result.updatedOccurrences });
     }
     if (action === "cancel_recurring_bill_series") {
-      const parsed = z.object({ id }).parse(body); const [series] = await db.select().from(recurringBillSeries).where(and(eq(recurringBillSeries.id, parsed.id), eq(recurringBillSeries.householdId, householdId))).limit(1); if (!series) return NextResponse.json({ error: "Série recorrente não encontrada." }, { status: 404 }); if (!env.DB) throw new Error("D1 binding indisponível"); const today = timestamp.slice(0, 10); await env.DB.batch([env.DB.prepare("UPDATE recurring_bill_series SET is_active = 0, updated_at = ? WHERE id = ? AND household_id = ?").bind(timestamp, parsed.id, householdId), env.DB.prepare("UPDATE bills SET status = 'cancelled', updated_at = ? WHERE recurrence_series_id = ? AND household_id = ? AND status = 'pending' AND due_date >= ?").bind(timestamp, parsed.id, householdId, today)]); return NextResponse.json({ ok: true });
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ id }).parse(body); await cancelRecurringBillSeries(parsed.id, { d1: env.DB, householdId, userId: user.id, timestamp }); return NextResponse.json({ ok: true });
     }
     if (action === "pay_bill") {
-      const parsed = z.object({ id, accountId: id.optional() }).parse(body); const [bill] = await db.select().from(bills).where(and(eq(bills.id, parsed.id), eq(bills.householdId, householdId))).limit(1); if (!bill) return NextResponse.json({ error: "Conta a pagar não encontrada." }, { status: 404 }); if (bill.status === "paid") return NextResponse.json({ error: "Esta conta já foi paga." }, { status: 409 }); const accountId = parsed.accountId ?? bill.accountId; if (!accountId) return NextResponse.json({ error: "Selecione a conta usada no pagamento." }, { status: 400 }); const [account] = await db.select().from(accounts).where(and(eq(accounts.id, accountId), eq(accounts.householdId, householdId))).limit(1); if (!account) return NextResponse.json({ error: "Conta inválida." }, { status: 400 }); const transactionId = uid("transaction"); await db.insert(transactions).values({ id: transactionId, householdId, type: "expense", amountCents: bill.amountCents, description: bill.description, categoryId: bill.categoryId, transactionDate: timestamp.slice(0, 10), responsibleUserId: user.id, accountId, paymentMethod: "conta_a_pagar", status: "confirmed", origin: "dashboard", notes: bill.notes, createdAt: timestamp, updatedAt: timestamp }); await db.update(bills).set({ status: "paid", paidAt: timestamp, accountId, paymentTransactionId: transactionId, updatedAt: timestamp }).where(and(eq(bills.id, bill.id), eq(bills.householdId, householdId))); return NextResponse.json({ ok: true, transactionId });
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ id, accountId: id }).parse(body); const result = await payBill(parsed, { d1: env.DB, householdId, userId: user.id, timestamp }); return NextResponse.json({ ok: true, transactionId: result.transactionId });
+    }
+    if (action === "undo_bill_payment") {
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ id }).parse(body); const result = await undoBillPayment(parsed.id, { d1: env.DB, householdId, userId: user.id, timestamp }); return NextResponse.json({ ok: true, transactionId: result.transactionId });
     }
     if (action === "simulate_purchase") {
       const parsed = z.object({ description: shortText, purchaseCents: money, purchaseDate: dateSchema, paymentMethod: z.enum(["cash", "credit_card"]), installmentCount: z.number().int().min(1).max(120), cardId: id.nullable().optional() }).parse(body);
@@ -189,6 +180,7 @@ export async function POST(request: Request) {
     }
     return NextResponse.json({ error: "Ação inválida." }, { status: 400 });
   } catch (error) {
+    if (error instanceof BillServiceError) return NextResponse.json({ error: error.message, ...(error.code ? { code: error.code } : {}) }, { status: error.status });
     if (error instanceof FinanceValidationError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof z.ZodError) return NextResponse.json({ error: error.issues[0]?.message ?? "Dados inválidos.", details: error.flatten() }, { status: 400 });
     console.error("advanced_finance_failed", error); return NextResponse.json({ error: "Não foi possível concluir a operação." }, { status: 500 });
