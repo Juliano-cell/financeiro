@@ -1,13 +1,15 @@
+import { env } from "cloudflare:workers";
 import { NextResponse } from "next/server";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { accounts, auditLogs, bills, categories, householdInviteTokens, householdMembers, households, subcategories, transactions, users } from "@/db/schema";
+import { accounts, auditLogs, bills, categories, householdInviteTokens, householdMembers, households, recurringBillSeries, subcategories, transactions, users } from "@/db/schema";
 import { digestToken, generateRecoveryCode, normalizeRecoveryCode } from "@/lib/auth-crypto.mjs";
 import { dateInTimeZone } from "@/lib/finance-analytics.mjs";
 import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
 import { createTransaction, FinanceValidationError } from "@/lib/finance-service";
+import { createSubcategory, setSubcategoryActive, SubcategoryServiceError, updateSubcategory } from "@/lib/subcategory-service";
 
 export const dynamic = "force-dynamic";
 
@@ -61,6 +63,12 @@ export async function GET() {
     const accountRows = await db.select().from(accounts).where(eq(accounts.householdId, householdId)).orderBy(asc(accounts.name));
     const categoryRows = await db.select().from(categories).where(eq(categories.householdId, householdId)).orderBy(asc(categories.name));
     const subcategoryRows = await db.select().from(subcategories).where(eq(subcategories.householdId, householdId)).orderBy(asc(subcategories.name));
+    const [transactionSubcategories, billSubcategories, seriesSubcategories] = await Promise.all([
+      db.selectDistinct({ subcategoryId: transactions.subcategoryId }).from(transactions).where(and(eq(transactions.householdId, householdId), isNotNull(transactions.subcategoryId))),
+      db.selectDistinct({ subcategoryId: bills.subcategoryId }).from(bills).where(and(eq(bills.householdId, householdId), isNotNull(bills.subcategoryId))),
+      db.selectDistinct({ subcategoryId: recurringBillSeries.subcategoryId }).from(recurringBillSeries).where(and(eq(recurringBillSeries.householdId, householdId), isNotNull(recurringBillSeries.subcategoryId))),
+    ]);
+    const usedSubcategoryIds = new Set([...transactionSubcategories, ...billSubcategories, ...seriesSubcategories].map((item) => item.subcategoryId).filter((value): value is string => Boolean(value)));
     const memberRows = await db.select({ id: householdMembers.id, userId: householdMembers.userId, invitedEmail: householdMembers.invitedEmail, role: householdMembers.role, status: householdMembers.status, name: users.name, email: users.email }).from(householdMembers).leftJoin(users, eq(householdMembers.userId, users.id)).where(eq(householdMembers.householdId, householdId));
     const transactionRows = await db.select({
       id: transactions.id, type: transactions.type, amountCents: transactions.amountCents, description: transactions.description, categoryId: transactions.categoryId, subcategoryId: transactions.subcategoryId,
@@ -78,7 +86,7 @@ export async function GET() {
     const availableCents = accountsWithBalance.filter((account) => account.isActive).reduce((sum, account) => sum + account.currentBalanceCents, 0);
     const daily = new Map<string, { date: string; income: number; expense: number }>();
     for (const item of confirmedThisMonth) { const point = daily.get(item.transactionDate) ?? { date: item.transactionDate, income: 0, expense: 0 }; point[item.type] += item.amountCents; daily.set(item.transactionDate, point); }
-    return NextResponse.json({ setupRequired: false, user: { id: auth.userId, name: auth.displayName, email: auth.email }, household: family, membership, members: memberRows, accounts: accountsWithBalance, categories: categoryRows.map((category) => ({ ...category, subcategories: subcategoryRows.filter((sub) => sub.categoryId === category.id) })), transactions: transactionRows, summary: { availableCents, incomeCents, expenseCents, pendingBillsCents: 0, projectedCents: availableCents }, cashflow: [...daily.values()].sort((a, b) => a.date.localeCompare(b.date)) });
+    return NextResponse.json({ setupRequired: false, user: { id: auth.userId, name: auth.displayName, email: auth.email }, household: family, membership, members: memberRows, accounts: accountsWithBalance, categories: categoryRows.map((category) => ({ ...category, subcategories: subcategoryRows.filter((sub) => sub.categoryId === category.id).map((sub) => ({ ...sub, isInUse: usedSubcategoryIds.has(sub.id) })) })), transactions: transactionRows, summary: { availableCents, incomeCents, expenseCents, pendingBillsCents: 0, projectedCents: availableCents }, cashflow: [...daily.values()].sort((a, b) => a.date.localeCompare(b.date)) });
   } catch (error) {
     console.error("finance_snapshot_failed", error);
     return NextResponse.json({ error: "Não foi possível carregar os dados financeiros." }, { status: 500 });
@@ -130,6 +138,25 @@ export async function POST(request: Request) {
     }
     if (!membership) return NextResponse.json({ error: "Crie ou aceite uma família antes de continuar." }, { status: 409 });
     const householdId = membership.householdId;
+
+    if (action === "create_subcategory") {
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ action: z.literal("create_subcategory"), name: text, categoryId: id }).strict().parse(body);
+      const created = await createSubcategory(parsed, { d1: env.DB, householdId, userId: auth.userId });
+      return NextResponse.json({ ok: true, subcategory: created });
+    }
+    if (action === "update_subcategory") {
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ action: z.literal("update_subcategory"), id, name: text, categoryId: id }).strict().parse(body);
+      const updated = await updateSubcategory(parsed, { d1: env.DB, householdId, userId: auth.userId });
+      return NextResponse.json({ ok: true, subcategory: updated });
+    }
+    if (action === "set_subcategory_active") {
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({ action: z.literal("set_subcategory_active"), id, isActive: z.boolean() }).strict().parse(body);
+      const updated = await setSubcategoryActive(parsed, { d1: env.DB, householdId, userId: auth.userId });
+      return NextResponse.json({ ok: true, subcategory: updated });
+    }
 
     if (action === "get_transaction") {
       const parsed = z.object({ action: z.literal("get_transaction"), id }).strict().parse(body);
@@ -199,6 +226,7 @@ export async function POST(request: Request) {
     }
     return NextResponse.json({ error: "Ação inválida." }, { status: 400 });
   } catch (error) {
+    if (error instanceof SubcategoryServiceError) return NextResponse.json({ error: error.message, ...(error.code ? { code: error.code } : {}) }, { status: error.status });
     if (error instanceof FinanceValidationError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof z.ZodError) return NextResponse.json({ error: "Dados inválidos.", details: error.flatten() }, { status: 400 });
     console.error("finance_action_failed", error);
