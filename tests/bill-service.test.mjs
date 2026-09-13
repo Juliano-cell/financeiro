@@ -161,17 +161,16 @@ test("edição valida classificação e mantém bills legadas legíveis", async 
   await assert.rejects(updateBillOccurrence({ id: paid.id, description: "Alterada", amountCents: 1000, dueDate: "2026-09-21", categoryId: a.category, subcategoryId: a.subcategory }, context(db, a)), assertBillError(409));
 });
 
-test("edição e cancelamento de série preservam ocorrências passadas e propagam subcategoria às futuras", async () => {
+test("edição desta e próximas usa a ocorrência selecionada como âncora e preserva anteriores", async () => {
   const db = database();
   const a = seedHousehold(db, "a");
   const recurring = await createBill({ description: "Mensal", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-11-10" }, context(db, a));
-  await updateRecurringBillSeries({ id: recurring.seriesId, description: "Mensal atualizada", amountCents: 3500, dayOfMonth: 25, categoryId: a.otherCategory, subcategoryId: a.otherSubcategory, accountId: null, endsOn: "2026-11-25" }, context(db, a));
+  await updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[1], scope: "future", occurrenceIds: recurring.ids.slice(1), changeDueDate: true, description: "Mensal atualizada", amountCents: 3500, dayOfMonth: 25, categoryId: a.otherCategory, subcategoryId: a.otherSubcategory, accountId: null, endsOn: "2026-11-25" }, context(db, a));
   const occurrences = db.prepare("SELECT due_date, description, category_id, subcategory_id, status FROM bills WHERE recurrence_series_id=? ORDER BY due_date").all(recurring.seriesId);
   assert.equal(occurrences[0].due_date, "2026-09-10");
   assert.equal(occurrences[0].description, "Mensal");
-  assert.equal(occurrences[1].due_date, "2026-10-25");
-  assert.equal(occurrences[1].category_id, a.otherCategory);
-  assert.equal(occurrences[1].subcategory_id, a.otherSubcategory);
+  assert.deepEqual(occurrences.slice(1).map((item) => item.due_date), ["2026-10-25", "2026-11-25"]);
+  assert.ok(occurrences.slice(1).every((item) => item.category_id === a.otherCategory && item.subcategory_id === a.otherSubcategory));
   assert.equal(db.prepare("SELECT subcategory_id FROM recurring_bill_series WHERE id=?").get(recurring.seriesId).subcategory_id, a.otherSubcategory);
 
   await cancelRecurringBillSeries(recurring.seriesId, context(db, a));
@@ -179,6 +178,140 @@ test("edição e cancelamento de série preservam ocorrências passadas e propag
   assert.equal(statuses[0].status, "pending");
   assert.ok(statuses.slice(1).every((item) => item.status === "cancelled"));
   assert.equal(db.prepare("SELECT is_active FROM recurring_bill_series WHERE id=?").get(recurring.seriesId).is_active, 0);
+});
+
+test("edição individual e seleção manual alteram somente as ocorrências escolhidas", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const recurring = await createBill({ description: "Mensal", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-12-10" }, context(db, a));
+
+  await updateBillOccurrence({ id: recurring.ids[0], description: "Somente setembro", amountCents: 3100, dueDate: "2026-09-12", categoryId: a.category, subcategoryId: a.subcategory, accountId: null }, context(db, a));
+  await updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[1], scope: "selected", occurrenceIds: [recurring.ids[1]], changeDueDate: true, description: "Somente outubro", amountCents: 3200, dayOfMonth: 15, categoryId: a.category, subcategoryId: a.subcategory, accountId: null }, context(db, a));
+  await updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[1], scope: "selected", occurrenceIds: [recurring.ids[1], recurring.ids[3]], changeDueDate: true, description: "Outubro e dezembro", amountCents: 3300, dayOfMonth: 18, categoryId: a.otherCategory, subcategoryId: a.otherSubcategory, accountId: a.secondAccount }, context(db, a));
+
+  const occurrences = db.prepare("SELECT id, due_date, description, amount_cents, category_id, subcategory_id, account_id FROM bills WHERE recurrence_series_id=? ORDER BY due_date").all(recurring.seriesId);
+  assert.deepEqual(occurrences.map((item) => item.description), ["Somente setembro", "Outubro e dezembro", "Mensal", "Outubro e dezembro"]);
+  assert.deepEqual(occurrences.map((item) => item.due_date), ["2026-09-12", "2026-10-18", "2026-11-10", "2026-12-18"]);
+  assert.equal(occurrences[1].account_id, a.secondAccount);
+  assert.equal(occurrences[3].subcategory_id, a.otherSubcategory);
+  assert.equal(db.prepare("SELECT description FROM recurring_bill_series WHERE id=?").get(recurring.seriesId).description, "Mensal");
+});
+
+test("seleção manual preserva datas por padrão e altera valores mesmo com duas ocorrências no mesmo mês", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const recurring = await createBill({ description: "Mensal", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-12-10" }, context(db, a));
+  await updateBillOccurrence({ id: recurring.ids[0], description: "Mensal", amountCents: 3000, dueDate: "2026-10-20", categoryId: a.category, subcategoryId: a.subcategory, accountId: null }, context(db, a));
+  const beforeTransactions = db.prepare("SELECT count(*) total FROM transactions").get().total;
+
+  await updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[2], scope: "selected", occurrenceIds: recurring.ids, changeDueDate: false, description: "Mensal em lote", amountCents: 7777, dayOfMonth: 10, categoryId: a.otherCategory, subcategoryId: a.otherSubcategory, accountId: null }, context(db, a));
+
+  const rows = db.prepare("SELECT due_date, description, amount_cents FROM bills WHERE recurrence_series_id=? ORDER BY due_date").all(recurring.seriesId);
+  assert.deepEqual(rows.map((row) => row.due_date), ["2026-10-10", "2026-10-20", "2026-11-10", "2026-12-10"]);
+  assert.ok(rows.every((row) => row.description === "Mensal em lote" && row.amount_cents === 7777));
+  assert.equal(db.prepare("SELECT description FROM recurring_bill_series WHERE id=?").get(recurring.seriesId).description, "Mensal");
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, beforeTransactions);
+});
+
+test("colisão de datas entre selecionadas retorna 409 amigável sem alteração parcial", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const recurring = await createBill({ description: "Original", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-10-10" }, context(db, a));
+  await updateBillOccurrence({ id: recurring.ids[0], description: "Original", amountCents: 3000, dueDate: "2026-10-20", categoryId: a.category, subcategoryId: a.subcategory, accountId: null }, context(db, a));
+  const before = db.prepare("SELECT id, due_date, description, amount_cents FROM bills WHERE recurrence_series_id=? ORDER BY id").all(recurring.seriesId);
+
+  await assert.rejects(
+    updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[0], scope: "selected", occurrenceIds: recurring.ids, changeDueDate: true, description: "Não deve persistir", amountCents: 9000, dayOfMonth: 15, categoryId: a.otherCategory, subcategoryId: a.otherSubcategory, accountId: a.secondAccount }, context(db, a)),
+    (error) => error instanceof BillServiceError && error.status === 409 && error.code === "BILL_RECURRENCE_DUE_DATE_CONFLICT" && /duas ocorrências.*mesma data/i.test(error.message),
+  );
+  assert.deepEqual(db.prepare("SELECT id, due_date, description, amount_cents FROM bills WHERE recurrence_series_id=? ORDER BY id").all(recurring.seriesId), before);
+  assert.equal(db.prepare("SELECT description FROM recurring_bill_series WHERE id=?").get(recurring.seriesId).description, "Original");
+});
+
+test("colisão com ocorrência não selecionada é rejeitada em seleção manual e em futuras", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const recurring = await createBill({ description: "Original", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-12-10" }, context(db, a));
+  await updateBillOccurrence({ id: recurring.ids[0], description: "Original", amountCents: 3000, dueDate: "2026-10-20", categoryId: a.category, subcategoryId: a.subcategory, accountId: null }, context(db, a));
+  const before = db.prepare("SELECT id, due_date, description, amount_cents FROM bills WHERE recurrence_series_id=? ORDER BY id").all(recurring.seriesId);
+  const conflictingInput = { id: recurring.seriesId, anchorBillId: recurring.ids[0], occurrenceIds: [recurring.ids[0]], changeDueDate: true, description: "Não deve persistir", amountCents: 9000, dayOfMonth: 10, categoryId: a.category, subcategoryId: a.subcategory, accountId: null };
+
+  await assert.rejects(updateRecurringBillSeries({ ...conflictingInput, scope: "selected" }, context(db, a)), assertBillError(409, "BILL_RECURRENCE_DUE_DATE_CONFLICT"));
+  await assert.rejects(updateRecurringBillSeries({ ...conflictingInput, scope: "future", occurrenceIds: [recurring.ids[0], recurring.ids[2], recurring.ids[3]] }, context(db, a)), assertBillError(409, "BILL_RECURRENCE_DUE_DATE_CONFLICT"));
+  assert.deepEqual(db.prepare("SELECT id, due_date, description, amount_cents FROM bills WHERE recurrence_series_id=? ORDER BY id").all(recurring.seriesId), before);
+  assert.equal(db.prepare("SELECT description FROM recurring_bill_series WHERE id=?").get(recurring.seriesId).description, "Original");
+});
+
+test("edição em série mantém pagas e canceladas intactas e não cria transações", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const recurring = await createBill({ description: "Mensal", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-12-10" }, context(db, a));
+  await payBill({ id: recurring.ids[1], accountId: a.account }, context(db, a));
+  db.prepare("UPDATE bills SET status='cancelled' WHERE id=?").run(recurring.ids[2]);
+  const transactionCount = db.prepare("SELECT count(*) total FROM transactions").get().total;
+  const paidPaymentId = db.prepare("SELECT payment_transaction_id FROM bills WHERE id=?").get(recurring.ids[1]).payment_transaction_id;
+
+  await updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[0], scope: "future", occurrenceIds: [recurring.ids[0], recurring.ids[3]], changeDueDate: true, description: "Pendentes atualizados", amountCents: 3500, dayOfMonth: 20, categoryId: a.otherCategory, subcategoryId: a.otherSubcategory, accountId: null }, context(db, a));
+
+  const occurrences = db.prepare("SELECT id, due_date, description, status, payment_transaction_id FROM bills WHERE recurrence_series_id=? ORDER BY due_date").all(recurring.seriesId);
+  assert.equal(occurrences.find((item) => item.id === recurring.ids[0]).description, "Pendentes atualizados");
+  assert.deepEqual({ ...occurrences.find((item) => item.id === recurring.ids[1]) }, { id: recurring.ids[1], due_date: "2026-10-10", description: "Mensal", status: "paid", payment_transaction_id: paidPaymentId });
+  assert.ok(paidPaymentId);
+  assert.equal(occurrences.find((item) => item.id === recurring.ids[2]).status, "cancelled");
+  assert.equal(occurrences.find((item) => item.id === recurring.ids[2]).description, "Mensal");
+  assert.equal(occurrences.find((item) => item.id === recurring.ids[3]).description, "Pendentes atualizados");
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, transactionCount);
+});
+
+test("seleção recorrente rejeita vazio, outra série, outro household e classificação ou conta inválida", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const b = seedHousehold(db, "b");
+  const first = await createBill({ description: "A", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-10-10" }, context(db, a));
+  const second = await createBill({ description: "B", amountCents: 4000, dueDate: "2026-09-15", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-10-15" }, context(db, a));
+  const foreign = await createBill({ description: "Estrangeira", amountCents: 5000, dueDate: "2026-09-20", categoryId: b.category, subcategoryId: b.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-10-20" }, context(db, b));
+  const base = { id: first.seriesId, anchorBillId: first.ids[0], scope: "selected", changeDueDate: false, description: "Alterada", amountCents: 3500, dayOfMonth: 21, categoryId: a.category, subcategoryId: a.subcategory, accountId: null };
+
+  await assert.rejects(updateRecurringBillSeries({ ...base, occurrenceIds: [] }, context(db, a)), assertBillError(400));
+  await assert.rejects(updateRecurringBillSeries({ ...base, occurrenceIds: [second.ids[0]] }, context(db, a)), assertBillError(409, "BILL_RECURRENCE_SELECTION_CHANGED"));
+  await assert.rejects(updateRecurringBillSeries({ ...base, occurrenceIds: [foreign.ids[0]] }, context(db, a)), assertBillError(409, "BILL_RECURRENCE_SELECTION_CHANGED"));
+  await assert.rejects(updateRecurringBillSeries({ ...base, occurrenceIds: [first.ids[0]], categoryId: a.otherCategory, subcategoryId: a.subcategory }, context(db, a)), assertBillError(400));
+  await assert.rejects(updateRecurringBillSeries({ ...base, occurrenceIds: [first.ids[0]], accountId: b.account }, context(db, a)), assertBillError(400));
+  assert.equal(db.prepare("SELECT description FROM bills WHERE id=?").get(first.ids[0]).description, "A");
+});
+
+test("mudança concorrente de status rejeita o lote inteiro e preserva a série", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const recurring = await createBill({ description: "Original", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-11-10" }, context(db, a));
+  class ConcurrentStatusD1 extends LocalD1 {
+    async batch(statements) {
+      db.prepare("UPDATE bills SET status='cancelled' WHERE id=?").run(recurring.ids[1]);
+      return super.batch(statements);
+    }
+  }
+  const concurrentContext = { ...context(db, a), d1: new ConcurrentStatusD1(db) };
+
+  await assert.rejects(updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[0], scope: "future", occurrenceIds: recurring.ids, changeDueDate: true, description: "Não deve persistir", amountCents: 9000, dayOfMonth: 25, categoryId: a.otherCategory, subcategoryId: a.otherSubcategory, accountId: a.secondAccount }, concurrentContext), assertBillError(409, "BILL_RECURRENCE_SELECTION_CHANGED"));
+  const rows = db.prepare("SELECT id, description, amount_cents, status FROM bills WHERE recurrence_series_id=? ORDER BY due_date").all(recurring.seriesId);
+  assert.equal(rows[0].description, "Original");
+  assert.equal(rows[2].description, "Original");
+  assert.equal(rows[1].status, "cancelled");
+  assert.equal(db.prepare("SELECT description FROM recurring_bill_series WHERE id=?").get(recurring.seriesId).description, "Original");
+});
+
+test("edição recorrente preserva payment_transaction_id existente e aceita Definir ao pagar", async () => {
+  const db = database();
+  const a = seedHousehold(db, "a");
+  const recurring = await createBill({ description: "Mensal", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: a.account, recurrence: "monthly", recurrenceEndDate: "2026-10-10" }, context(db, a));
+  db.prepare("INSERT INTO transactions(id,household_id,type,amount_cents,description,transaction_date,responsible_user_id,account_id,payment_method,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run("linked_pending", a.household, "expense", 1, "Vínculo legado", "2026-09-01", a.user, a.account, "cash", "confirmed", "dashboard", AT, AT);
+  db.prepare("UPDATE bills SET payment_transaction_id='linked_pending' WHERE id=?").run(recurring.ids[0]);
+  const beforeTransactions = db.prepare("SELECT count(*) total FROM transactions").get().total;
+
+  await updateRecurringBillSeries({ id: recurring.seriesId, anchorBillId: recurring.ids[0], scope: "selected", occurrenceIds: [recurring.ids[0]], changeDueDate: false, description: "Sem conta definida", amountCents: 3100, dayOfMonth: 22, categoryId: a.categoryWithoutSubs, subcategoryId: null, accountId: null }, context(db, a));
+  const bill = db.prepare("SELECT account_id, category_id, subcategory_id, payment_transaction_id FROM bills WHERE id=?").get(recurring.ids[0]);
+  assert.deepEqual({ ...bill }, { account_id: null, category_id: a.categoryWithoutSubs, subcategory_id: null, payment_transaction_id: "linked_pending" });
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, beforeTransactions);
 });
 
 test("pay_bill rejeita conta ausente, inválida, inativa ou de outro household", async () => {

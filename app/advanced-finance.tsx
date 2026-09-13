@@ -7,9 +7,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { activeBillCategories, activeBillSubcategories, billActions, billClassificationError, buildBillPaymentPayload, changeBillCategory, friendlyBillPaymentError, initialBillPaymentAccountId, normalizeBillAccountId } from "@/lib/bill-ui-rules.mjs";
+import { activeBillCategories, activeBillSubcategories, billActions, billClassificationError, buildBillPaymentPayload, changeBillCategory, eligibleRecurringBillIds, friendlyBillPaymentError, initialBillPaymentAccountId, normalizeBillAccountId, normalizeRecurringBillSelection, recurringBillOccurrences, toggleRecurringBillSelection } from "@/lib/bill-ui-rules.mjs";
 
 export type AdvancedView = "cards" | "installments" | "bills" | "simulator" | "settings";
 type Account = { id: string; name: string; currentBalanceCents: number; isActive: boolean };
@@ -101,22 +102,29 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
         </div>}
       </article>;
     }) : <Empty icon={CalendarClock} text="Nenhum vencimento neste mês." />}</div>
-    {editor && <BillEditorDialog key={editor.session} open item={editor.item} accounts={accounts} categories={categories} onOpenChange={(open) => { if (!open) setEditor(null); }} onChanged={onChanged} />}
+    {editor && <BillEditorDialog key={editor.session} open item={editor.item} bills={data.bills} accounts={accounts} categories={categories} onOpenChange={(open) => { if (!open) setEditor(null); }} onChanged={onChanged} />}
     {payment && <BillPaymentDialog key={payment.session} open bill={payment.bill} accounts={accounts} categories={categories} onOpenChange={(open) => { if (!open) setPayment(null); }} onChanged={onChanged} onEdit={() => { const bill = payment.bill; setPayment(null); openEditor(bill); }} />}
     {confirmation && <BillConfirmationDialog key={confirmation.session} open bill={confirmation.bill} kind={confirmation.kind} onOpenChange={(open) => { if (!open) setConfirmation(null); }} onChanged={onChanged} />}
   </section>;
 }
 
-function BillEditorDialog({ open, item, accounts, categories, onOpenChange, onChanged }: { open: boolean; item: Bill | null; accounts: Account[]; categories: Category[]; onOpenChange: (open: boolean) => void; onChanged: () => Promise<void> }) {
+function BillEditorDialog({ open, item, bills, accounts, categories, onOpenChange, onChanged }: { open: boolean; item: Bill | null; bills: Bill[]; accounts: Account[]; categories: Category[]; onOpenChange: (open: boolean) => void; onChanged: () => Promise<void> }) {
   const availableCategories = activeBillCategories(categories) as Category[];
   const initialCategoryId = availableCategories.some((category) => category.id === item?.categoryId) ? item?.categoryId ?? null : null;
   const initialSubcategories = activeBillSubcategories(categories, initialCategoryId) as Subcategory[];
   const [classification, setClassification] = useState({ categoryId: initialCategoryId, subcategoryId: initialSubcategories.some((subcategory) => subcategory.id === item?.subcategoryId) ? item?.subcategoryId ?? null : null });
   const [accountId, setAccountId] = useState(accounts.some((account) => account.id === item?.accountId && account.isActive) ? item?.accountId ?? null : null);
   const [recurrence, setRecurrence] = useState<"none" | "monthly">(item?.recurrence ?? "none");
-  const [scope, setScope] = useState<"occurrence" | "future">("occurrence");
+  const [scope, setScope] = useState<"occurrence" | "future" | "selected">("occurrence");
+  const [selectedOccurrenceIds, setSelectedOccurrenceIds] = useState<string[]>(item?.recurrenceSeriesId ? [item.id] : []);
+  const [changeSelectedDueDate, setChangeSelectedDueDate] = useState(false);
   const [busy, setBusy] = useState(false);
   const recurringEdit = Boolean(item?.recurrenceSeriesId);
+  const seriesOccurrences = recurringBillOccurrences(bills, item?.recurrenceSeriesId) as Bill[];
+  const eligibleIds = eligibleRecurringBillIds(bills, item?.recurrenceSeriesId) as string[];
+  const futureIds = eligibleRecurringBillIds(bills, item?.recurrenceSeriesId, item?.dueDate) as string[];
+  const selectedIds = normalizeRecurringBillSelection(selectedOccurrenceIds, eligibleIds) as string[];
+  const affectedCount = scope === "occurrence" ? 1 : scope === "future" ? futureIds.length : selectedIds.length;
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const classificationMessage = billClassificationError(classification, categories);
@@ -128,9 +136,10 @@ function BillEditorDialog({ open, item, accounts, categories, onOpenChange, onCh
       if (!item) {
         await advancedApi({ action: "create_bill", description: form.get("description"), amountCents: cents(form.get("amount")), dueDate: form.get("dueDate"), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, recurrence, recurrenceEndDate: recurrence === "monthly" ? form.get("recurrenceEndDate") || null : null, notes: form.get("notes") || null });
         toast.success("Vencimento criado.");
-      } else if (scope === "future" && item.recurrenceSeriesId) {
-        await advancedApi({ action: "update_recurring_bill_series", id: item.recurrenceSeriesId, description: form.get("description"), amountCents: cents(form.get("amount")), dayOfMonth: Number(form.get("dayOfMonth")), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, endsOn: form.get("recurrenceEndDate") || null, notes: form.get("notes") || null });
-        toast.success("Série e vencimentos futuros atualizados.");
+      } else if (scope !== "occurrence" && item.recurrenceSeriesId) {
+        const occurrenceIds = scope === "future" ? futureIds : selectedIds;
+        await advancedApi({ action: "update_recurring_bill_series", id: item.recurrenceSeriesId, anchorBillId: item.id, scope, occurrenceIds, changeDueDate: scope === "future" || changeSelectedDueDate, description: form.get("description"), amountCents: cents(form.get("amount")), dayOfMonth: Number(form.get("dayOfMonth") ?? item.dueDate.slice(8)), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, endsOn: scope === "future" ? form.get("recurrenceEndDate") || null : null, notes: form.get("notes") || null });
+        toast.success(`${occurrenceIds.length} vencimento(s) atualizado(s).`);
       } else {
         await advancedApi({ action: "update_bill_occurrence", id: item.id, description: form.get("description"), amountCents: cents(form.get("amount")), dueDate: form.get("dueDate"), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, notes: form.get("notes") || null });
         toast.success("Vencimento atualizado.");
@@ -141,14 +150,16 @@ function BillEditorDialog({ open, item, accounts, categories, onOpenChange, onCh
     finally { setBusy(false); if (completed) onOpenChange(false); }
   };
   return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}><DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-xl"><DialogHeader><DialogTitle>{item ? "Editar vencimento" : "Novo vencimento"}</DialogTitle><DialogDescription>{item ? "Apenas vencimentos pendentes podem ter dados financeiros alterados." : "Cadastre a classificação e escolha uma conta ou deixe para definir no pagamento."}</DialogDescription></DialogHeader><form onSubmit={submit} className="grid gap-4 sm:grid-cols-2">
-    {recurringEdit && <div className="sm:col-span-2"><Label>Aplicar alteração</Label><Select value={scope} onValueChange={(value) => setScope(value as "occurrence" | "future")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="occurrence">Somente esta ocorrência</SelectItem><SelectItem value="future">Todos os vencimentos futuros da série</SelectItem></SelectContent></Select></div>}
+    {recurringEdit && <div className="sm:col-span-2"><Label>Quais vencimentos você deseja alterar?</Label><Select value={scope} onValueChange={(value) => setScope(value as "occurrence" | "future" | "selected")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="occurrence">Somente este vencimento</SelectItem><SelectItem value="future">Este e os próximos vencimentos pendentes</SelectItem><SelectItem value="selected">Escolher vencimentos</SelectItem></SelectContent></Select></div>}
     <div className="sm:col-span-2"><Field name="description" label="Descrição" defaultValue={item?.description ?? ""} required /></div><Field name="amount" label="Valor (R$)" defaultValue={item ? (item.amountCents / 100).toFixed(2).replace(".", ",") : ""} inputMode="decimal" required />
-    {scope === "future" && recurringEdit ? <Field name="dayOfMonth" label="Dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : <Field name="dueDate" label="Vencimento" type="date" defaultValue={item?.dueDate} required />}
+    {scope === "future" && recurringEdit ? <Field name="dayOfMonth" label="Dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : scope === "selected" && recurringEdit ? changeSelectedDueDate ? <Field name="dayOfMonth" label="Novo dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : null : <Field name="dueDate" label="Vencimento" type="date" defaultValue={item?.dueDate} required />}
     <BillClassificationFields categories={availableCategories} classification={classification} onChange={setClassification} />
     <div><Label>Conta para pagamento</Label><Select value={accountId ?? "none"} onValueChange={(value) => setAccountId(normalizeBillAccountId(value))}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">Definir ao pagar</SelectItem>{accounts.filter((account) => account.isActive).map((account) => <SelectItem key={account.id} value={account.id}>{account.name}</SelectItem>)}</SelectContent></Select></div>
     {!item && <div><Label>Recorrência</Label><Select value={recurrence} onValueChange={(value) => setRecurrence(value as "none" | "monthly")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">Não recorrente</SelectItem><SelectItem value="monthly">Todo mês</SelectItem></SelectContent></Select></div>}
     {((!item && recurrence === "monthly") || (scope === "future" && recurringEdit)) && <Field name="recurrenceEndDate" label="Repetir até (opcional)" type="date" defaultValue={item?.recurrenceEndDate ?? ""} />}
-    <div className="sm:col-span-2"><Field name="notes" label="Observação" defaultValue={item?.notes ?? ""} /></div><DialogFooter className="sm:col-span-2"><Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>Cancelar</Button><Button type="submit" disabled={busy}>{busy ? "Salvando..." : item ? "Salvar alterações" : "Criar vencimento"}</Button></DialogFooter>
+    {scope === "selected" && recurringEdit && <div className="sm:col-span-2 rounded-2xl border border-[#d8e1de] p-3"><label className="flex cursor-pointer items-start gap-3 rounded-xl bg-[#f4f7f5] p-3"><Checkbox checked={changeSelectedDueDate} onCheckedChange={(value) => setChangeSelectedDueDate(value === true)} /><span><span className="block text-sm font-medium">Alterar também o dia do vencimento</span><span className="block text-xs text-[#71837e]">Desmarcado, cada ocorrência mantém sua própria data.</span></span></label><div className="mt-3 flex flex-wrap items-center justify-between gap-2"><div><Label>Escolher ocorrências</Label><p className="text-xs text-[#71837e]">Pagas e canceladas são exibidas apenas para contexto.</p></div><Button type="button" size="sm" variant="ghost" onClick={() => setSelectedOccurrenceIds(selectedIds.length === eligibleIds.length ? [] : eligibleIds)}>{selectedIds.length === eligibleIds.length ? "Desmarcar todos" : "Selecionar todos os elegíveis"}</Button></div><div className="mt-3 max-h-56 space-y-2 overflow-y-auto pr-1">{seriesOccurrences.map((occurrence) => { const eligible = occurrence.status === "pending"; const checked = selectedIds.includes(occurrence.id); const status = occurrence.status === "paid" ? "Pago" : occurrence.status === "cancelled" ? "Cancelado" : occurrence.displayStatus === "overdue" ? "Vencido · pendente" : "Pendente"; return <label key={occurrence.id} className={`flex items-center gap-3 rounded-xl border p-3 ${eligible ? "cursor-pointer bg-white" : "cursor-not-allowed bg-[#f4f7f5] opacity-65"}`}><Checkbox checked={checked} disabled={!eligible} onCheckedChange={(value) => setSelectedOccurrenceIds(toggleRecurringBillSelection(selectedIds, occurrence.id, value === true, eligibleIds))} /><span className="min-w-0 flex-1"><span className="block text-sm font-medium">{formatBillDate(occurrence.dueDate)}</span><span className="block text-xs text-[#71837e]">{brl(occurrence.amountCents)} · {status}</span></span></label>; })}</div></div>}
+    {recurringEdit && <div className="sm:col-span-2 rounded-xl bg-[#edf6f3] px-3 py-2 text-sm font-medium text-[#285f56]">{affectedCount} vencimento(s) será(ão) alterado(s).</div>}
+    <div className="sm:col-span-2"><Field name="notes" label="Observação" defaultValue={item?.notes ?? ""} /></div><DialogFooter className="sm:col-span-2"><Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>Cancelar</Button><Button type="submit" disabled={busy || (scope === "selected" && selectedIds.length === 0)}>{busy ? "Salvando..." : item ? "Salvar alterações" : "Criar vencimento"}</Button></DialogFooter>
   </form></DialogContent></Dialog>;
 }
 

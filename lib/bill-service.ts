@@ -33,6 +33,10 @@ export type UpdateBillOccurrenceInput = BillClassification & {
 
 export type UpdateRecurringBillSeriesInput = BillClassification & {
   id: string;
+  anchorBillId: string;
+  scope: "future" | "selected";
+  occurrenceIds: string[];
+  changeDueDate: boolean;
   description: string;
   amountCents: number;
   dayOfMonth: number;
@@ -49,6 +53,8 @@ type BillRow = {
   category_id: string | null;
   subcategory_id: string | null;
   account_id: string | null;
+  due_date: string;
+  recurrence_series_id: string | null;
   status: "pending" | "paid" | "cancelled";
   payment_transaction_id: string | null;
   notes: string | null;
@@ -122,11 +128,129 @@ async function validateClassification(context: BillContext, classification: Bill
 }
 
 async function getBill(context: BillContext, billId: string) {
-  return context.d1.prepare("SELECT id, household_id, description, amount_cents, category_id, subcategory_id, account_id, status, payment_transaction_id, notes FROM bills WHERE id = ? AND household_id = ? LIMIT 1").bind(billId, context.householdId).first<BillRow>();
+  return context.d1.prepare("SELECT id, household_id, description, amount_cents, category_id, subcategory_id, account_id, due_date, recurrence_series_id, status, payment_transaction_id, notes FROM bills WHERE id = ? AND household_id = ? LIMIT 1").bind(billId, context.householdId).first<BillRow>();
 }
 
 function changes(result: D1Result | undefined) {
   return result?.meta.changes ?? 0;
+}
+
+function assertOccurrenceIds(ids: string[]) {
+  if (ids.length < 1) throw new BillServiceError("Selecione pelo menos um vencimento para alterar.");
+  if (ids.length > 48 || new Set(ids).size !== ids.length || ids.some((id) => !id || id.length > 100)) {
+    throw new BillServiceError("A seleção de vencimentos é inválida.");
+  }
+}
+
+function sameIds(left: string[], right: string[]) {
+  if (left.length !== right.length) return false;
+  const rightIds = new Set(right);
+  return left.every((id) => rightIds.has(id));
+}
+
+function requestedIdsCte(ids: string[]) {
+  return `requested(id) AS (VALUES ${ids.map(() => "(?)").join(", ")})`;
+}
+
+function dueDateWithDay(dueDate: string, dayOfMonth: number) {
+  const month = dueDate.slice(0, 7);
+  const lastDay = new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate();
+  return `${month}-${String(Math.min(dayOfMonth, lastDay)).padStart(2, "0")}`;
+}
+
+function recurrenceDateConflict() {
+  return new BillServiceError("Não foi possível alterar os vencimentos porque duas ocorrências da série ficariam com a mesma data.", 409, "BILL_RECURRENCE_DUE_DATE_CONFLICT");
+}
+
+function isRecurrenceDateConstraint(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("bills.recurrence_series_id, bills.due_date") || message.includes("bills_series_due_unique");
+}
+
+async function validateRecurringDueDates(
+  input: UpdateRecurringBillSeriesInput,
+  context: BillContext,
+  occurrences: Array<{ id: string; due_date: string }>,
+) {
+  const resultingDates = occurrences.map((occurrence) => {
+    const adjustedDueDate = input.changeDueDate ? dueDateWithDay(occurrence.due_date, input.dayOfMonth) : occurrence.due_date;
+    return input.scope === "future" && input.endsOn && adjustedDueDate > input.endsOn ? occurrence.due_date : adjustedDueDate;
+  });
+  if (new Set(resultingDates).size !== resultingDates.length) throw recurrenceDateConflict();
+  const distinctDates = [...new Set(resultingDates)];
+  const requestedPlaceholders = input.occurrenceIds.map(() => "?").join(", ");
+  const datePlaceholders = distinctDates.map(() => "?").join(", ");
+  const collision = await context.d1.prepare(`SELECT id FROM bills WHERE household_id = ? AND recurrence_series_id = ? AND id NOT IN (${requestedPlaceholders}) AND due_date IN (${datePlaceholders}) LIMIT 1`).bind(context.householdId, input.id, ...input.occurrenceIds, ...distinctDates).first<{ id: string }>();
+  if (collision) throw recurrenceDateConflict();
+}
+
+function recurringOccurrenceUpdate(
+  input: UpdateRecurringBillSeriesInput,
+  context: BillContext,
+  anchorDueDate: string,
+  expectedCount: number,
+  timestamp: string,
+) {
+  const requestedCte = requestedIdsCte(input.occurrenceIds);
+  const futureCondition = input.scope === "future" ? "AND b.due_date >= ?" : "";
+  const futureGuard = input.scope === "future"
+    ? "AND (SELECT count(*) FROM bills AS future WHERE future.household_id = ? AND future.recurrence_series_id = ? AND future.status = 'pending' AND future.due_date >= ?) = ?"
+    : "";
+  const adjustedDueDate = "CASE WHEN ? = 1 THEN substr(due_date, 1, 8) || printf('%02d', min(?, CAST(strftime('%d', date(substr(due_date, 1, 7) || '-01', '+1 month', '-1 day')) AS INTEGER))) ELSE due_date END";
+  const statement = context.d1.prepare(`WITH ${requestedCte},
+    eligible AS (
+      SELECT b.id, b.due_date
+      FROM bills AS b
+      INNER JOIN requested AS r ON r.id = b.id
+      WHERE b.household_id = ? AND b.recurrence_series_id = ? AND b.status = 'pending' ${futureCondition}
+    ),
+    adjusted AS (SELECT id, due_date, ${adjustedDueDate} AS adjusted_due_date FROM eligible),
+    planned AS (SELECT id, due_date, adjusted_due_date, CASE WHEN ? IS NOT NULL AND adjusted_due_date > ? THEN 1 ELSE 0 END AS cancel FROM adjusted)
+    UPDATE bills SET
+      description = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN description ELSE ? END,
+      amount_cents = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN amount_cents ELSE ? END,
+      category_id = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN category_id ELSE ? END,
+      subcategory_id = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN subcategory_id ELSE ? END,
+      account_id = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN account_id ELSE ? END,
+      due_date = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN due_date ELSE (SELECT adjusted_due_date FROM planned WHERE planned.id = bills.id) END,
+      recurrence_end_date = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 OR ? = 'selected' THEN recurrence_end_date ELSE ? END,
+      notes = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN notes ELSE ? END,
+      status = CASE WHEN (SELECT cancel FROM planned WHERE planned.id = bills.id) = 1 THEN 'cancelled' ELSE status END,
+      updated_at = ?
+    WHERE household_id = ? AND recurrence_series_id = ? AND status = 'pending' AND id IN (SELECT id FROM requested)
+      AND (SELECT count(*) FROM eligible) = ?
+      ${futureGuard}
+      AND EXISTS (SELECT 1 FROM bills AS anchor WHERE anchor.id = ? AND anchor.household_id = ? AND anchor.recurrence_series_id = ? AND anchor.status = 'pending')
+      AND EXISTS (SELECT 1 FROM recurring_bill_series AS series WHERE series.id = ? AND series.household_id = ? AND series.is_active = 1)`);
+  const bindings: unknown[] = [
+    ...input.occurrenceIds,
+    context.householdId,
+    input.id,
+    ...(input.scope === "future" ? [anchorDueDate] : []),
+    input.changeDueDate ? 1 : 0,
+    input.dayOfMonth,
+    input.scope === "future" ? input.endsOn ?? null : null,
+    input.scope === "future" ? input.endsOn ?? null : null,
+    input.description.trim(),
+    input.amountCents,
+    input.categoryId,
+    input.subcategoryId ?? null,
+    input.accountId ?? null,
+    input.scope,
+    input.endsOn ?? null,
+    input.notes ?? null,
+    timestamp,
+    context.householdId,
+    input.id,
+    expectedCount,
+    ...(input.scope === "future" ? [context.householdId, input.id, anchorDueDate, expectedCount] : []),
+    input.anchorBillId,
+    context.householdId,
+    input.id,
+    input.id,
+    context.householdId,
+  ];
+  return statement.bind(...bindings);
 }
 
 export async function createBill(input: CreateBillInput, context: BillContext) {
@@ -187,8 +311,13 @@ export async function updateRecurringBillSeries(input: UpdateRecurringBillSeries
   assertText(input.description);
   assertMoney(input.amountCents);
   if (!Number.isInteger(input.dayOfMonth) || input.dayOfMonth < 1 || input.dayOfMonth > 31) throw new BillServiceError("Dia de vencimento inválido.");
+  if (input.scope === "future" && !input.changeDueDate) throw new BillServiceError("A edição dos próximos vencimentos exige um dia de vencimento válido.");
   if (input.endsOn) assertDate(input.endsOn);
+  assertOccurrenceIds(input.occurrenceIds);
   await assertActiveMembership(context);
+  const anchor = await getBill(context, input.anchorBillId);
+  if (!anchor || anchor.recurrence_series_id !== input.id) throw new BillServiceError("Vencimento recorrente não encontrado.", 404);
+  if (anchor.status !== "pending") throw new BillServiceError("Este vencimento não está mais pendente. Atualize os dados e tente novamente.", 409, "BILL_RECURRENCE_SELECTION_CHANGED");
   const series = await context.d1.prepare("SELECT id, starts_on, is_active FROM recurring_bill_series WHERE id = ? AND household_id = ? LIMIT 1").bind(input.id, context.householdId).first<{ id: string; starts_on: string; is_active: number }>();
   if (!series) throw new BillServiceError("Série recorrente não encontrada.", 404);
   if (!series.is_active) throw new BillServiceError("A série recorrente está cancelada.", 409);
@@ -196,20 +325,74 @@ export async function updateRecurringBillSeries(input: UpdateRecurringBillSeries
   await validateClassification(context, input);
   await validateAccount(context, input.accountId);
   const timestamp = isoTimestamp(context);
-  const today = saoPauloDate(timestamp);
-  const futureResult = await context.d1.prepare("SELECT id, due_date FROM bills WHERE household_id = ? AND recurrence_series_id = ? AND status = 'pending' AND due_date >= ? ORDER BY due_date").bind(context.householdId, input.id, today).all<{ id: string; due_date: string }>();
-  const future = futureResult.results;
-  const statements: D1PreparedStatement[] = [context.d1.prepare("UPDATE recurring_bill_series SET description = ?, amount_cents = ?, category_id = ?, subcategory_id = ?, account_id = ?, day_of_month = ?, ends_on = ?, notes = ?, updated_at = ? WHERE id = ? AND household_id = ? AND is_active = 1").bind(input.description.trim(), input.amountCents, input.categoryId, input.subcategoryId ?? null, input.accountId ?? null, input.dayOfMonth, input.endsOn ?? null, input.notes ?? null, timestamp, input.id, context.householdId)];
-  for (const occurrence of future) {
-    const month = occurrence.due_date.slice(0, 7);
-    const lastDay = new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate();
-    const dueDate = `${month}-${String(Math.min(input.dayOfMonth, lastDay)).padStart(2, "0")}`;
-    if (input.endsOn && dueDate > input.endsOn) statements.push(context.d1.prepare("UPDATE bills SET status = 'cancelled', updated_at = ? WHERE id = ? AND household_id = ? AND status = 'pending'").bind(timestamp, occurrence.id, context.householdId));
-    else statements.push(context.d1.prepare("UPDATE bills SET description = ?, amount_cents = ?, category_id = ?, subcategory_id = ?, account_id = ?, due_date = ?, recurrence_end_date = ?, notes = ?, updated_at = ? WHERE id = ? AND household_id = ? AND status = 'pending'").bind(input.description.trim(), input.amountCents, input.categoryId, input.subcategoryId ?? null, input.accountId ?? null, dueDate, input.endsOn ?? null, input.notes ?? null, timestamp, occurrence.id, context.householdId));
+  const selectedPlaceholders = input.occurrenceIds.map(() => "?").join(", ");
+  const selectedResult = await context.d1.prepare(`SELECT id, due_date FROM bills WHERE household_id = ? AND recurrence_series_id = ? AND status = 'pending' AND id IN (${selectedPlaceholders}) ORDER BY due_date`).bind(context.householdId, input.id, ...input.occurrenceIds).all<{ id: string; due_date: string }>();
+  if (!sameIds(input.occurrenceIds, selectedResult.results.map((occurrence) => occurrence.id))) {
+    throw new BillServiceError("A seleção contém um vencimento inválido ou que não está mais pendente. Atualize os dados e tente novamente.", 409, "BILL_RECURRENCE_SELECTION_CHANGED");
   }
-  const results = await context.d1.batch(statements);
-  if (changes(results[0]) !== 1) throw new BillServiceError("A série foi alterada por outra operação.", 409);
-  return { updatedOccurrences: future.length };
+  if (input.scope === "future") {
+    const futureResult = await context.d1.prepare("SELECT id FROM bills WHERE household_id = ? AND recurrence_series_id = ? AND status = 'pending' AND due_date >= ? ORDER BY due_date").bind(context.householdId, input.id, anchor.due_date).all<{ id: string }>();
+    if (!sameIds(input.occurrenceIds, futureResult.results.map((occurrence) => occurrence.id))) {
+      throw new BillServiceError("Os vencimentos futuros foram alterados. Atualize os dados e tente novamente.", 409, "BILL_RECURRENCE_SELECTION_CHANGED");
+    }
+  }
+  await validateRecurringDueDates(input, context, selectedResult.results);
+
+  const occurrenceUpdate = recurringOccurrenceUpdate(input, context, anchor.due_date, input.occurrenceIds.length, timestamp);
+  if (input.scope === "selected") {
+    let result: D1Result;
+    try {
+      result = await occurrenceUpdate.run();
+    } catch (error) {
+      if (isRecurrenceDateConstraint(error)) throw recurrenceDateConflict();
+      throw error;
+    }
+    if (changes(result) !== input.occurrenceIds.length) throw new BillServiceError("Os vencimentos selecionados foram alterados. Atualize os dados e tente novamente.", 409, "BILL_RECURRENCE_SELECTION_CHANGED");
+    return { updatedOccurrences: input.occurrenceIds.length };
+  }
+
+  const requestedCte = requestedIdsCte(input.occurrenceIds);
+  const seriesUpdate = context.d1.prepare(`WITH ${requestedCte}
+    UPDATE recurring_bill_series SET description = ?, amount_cents = ?, category_id = ?, subcategory_id = ?, account_id = ?, day_of_month = ?, ends_on = ?, notes = ?, updated_at = ?
+    WHERE id = ? AND household_id = ? AND is_active = 1
+      AND EXISTS (SELECT 1 FROM bills AS anchor WHERE anchor.id = ? AND anchor.household_id = ? AND anchor.recurrence_series_id = ? AND anchor.status = 'pending')
+      AND (SELECT count(*) FROM bills AS selected INNER JOIN requested AS request ON request.id = selected.id WHERE selected.household_id = ? AND selected.recurrence_series_id = ? AND selected.status = 'pending' AND selected.due_date >= ?) = ?
+      AND (SELECT count(*) FROM bills AS future WHERE future.household_id = ? AND future.recurrence_series_id = ? AND future.status = 'pending' AND future.due_date >= ?) = ?`).bind(
+    ...input.occurrenceIds,
+    input.description.trim(),
+    input.amountCents,
+    input.categoryId,
+    input.subcategoryId ?? null,
+    input.accountId ?? null,
+    input.dayOfMonth,
+    input.endsOn ?? null,
+    input.notes ?? null,
+    timestamp,
+    input.id,
+    context.householdId,
+    input.anchorBillId,
+    context.householdId,
+    input.id,
+    context.householdId,
+    input.id,
+    anchor.due_date,
+    input.occurrenceIds.length,
+    context.householdId,
+    input.id,
+    anchor.due_date,
+    input.occurrenceIds.length,
+  );
+  let results: D1Result[];
+  try {
+    results = await context.d1.batch([seriesUpdate, occurrenceUpdate]);
+  } catch (error) {
+    if (isRecurrenceDateConstraint(error)) throw recurrenceDateConflict();
+    throw error;
+  }
+  if (changes(results[0]) !== 1 || changes(results[1]) !== input.occurrenceIds.length) {
+    throw new BillServiceError("A série ou seus vencimentos foram alterados. Atualize os dados e tente novamente.", 409, "BILL_RECURRENCE_SELECTION_CHANGED");
+  }
+  return { updatedOccurrences: input.occurrenceIds.length };
 }
 
 export async function cancelRecurringBillSeries(seriesId: string, context: BillContext) {

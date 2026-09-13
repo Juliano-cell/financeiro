@@ -7,9 +7,13 @@ import {
   billClassificationError,
   buildBillPaymentPayload,
   changeBillCategory,
+  eligibleRecurringBillIds,
   friendlyBillPaymentError,
   initialBillPaymentAccountId,
   normalizeBillAccountId,
+  normalizeRecurringBillSelection,
+  recurringBillOccurrences,
+  toggleRecurringBillSelection,
 } from "../lib/bill-ui-rules.mjs";
 
 const categories = [
@@ -66,6 +70,28 @@ test("ações dependem do status financeiro da bill", () => {
   assert.deepEqual(billActions("cancelled"), []);
 });
 
+test("seleção de recorrências fica restrita à série e somente a ocorrências pendentes", () => {
+  const bills = [
+    { id: "previous", recurrenceSeriesId: "series-a", dueDate: "2026-08-10", status: "pending" },
+    { id: "anchor", recurrenceSeriesId: "series-a", dueDate: "2026-09-10", status: "pending" },
+    { id: "paid", recurrenceSeriesId: "series-a", dueDate: "2026-10-10", status: "paid" },
+    { id: "cancelled", recurrenceSeriesId: "series-a", dueDate: "2026-11-10", status: "cancelled" },
+    { id: "next", recurrenceSeriesId: "series-a", dueDate: "2026-12-10", status: "pending" },
+    { id: "foreign-series", recurrenceSeriesId: "series-b", dueDate: "2026-10-05", status: "pending" },
+  ];
+  assert.deepEqual(recurringBillOccurrences(bills, "series-a").map((bill) => bill.id), ["previous", "anchor", "paid", "cancelled", "next"]);
+  assert.deepEqual(eligibleRecurringBillIds(bills, "series-a"), ["previous", "anchor", "next"]);
+  assert.deepEqual(eligibleRecurringBillIds(bills, "series-a", "2026-09-10"), ["anchor", "next"]);
+});
+
+test("seleção manual normaliza duplicados, bloqueia inelegíveis e permite alternar itens", () => {
+  const eligible = ["one", "two"];
+  assert.deepEqual(normalizeRecurringBillSelection(["one", "paid", "one"], eligible), ["one"]);
+  assert.deepEqual(toggleRecurringBillSelection(["one"], "two", true, eligible), ["one", "two"]);
+  assert.deepEqual(toggleRecurringBillSelection(["one", "two"], "one", false, eligible), ["two"]);
+  assert.deepEqual(toggleRecurringBillSelection(["one"], "paid", true, eligible), ["one"]);
+});
+
 test("erro de classificação recebe mensagem amigável", () => {
   assert.equal(friendlyBillPaymentError("BILL_CLASSIFICATION_REQUIRED", "erro técnico"), "Antes de pagar este vencimento, informe a categoria e a subcategoria.");
   assert.equal(friendlyBillPaymentError(undefined, "Conta inválida."), "Conta inválida.");
@@ -81,6 +107,14 @@ test("interface abre confirmação e delega operações sem fallback automático
   assert.match(source, /action: "undo_bill_payment"/);
   assert.match(source, /action: "update_bill_occurrence"/);
   assert.match(source, /action: "update_recurring_bill_series"/);
+  assert.match(source, /anchorBillId: item\.id/);
+  assert.match(source, /occurrenceIds/);
+  assert.match(source, /changeDueDate: scope === "future" \|\| changeSelectedDueDate/);
+  assert.match(source, /Alterar também o dia do vencimento/);
+  assert.match(source, /cada ocorrência mantém sua própria data/);
+  assert.match(source, /Este e os próximos vencimentos pendentes/);
+  assert.match(source, /Escolher vencimentos/);
+  assert.match(source, /disabled=\{busy \|\| \(scope === "selected" && selectedIds\.length === 0\)\}/);
   assert.match(source, /action: "cancel_recurring_bill_series"/);
   assert.match(source, /await onChanged\(\)/);
 });
