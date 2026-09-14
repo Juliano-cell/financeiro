@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CalendarClock, ChevronLeft, ChevronRight, CreditCard, Pencil, Link2, Plus, Receipt, RotateCcw, Sparkles, Trash2, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -36,6 +36,13 @@ export async function advancedApi(body?: Record<string, unknown>, month?: string
   const data = await response.json() as { error?: string; code?: string } & Record<string, unknown>;
   if (!response.ok) throw new AdvancedApiError(data.error ?? "Não foi possível concluir a operação.", data.code);
   return data;
+}
+
+async function telegramLinkStatus(signal?: AbortSignal) {
+  const response = await fetch("/api/telegram/link", { signal, cache: "no-store" });
+  const result = await response.json() as { connected?: boolean; error?: string };
+  if (!response.ok) throw new Error(result.error ?? "Não foi possível verificar a conexão.");
+  return Boolean(result.connected);
 }
 
 export function MonthNavigator({ month, onChange }: { month: string; onChange: (month: string) => void }) {
@@ -229,9 +236,42 @@ function SimulatorView({ data }: { data: AdvancedSnapshot }) {
 }
 
 function TelegramSettings({ data, onChanged }: { data: AdvancedSnapshot; onChanged: () => Promise<void> }) {
-  const [code, setCode] = useState(""); const generate = async () => { try { const response = await fetch("/api/telegram/link-code", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); const data = await response.json() as { code?: string; error?: string }; if (!response.ok) throw new Error(data.error); setCode(data.code ?? ""); } catch (error) { toast.error(error instanceof Error ? error.message : "Falha."); } };
+  const [code, setCode] = useState("");
+  const [connection, setConnection] = useState<"loading" | "connected" | "disconnected" | "error">("loading");
+  const [connectionBusy, setConnectionBusy] = useState(false);
+  const loadConnection = async (signal?: AbortSignal) => {
+    try {
+      const connected = await telegramLinkStatus(signal);
+      if (!signal?.aborted) setConnection(connected ? "connected" : "disconnected");
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (!signal?.aborted) setConnection("error");
+    }
+  };
+  useEffect(() => {
+    const controller = new AbortController();
+    void telegramLinkStatus(controller.signal).then(
+      (connected) => { if (!controller.signal.aborted) setConnection(connected ? "connected" : "disconnected"); },
+      (error: unknown) => { if (!(error instanceof DOMException && error.name === "AbortError") && !controller.signal.aborted) setConnection("error"); },
+    );
+    return () => controller.abort();
+  }, []);
+  const generate = async () => { setConnectionBusy(true); try { const response = await fetch("/api/telegram/link-code", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); const result = await response.json() as { code?: string; error?: string }; if (!response.ok) throw new Error(result.error); setCode(result.code ?? ""); } catch (error) { toast.error(error instanceof Error ? error.message : "Não foi possível gerar o código."); } finally { setConnectionBusy(false); } };
+  const disconnect = async () => {
+    if (!window.confirm("Desvincular seu Telegram? Você poderá gerar um novo código de conexão depois.")) return;
+    setConnectionBusy(true);
+    try {
+      const response = await fetch("/api/telegram/link", { method: "DELETE" });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error ?? "Não foi possível desvincular o Telegram.");
+      setCode("");
+      setConnection("disconnected");
+      toast.success("Telegram desvinculado. Agora você pode gerar um novo código.");
+    } catch (error) { toast.error(error instanceof Error ? error.message : "Não foi possível desvincular o Telegram."); }
+    finally { setConnectionBusy(false); }
+  };
   const saveAlerts = async (event: React.FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = new FormData(event.currentTarget); try { await advancedApi({ action: "update_notification_settings", enabled: form.get("enabled") === "on", offsets: [7, 3, 1, 0, -1].filter((offset) => form.get(`offset_${offset}`) === "on") }); toast.success("Alertas atualizados."); await onChanged(); } catch (error) { toast.error(error instanceof Error ? error.message : "Falha."); } };
-  return <section><Heading title="Configurações" text="Conecte cada pessoa da família ao Telegram e ajuste os alertas." /><div className="mt-6 grid max-w-4xl gap-5 md:grid-cols-2"><div className="rounded-[24px] border bg-white p-6"><div className="flex items-start gap-4"><div className="rounded-2xl bg-[#edf6f3] p-3"><Link2 className="h-5 w-5" /></div><div><h3 className="font-semibold">Conectar Telegram</h3><p className="mt-1 text-sm leading-6 text-[#71837e]">Gere o código e envie <strong>/conectar CÓDIGO</strong> ao bot. Ele expira em 10 minutos e não é armazenado em texto puro.</p></div></div>{code ? <div className="mt-5 rounded-2xl bg-[#0d2925] p-5 text-center text-white"><p className="text-xs text-white/60">Código temporário</p><p className="mt-1 font-mono text-3xl tracking-[.25em]">{code}</p><p className="mt-2 text-xs text-white/60">/conectar {code}</p></div> : <Button className="mt-5" onClick={generate}>Gerar código de conexão</Button>}</div><form onSubmit={saveAlerts} className="rounded-[24px] border bg-white p-6"><h3 className="font-semibold">Alertas de vencimento</h3><label className="mt-4 flex items-center gap-2 text-sm"><input type="checkbox" name="enabled" defaultChecked={data.notificationSettings.enabled} /> Ativar notificações</label><div className="mt-4 grid gap-2 text-sm">{[[7, "7 dias antes"], [3, "3 dias antes"], [1, "1 dia antes"], [0, "No vencimento"], [-1, "Após o vencimento"]].map(([offset, label]) => <label key={offset} className="flex items-center gap-2"><input type="checkbox" name={`offset_${offset}`} defaultChecked={data.notificationSettings.offsets.includes(Number(offset))} /> {label}</label>)}</div><Button className="mt-5" type="submit">Salvar alertas</Button></form></div></section>;
+  return <section><Heading title="Configurações" text="Conecte cada pessoa da família ao Telegram e ajuste os alertas." /><div className="mt-6 grid max-w-4xl gap-5 md:grid-cols-2"><div className="rounded-[24px] border bg-white p-6"><div className="flex items-start gap-4"><div className="rounded-2xl bg-[#edf6f3] p-3"><Link2 className="h-5 w-5" /></div><div><h3 className="font-semibold">Conectar Telegram</h3><p className="mt-1 text-sm leading-6 text-[#71837e]">O vínculo é individual: cada pessoa conecta seu próprio Telegram à família.</p></div></div><div className="mt-5">{connection === "loading" && <p className="text-sm text-[#71837e]">Verificando conexão...</p>}{connection === "error" && <div><p className="text-sm text-[#a1444d]">Não foi possível verificar a conexão.</p><Button className="mt-3" variant="outline" onClick={() => { setConnection("loading"); void loadConnection(); }} disabled={connectionBusy}>Tentar novamente</Button></div>}{connection === "connected" && <div><p className="font-semibold text-[#287461]">Telegram conectado</p><p className="mt-1 text-sm text-[#71837e]">Seu usuário está habilitado para usar o bot desta família.</p><Button className="mt-4" variant="outline" onClick={() => void disconnect()} disabled={connectionBusy}>{connectionBusy ? "Desvinculando..." : "Desvincular Telegram"}</Button></div>}{connection === "disconnected" && <div><p className="font-semibold">Telegram não conectado</p><p className="mt-1 text-sm leading-6 text-[#71837e]">Gere um código e envie <strong>/conectar CÓDIGO</strong> ao bot. O código expira em 10 minutos.</p>{code ? <div className="mt-4 rounded-2xl bg-[#0d2925] p-5 text-center text-white"><p className="text-xs text-white/60">Código temporário · expira em 10 minutos</p><p className="mt-1 font-mono text-3xl tracking-[.25em]">{code}</p><p className="mt-2 text-xs text-white/60">/conectar {code}</p></div> : <Button className="mt-4" onClick={() => void generate()} disabled={connectionBusy}>{connectionBusy ? "Gerando..." : "Gerar código de conexão"}</Button>}</div>}</div></div><form onSubmit={saveAlerts} className="rounded-[24px] border bg-white p-6"><h3 className="font-semibold">Alertas de vencimento</h3><label className="mt-4 flex items-center gap-2 text-sm"><input type="checkbox" name="enabled" defaultChecked={data.notificationSettings.enabled} /> Ativar notificações</label><div className="mt-4 grid gap-2 text-sm">{[[7, "7 dias antes"], [3, "3 dias antes"], [1, "1 dia antes"], [0, "No vencimento"], [-1, "Após o vencimento"]].map(([offset, label]) => <label key={offset} className="flex items-center gap-2"><input type="checkbox" name={`offset_${offset}`} defaultChecked={data.notificationSettings.offsets.includes(Number(offset))} /> {label}</label>)}</div><Button className="mt-5" type="submit">Salvar alertas</Button></form></div></section>;
 }
 
 function Heading({ title, text, action }: { title: string; text: string; action?: React.ReactNode }) { return <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><h2 className="text-3xl font-semibold tracking-[-.04em]">{title}</h2><p className="mt-2 max-w-2xl text-[#71837e]">{text}</p></div>{action}</div>; }
