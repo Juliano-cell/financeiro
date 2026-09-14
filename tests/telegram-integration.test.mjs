@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { hasTelegramDeliveryFailure } from "../lib/telegram-delivery.mjs";
+import { classifyTelegramUpdate } from "../lib/telegram-update.mjs";
 
 function database() {
   const db = new DatabaseSync(":memory:");
@@ -101,9 +102,70 @@ test("handler exige confirmação, auditoria, household e payload limitado", () 
   assert.match(webhook, /16_384/); assert.match(webhook, /safeSecretEqual/); assert.doesNotMatch(webhook, /TELEGRAM_BOT_TOKEN/);
 });
 
+test("mensagens e callbacks suportados continuam processáveis", () => {
+  const message = (updateId, text) => ({
+    update_id: updateId,
+    message: {
+      text,
+      chat: { id: 42, type: "private" },
+      from: { id: 42 },
+    },
+  });
+
+  for (const update of [message(301, "/start"), message(302, "/conectar 123456"), message(303, "Gastei 85 no mercado")]) {
+    assert.equal(classifyTelegramUpdate(update).kind, "processable");
+  }
+
+  assert.equal(classifyTelegramUpdate({
+    update_id: 304,
+    callback_query: {
+      id: "callback-304",
+      data: "ok",
+      from: { id: 42 },
+      message: { chat: { id: 42, type: "private" } },
+    },
+  }).kind, "processable");
+});
+
+test("updates Telegram legítimos mas não suportados são ignorados", () => {
+  const chat = { id: 42, type: "private" };
+  const from = { id: 42 };
+  const unsupported = [
+    { update_id: 401, my_chat_member: { chat, from, new_chat_member: {} } },
+    { update_id: 402, chat_member: { chat, from, new_chat_member: {} } },
+    { update_id: 403, edited_message: { text: "/start", chat, from } },
+    { update_id: 404, channel_post: { text: "publicação", chat: { id: -10042, type: "channel" } } },
+    { update_id: 405, message: { photo: [{ file_id: "photo" }], chat, from } },
+    { update_id: 406, message: { sticker: { file_id: "sticker" }, chat, from } },
+    { update_id: 407, message: { new_chat_members: [from], chat, from } },
+    { update_id: 408, callback_query: { id: "callback-408", data: "ok", from, inline_message_id: "inline" } },
+  ];
+
+  for (const update of unsupported) assert.equal(classifyTelegramUpdate(update).kind, "unsupported");
+});
+
+test("somente envelopes realmente inválidos são classificados como inválidos", () => {
+  for (const update of [null, [], {}, { update_id: -1 }, { update_id: "409" }, { update_id: Number.MAX_SAFE_INTEGER + 1 }]) {
+    assert.equal(classifyTelegramUpdate(update).kind, "invalid");
+  }
+});
+
+test("webhook encerra update não suportado antes de handler, banco ou entrega", () => {
+  const webhook = readFileSync(new URL("../app/api/telegram/webhook/route.ts", import.meta.url), "utf8");
+  const classifier = readFileSync(new URL("../lib/telegram-update.mjs", import.meta.url), "utf8");
+  const ignoredBranch = webhook.indexOf('classification.kind === "unsupported"');
+  const handlerCall = webhook.indexOf("await handleTelegramUpdate(candidate)");
+
+  assert.ok(ignoredBranch >= 0 && handlerCall > ignoredBranch);
+  assert.match(webhook.slice(ignoredBranch, handlerCall), /ok: true, ignored: true/);
+  assert.doesNotMatch(classifier, /getDb|env\.DB|transactions|telegramLinks|connectTelegramWithCode/);
+  assert.match(webhook, /JSON inválido[\s\S]+status: 400/);
+  assert.match(webhook, /Webhook não autorizado[\s\S]+status: 401/);
+});
+
 test("webhook retorna 5xx antes do commit e mantém 2xx quando apenas a entrega ao Telegram falha", async () => {
   const webhook = readFileSync(new URL("../app/api/telegram/webhook/route.ts", import.meta.url), "utf8");
-  const processing = webhook.indexOf("await handleTelegramUpdate(update)");
+  const processing = webhook.indexOf("await handleTelegramUpdate(candidate)");
   const delivery = webhook.indexOf("await hasTelegramDeliveryFailure(deliveries)");
   assert.ok(processing >= 0 && delivery > processing);
   assert.match(webhook, /telegram_webhook_processing_failed/);

@@ -1,9 +1,9 @@
 import { env } from "cloudflare:workers";
 import { NextResponse } from "next/server";
-import { z } from "zod";
 import { handleTelegramUpdate, isDuplicateTelegramError, isTelegramPayloadTooLarge } from "@/lib/telegram-handler";
 import { hasTelegramDeliveryFailure } from "@/lib/telegram-delivery.mjs";
 import { answerTelegramCallback, sendTelegramMessage } from "@/lib/telegram";
+import { classifyTelegramUpdate } from "@/lib/telegram-update.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -30,15 +30,20 @@ export async function POST(request: Request) {
   } catch {
     return NextResponse.json({ error: "JSON inválido." }, { status: 400 });
   }
-  const candidate = update as { message?: { chat?: { id?: number | string } }; callback_query?: { id?: string; message?: { chat?: { id?: number | string } } } };
+
+  const classification = classifyTelegramUpdate(update);
+  if (classification.kind === "invalid") return NextResponse.json({ error: "Payload inválido." }, { status: 400 });
+  if (classification.kind === "unsupported") return NextResponse.json({ ok: true, ignored: true });
+
+  const candidate = classification.update;
+  if (!candidate) return NextResponse.json({ ok: true, ignored: true });
   const chatId = String(candidate.message?.chat?.id ?? candidate.callback_query?.message?.chat?.id ?? "");
   const callbackQueryId = candidate.callback_query?.id;
   let result: Awaited<ReturnType<typeof handleTelegramUpdate>>;
   try {
-    result = await handleTelegramUpdate(update);
+    result = await handleTelegramUpdate(candidate);
   } catch (error) {
     if (isDuplicateTelegramError(error)) result = { duplicate: true };
-    else if (error instanceof z.ZodError) return NextResponse.json({ error: "Payload inválido." }, { status: 400 });
     else {
       console.error("telegram_webhook_processing_failed");
       return NextResponse.json({ error: "Falha temporária ao processar o update." }, { status: 503 });
