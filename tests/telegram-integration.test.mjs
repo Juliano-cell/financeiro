@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { hasTelegramDeliveryFailure } from "../lib/telegram-delivery.mjs";
 import { classifyTelegramUpdate } from "../lib/telegram-update.mjs";
 
-const handlerTestEnv = {};
+const handlerTestEnv = globalThis.__telegramHandlerTestEnv ?? {};
 globalThis.__telegramHandlerTestEnv = handlerTestEnv;
 const loaderSource = `
   import { existsSync, statSync } from "node:fs";
@@ -313,6 +313,19 @@ test("cartão legado homônimo persiste pelo handler uma única compra parcelada
   assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id=?").get(`financial:${started.state.sessionId}`).total, 1);
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
+});
+
+test("cartão legado persiste subcategoria canônica e autoria Telegram", async () => {
+  const db = database(); const at = seedTelegramContext(db);
+  db.prepare("INSERT INTO subcategories(id,household_id,category_id,name,created_at,updated_at) VALUES(?,?,?,?,?,?)").run("subcategory-fair", "ha", "category-market", "Feira", at, at);
+  const started = await beginFinancialConversation(db, 1651, "Comprei tênis 50 na feira no Nubank em 2x");
+  assert.equal(started.state.financialIntent.subcategoryId, "subcategory-fair");
+  await handleTelegramUpdate(callbackUpdate(1652, callbackByText(started.response, "Confirmar")));
+  const purchase = db.prepare("SELECT subcategory_id,origin,created_by_user_id FROM card_purchases").get();
+  assert.deepEqual({ ...purchase }, { subcategory_id: "subcategory-fair", origin: "telegram", created_by_user_id: "ua" });
+  assert.equal(db.prepare("SELECT count(*) total FROM card_installments").get().total, 2);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM bills").get().total, 0);
 });
 
 test("future_bill confirmado cria um único vencimento pending sem transaction", async () => {

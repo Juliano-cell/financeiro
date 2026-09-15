@@ -4,7 +4,7 @@ import { and, asc, desc, eq, isNotNull } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { accounts, auditLogs, bills, categories, householdInviteTokens, householdMembers, households, recurringBillSeries, subcategories, transactions, users } from "@/db/schema";
+import { accounts, auditLogs, bills, cardPurchases, categories, householdInviteTokens, householdMembers, households, recurringBillSeries, subcategories, transactions, users } from "@/db/schema";
 import { digestToken, generateRecoveryCode, normalizeRecoveryCode } from "@/lib/auth-crypto.mjs";
 import { dateInTimeZone } from "@/lib/finance-analytics.mjs";
 import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
@@ -63,12 +63,13 @@ export async function GET() {
     const accountRows = await db.select().from(accounts).where(eq(accounts.householdId, householdId)).orderBy(asc(accounts.name));
     const categoryRows = await db.select().from(categories).where(eq(categories.householdId, householdId)).orderBy(asc(categories.name));
     const subcategoryRows = await db.select().from(subcategories).where(eq(subcategories.householdId, householdId)).orderBy(asc(subcategories.name));
-    const [transactionSubcategories, billSubcategories, seriesSubcategories] = await Promise.all([
+    const [transactionSubcategories, billSubcategories, seriesSubcategories, cardPurchaseSubcategories] = await Promise.all([
       db.selectDistinct({ subcategoryId: transactions.subcategoryId }).from(transactions).where(and(eq(transactions.householdId, householdId), isNotNull(transactions.subcategoryId))),
       db.selectDistinct({ subcategoryId: bills.subcategoryId }).from(bills).where(and(eq(bills.householdId, householdId), isNotNull(bills.subcategoryId))),
       db.selectDistinct({ subcategoryId: recurringBillSeries.subcategoryId }).from(recurringBillSeries).where(and(eq(recurringBillSeries.householdId, householdId), isNotNull(recurringBillSeries.subcategoryId))),
+      db.selectDistinct({ subcategoryId: cardPurchases.subcategoryId }).from(cardPurchases).where(and(eq(cardPurchases.householdId, householdId), isNotNull(cardPurchases.subcategoryId))),
     ]);
-    const usedSubcategoryIds = new Set([...transactionSubcategories, ...billSubcategories, ...seriesSubcategories].map((item) => item.subcategoryId).filter((value): value is string => Boolean(value)));
+    const usedSubcategoryIds = new Set([...transactionSubcategories, ...billSubcategories, ...seriesSubcategories, ...cardPurchaseSubcategories].map((item) => item.subcategoryId).filter((value): value is string => Boolean(value)));
     const memberRows = await db.select({ id: householdMembers.id, userId: householdMembers.userId, invitedEmail: householdMembers.invitedEmail, role: householdMembers.role, status: householdMembers.status, name: users.name, email: users.email }).from(householdMembers).leftJoin(users, eq(householdMembers.userId, users.id)).where(eq(householdMembers.householdId, householdId));
     const transactionRows = await db.select({
       id: transactions.id, type: transactions.type, amountCents: transactions.amountCents, description: transactions.description, categoryId: transactions.categoryId, subcategoryId: transactions.subcategoryId,

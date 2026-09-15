@@ -34,7 +34,8 @@ type CardPurchaseInput = {
   totalCents: number;
   purchaseDate: string;
   installmentCount: number;
-  categoryId?: string | null;
+  categoryId: string;
+  subcategoryId?: string | null;
   notes?: string | null;
 };
 
@@ -64,6 +65,9 @@ function assertMoney(value: number) {
 
 function assertDate(value: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) throw new FinanceValidationError("Data inválida.");
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) throw new FinanceValidationError("Data inválida.");
 }
 
 async function validateMembership(householdId: string, userId: string) {
@@ -115,6 +119,20 @@ function finalizeStatements(statements: D1PreparedStatement[], context: Creation
   return statements;
 }
 
+function telegramCardSessionGuardStatements(context: CreationContext, at: string) {
+  if (!context.source?.updateId || !context.source.operationId || !context.clearTelegramStateFor) return [];
+  return [database().prepare("INSERT INTO telegram_processed_updates (update_id, received_at) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM telegram_conversation_states WHERE telegram_user_id = ? AND household_id = ? AND json_extract(payload_json, '$.sessionId') = ?)").bind(context.source.updateId, at, context.clearTelegramStateFor, context.householdId, context.source.operationId)];
+}
+
+function finalizeCardStatements(statements: D1PreparedStatement[], context: CreationContext) {
+  if (!context.clearTelegramStateFor) return statements;
+  const operationId = context.source?.operationId;
+  statements.push(operationId
+    ? database().prepare("DELETE FROM telegram_conversation_states WHERE telegram_user_id = ? AND household_id = ? AND json_extract(payload_json, '$.sessionId') = ?").bind(context.clearTelegramStateFor, context.householdId, operationId)
+    : database().prepare("DELETE FROM telegram_conversation_states WHERE telegram_user_id = ? AND household_id = ?").bind(context.clearTelegramStateFor, context.householdId));
+  return statements;
+}
+
 async function runCreationBatch(statements: D1PreparedStatement[], updateId?: string) {
   const d1 = database();
   try {
@@ -156,33 +174,44 @@ export async function createCardPurchase(input: CardPurchaseInput, context: Crea
   assertMoney(input.totalCents);
   assertDate(input.purchaseDate);
   if (!Number.isInteger(input.installmentCount) || input.installmentCount < 1 || input.installmentCount > 120) throw new FinanceValidationError("Número de parcelas inválido.");
+  if (input.installmentCount > input.totalCents) throw new FinanceValidationError("O valor é insuficiente para a quantidade de parcelas.");
   await validateMembership(context.householdId, context.userId);
   const db = getDb();
   const [card] = await db.select().from(creditCards).where(and(eq(creditCards.id, input.cardId), eq(creditCards.householdId, context.householdId), eq(creditCards.isActive, true))).limit(1);
   if (!card) throw new FinanceValidationError("Cartão inválido.");
-  if (input.categoryId) {
-    const [category] = await db.select().from(categories).where(and(eq(categories.id, input.categoryId), eq(categories.householdId, context.householdId), eq(categories.isActive, true))).limit(1);
-    if (!category || (category.type !== "expense" && category.type !== "both")) throw new FinanceValidationError("Categoria inválida para esta compra.");
-  }
+  if (!input.categoryId) throw new FinanceValidationError("Selecione uma categoria para esta compra.");
+  const [category] = await db.select().from(categories).where(and(eq(categories.id, input.categoryId), eq(categories.householdId, context.householdId), eq(categories.isActive, true))).limit(1);
+  if (!category || (category.type !== "expense" && category.type !== "both")) throw new FinanceValidationError("Categoria inválida para esta compra.");
+  const categorySubcategories = await db.select({ id: subcategories.id }).from(subcategories).where(and(eq(subcategories.householdId, context.householdId), eq(subcategories.categoryId, category.id), eq(subcategories.isActive, true)));
+  if (categorySubcategories.length && !input.subcategoryId) throw new FinanceValidationError("Selecione uma subcategoria para esta compra.");
+  if (input.subcategoryId && !categorySubcategories.some((subcategory) => subcategory.id === input.subcategoryId)) throw new FinanceValidationError("Subcategoria inválida para esta compra.");
   const plan = buildInstallmentPlan({ totalCents: input.totalCents, count: input.installmentCount, purchaseDate: input.purchaseDate, closingDay: card.closingDay, dueDay: card.dueDay });
   const months = [...new Set(plan.map((part: { referenceMonth: string }) => part.referenceMonth))];
   const existing = months.length ? await db.select().from(cardInvoices).where(and(eq(cardInvoices.householdId, context.householdId), eq(cardInvoices.cardId, card.id), inArray(cardInvoices.referenceMonth, months))) : [];
-  const invoiceByMonth = new Map(existing.map((invoice) => [invoice.referenceMonth, invoice]));
+  const blockedInvoice = existing.find((invoice) => invoice.status !== "open");
+  if (blockedInvoice) throw new FinanceValidationError(`A fatura de ${blockedInvoice.referenceMonth} não está aberta e não pode receber novas parcelas.`);
   const at = timestamp();
   const purchaseId = uid("purchase");
   const d1 = database();
   const statements = idempotencyStatements(context, at);
-  statements.push(d1.prepare("INSERT INTO card_purchases (id, household_id, card_id, description, total_cents, purchase_date, installment_count, category_id, notes, status, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)").bind(purchaseId, context.householdId, card.id, input.description.trim(), input.totalCents, input.purchaseDate, input.installmentCount, input.categoryId ?? null, input.notes ?? null, context.userId, context.origin === "telegram" ? "telegram" : "web", at, at));
+  statements.push(...telegramCardSessionGuardStatements(context, at));
+  statements.push(d1.prepare("INSERT INTO card_purchases (id, household_id, card_id, description, total_cents, purchase_date, installment_count, category_id, subcategory_id, notes, status, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)").bind(purchaseId, context.householdId, card.id, input.description.trim(), input.totalCents, input.purchaseDate, input.installmentCount, input.categoryId, input.subcategoryId ?? null, input.notes ?? null, context.userId, context.origin === "telegram" ? "telegram" : "web", at, at));
+  for (const referenceMonth of months) {
+    const part = plan.find((candidate: { referenceMonth: string }) => candidate.referenceMonth === referenceMonth)!;
+    statements.push(d1.prepare("INSERT INTO card_invoices (id, household_id, card_id, reference_month, due_date, status, paid_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, ?) ON CONFLICT(household_id, card_id, reference_month) DO NOTHING").bind(uid("invoice"), context.householdId, card.id, referenceMonth, part.dueDate, at, at));
+  }
   for (const part of plan as Array<{ referenceMonth: string; dueDate: string; installmentNumber: number; installmentCount: number; amountCents: number }>) {
-    let invoice = invoiceByMonth.get(part.referenceMonth);
-    if (!invoice) {
-      invoice = { id: uid("invoice"), householdId: context.householdId, cardId: card.id, referenceMonth: part.referenceMonth, dueDate: part.dueDate, status: "open", paidAt: null, createdAt: at, updatedAt: at };
-      invoiceByMonth.set(part.referenceMonth, invoice);
-      statements.push(d1.prepare("INSERT INTO card_invoices (id, household_id, card_id, reference_month, due_date, status, paid_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, ?)").bind(invoice.id, context.householdId, card.id, part.referenceMonth, part.dueDate, at, at));
-    }
-    statements.push(d1.prepare("INSERT INTO card_installments (id, household_id, purchase_id, invoice_id, installment_number, installment_count, amount_cents, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)").bind(uid("installment"), context.householdId, purchaseId, invoice.id, part.installmentNumber, part.installmentCount, part.amountCents, at, at));
+    statements.push(d1.prepare("INSERT INTO card_installments (id, household_id, purchase_id, invoice_id, installment_number, installment_count, amount_cents, status, created_at, updated_at) VALUES (?, ?, ?, (SELECT id FROM card_invoices WHERE household_id = ? AND card_id = ? AND reference_month = ? AND status = 'open' LIMIT 1), ?, ?, ?, 'pending', ?, ?)").bind(uid("installment"), context.householdId, purchaseId, context.householdId, card.id, part.referenceMonth, part.installmentNumber, part.installmentCount, part.amountCents, at, at));
   }
   statements.push(d1.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) VALUES (?, ?, ?, 'create', 'card_purchase', ?, NULL, ?, ?)").bind(uid("audit"), context.householdId, context.userId, purchaseId, sourcePayload(input, context), at));
-  await runCreationBatch(finalizeStatements(statements, context), context.source?.updateId);
+  try {
+    await runCreationBatch(finalizeCardStatements(statements, context), context.source?.updateId);
+  } catch (error) {
+    if (error instanceof DuplicateTelegramUpdateError) throw error;
+    const currentInvoices = months.length ? await db.select().from(cardInvoices).where(and(eq(cardInvoices.householdId, context.householdId), eq(cardInvoices.cardId, card.id), inArray(cardInvoices.referenceMonth, months))) : [];
+    const currentBlockedInvoice = currentInvoices.find((invoice) => invoice.status !== "open");
+    if (currentBlockedInvoice) throw new FinanceValidationError(`A fatura de ${currentBlockedInvoice.referenceMonth} não está aberta e não pode receber novas parcelas.`);
+    throw error;
+  }
   return { id: purchaseId, plan, cardName: card.name };
 }

@@ -72,3 +72,12 @@ test("período personalizado continua compartilhado por Dashboard e Relatórios"
   assert.match(dashboard, /<FinancePeriodFilter/);
   assert.match(reports, /<FinancePeriodFilter/);
 });
+
+test("compra web no cartão usa a mesma classificação canônica", () => {
+  const app = readFileSync(new URL("../app/finance-app.tsx", import.meta.url), "utf8");
+  const route = readFileSync(new URL("../app/api/finance/advanced/route.ts", import.meta.url), "utf8");
+  assert.match(app, /action: "create_card_purchase"[\s\S]+categoryId: classification\.categoryId, subcategoryId: classification\.subcategoryId/u);
+  assert.match(app, /<TransactionClassificationFields[^>]+requireExpense allowSubcategory/u);
+  assert.doesNotMatch(app, /if \(!isCardPurchase\) \{\s*const classificationError/u);
+  assert.match(route, /categoryId: id, subcategoryId: id\.nullable\(\)\.optional\(\)/u);
+});

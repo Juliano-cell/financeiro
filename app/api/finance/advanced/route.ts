@@ -119,7 +119,7 @@ export async function POST(request: Request) {
       await db.delete(creditCards).where(and(eq(creditCards.id, parsed.id), eq(creditCards.householdId, householdId))); return NextResponse.json({ ok: true });
     }
     if (action === "create_card_purchase") {
-      const parsed = z.object({ cardId: id, description: shortText, totalCents: money, purchaseDate: dateSchema, installmentCount: z.number().int().min(1).max(120), categoryId: id.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
+      const parsed = z.object({ cardId: id, description: shortText, totalCents: money, purchaseDate: dateSchema, installmentCount: z.number().int().min(1).max(120), categoryId: id, subcategoryId: id.nullable().optional(), notes: z.string().max(500).nullable().optional() }).parse(body);
       const result = await createCardPurchase(parsed, { householdId, userId: user.id, origin: "dashboard" });
       return NextResponse.json({ ok: true, id: result.id, plan: result.plan });
     }

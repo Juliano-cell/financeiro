@@ -41,11 +41,12 @@ function database() {
 }
 
 function seedHousehold(db, suffix) {
-  const ids = { user: `user_${suffix}`, household: `house_${suffix}`, account: `account_${suffix}`, category: `category_${suffix}`, otherCategory: `category_${suffix}_other`, inactiveCategory: `category_${suffix}_inactive` };
+  const ids = { user: `user_${suffix}`, household: `house_${suffix}`, account: `account_${suffix}`, card: `card_${suffix}`, category: `category_${suffix}`, otherCategory: `category_${suffix}_other`, inactiveCategory: `category_${suffix}_inactive` };
   db.prepare("INSERT INTO users(id,name,email,created_at,updated_at) VALUES(?,?,?,?,?)").run(ids.user, `User ${suffix}`, `${suffix}@example.com`, AT, AT);
   db.prepare("INSERT INTO households(id,name,created_by,created_at,updated_at) VALUES(?,?,?,?,?)").run(ids.household, `House ${suffix}`, ids.user, AT, AT);
   db.prepare("INSERT INTO household_members(id,household_id,user_id,role,status,created_at) VALUES(?,?,?,?,?,?)").run(`member_${suffix}`, ids.household, ids.user, "owner", "active", AT);
   db.prepare("INSERT INTO accounts(id,household_id,name,type,initial_balance_cents,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").run(ids.account, ids.household, "Conta", "bank", 0, 1, AT, AT);
+  db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(ids.card, ids.household, "Cartão", "Banco", `User ${suffix}`, 100000, 5, 12, 1, AT, AT);
   for (const [id, active] of [[ids.category, 1], [ids.otherCategory, 1], [ids.inactiveCategory, 0]]) db.prepare("INSERT INTO categories(id,household_id,name,type,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").run(id, ids.household, id, "expense", active, AT, AT);
   return ids;
 }
@@ -67,6 +68,10 @@ function insertBill(db, ids, subcategoryId) {
 
 function insertSeries(db, ids, subcategoryId) {
   db.prepare("INSERT INTO recurring_bill_series(id,household_id,description,amount_cents,category_id,subcategory_id,day_of_month,starts_on,is_active,created_by_user_id,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(`series_${crypto.randomUUID()}`, ids.household, "Histórico", 1000, ids.category, subcategoryId, 20, "2026-09-20", 1, ids.user, "web", AT, AT);
+}
+
+function insertCardPurchase(db, ids, subcategoryId) {
+  db.prepare("INSERT INTO card_purchases(id,household_id,card_id,description,total_cents,purchase_date,installment_count,category_id,subcategory_id,status,created_by_user_id,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(`purchase_${crypto.randomUUID()}`, ids.household, ids.card, "Histórico", 1000, "2026-09-13", 1, ids.category, subcategoryId, "active", ids.user, "web", AT, AT);
 }
 
 test("cria subcategoria válida com trim e auditoria", async () => {
@@ -129,6 +134,24 @@ for (const [label, insertUsage] of [["transaction", insertTransaction], ["bill",
   });
 }
 
+test("compra de cartão marca uso e impede mover subcategoria atomicamente", async () => {
+  const db = database(); const a = seedHousehold(db, "a"); const created = await create(db, a);
+  insertCardPurchase(db, a, created.id);
+  assert.equal(await subcategoryIsInUse(context(db, a), created.id), true);
+  await assert.rejects(updateSubcategory({ id: created.id, name: "Mercado", categoryId: a.otherCategory }, context(db, a)), serviceError(409, "SUBCATEGORY_IN_USE"));
+  assert.equal(db.prepare("SELECT category_id FROM subcategories WHERE id=?").get(created.id).category_id, a.category);
+});
+
+test("uso de cartão respeita household e compra legada NULL não bloqueia movimentação", async () => {
+  const db = database(); const a = seedHousehold(db, "a"); const b = seedHousehold(db, "b");
+  const available = await create(db, a); const foreign = await create(db, b);
+  insertCardPurchase(db, a, null);
+  insertCardPurchase(db, b, foreign.id);
+  assert.equal(await subcategoryIsInUse(context(db, a), foreign.id), false);
+  const moved = await updateSubcategory({ id: available.id, name: "Mercado", categoryId: a.otherCategory }, context(db, a));
+  assert.equal(moved.categoryId, a.otherCategory);
+});
+
 test("permite renomear subcategoria utilizada sem alterar vínculos históricos", async () => {
   const db = database(); const a = seedHousehold(db, "a"); const created = await create(db, a); insertTransaction(db, a, created.id);
   await updateSubcategory({ id: created.id, name: "Compras de mercado", categoryId: a.category }, context(db, a));
@@ -174,4 +197,5 @@ test("API deriva household da membership e rejeita householdId no payload estrit
   assert.match(source, /z\.literal\("create_subcategory"\).*\.strict\(\)/s);
   assert.match(source, /SubcategoryServiceError/);
   assert.doesNotMatch(source, /createSubcategory\([^\n]*body\.householdId/);
+  assert.match(source, /cardPurchases\.subcategoryId[\s\S]+cardPurchases\.householdId, householdId[\s\S]+cardPurchaseSubcategories/u);
 });

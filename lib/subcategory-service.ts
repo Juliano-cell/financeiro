@@ -68,7 +68,8 @@ export async function subcategoryIsInUse(context: SubcategoryContext, subcategor
     EXISTS (SELECT 1 FROM transactions WHERE household_id = ? AND subcategory_id = ?)
     OR EXISTS (SELECT 1 FROM bills WHERE household_id = ? AND subcategory_id = ?)
     OR EXISTS (SELECT 1 FROM recurring_bill_series WHERE household_id = ? AND subcategory_id = ?)
-    THEN 1 ELSE 0 END AS is_in_use`).bind(context.householdId, subcategoryId, context.householdId, subcategoryId, context.householdId, subcategoryId).first<{ is_in_use: number }>();
+    OR EXISTS (SELECT 1 FROM card_purchases WHERE household_id = ? AND subcategory_id = ?)
+    THEN 1 ELSE 0 END AS is_in_use`).bind(context.householdId, subcategoryId, context.householdId, subcategoryId, context.householdId, subcategoryId, context.householdId, subcategoryId).first<{ is_in_use: number }>();
   return Boolean(usage?.is_in_use);
 }
 
@@ -111,7 +112,8 @@ export async function updateSubcategory(input: { id: string; name: string; categ
           NOT EXISTS (SELECT 1 FROM transactions WHERE household_id = ? AND subcategory_id = ?)
           AND NOT EXISTS (SELECT 1 FROM bills WHERE household_id = ? AND subcategory_id = ?)
           AND NOT EXISTS (SELECT 1 FROM recurring_bill_series WHERE household_id = ? AND subcategory_id = ?)
-        ))`).bind(name, input.categoryId, timestamp(context), input.id, context.householdId, input.categoryId, context.householdId, input.categoryId, input.categoryId, context.householdId, input.id, context.householdId, input.id, context.householdId, input.id).run();
+          AND NOT EXISTS (SELECT 1 FROM card_purchases WHERE household_id = ? AND subcategory_id = ?)
+        ))`).bind(name, input.categoryId, timestamp(context), input.id, context.householdId, input.categoryId, context.householdId, input.categoryId, input.categoryId, context.householdId, input.id, context.householdId, input.id, context.householdId, input.id, context.householdId, input.id).run();
     if ((result.meta.changes ?? 0) !== 1) throw new SubcategoryServiceError("A subcategoria passou a ter histórico ou a categoria deixou de estar disponível. Atualize a tela e tente novamente.", 409, "SUBCATEGORY_CHANGED");
   } catch (error) {
     if (isDuplicateError(error)) throw new SubcategoryServiceError(duplicateMessage, 409, "SUBCATEGORY_DUPLICATE");

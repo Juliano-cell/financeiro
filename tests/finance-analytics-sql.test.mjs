@@ -60,8 +60,8 @@ function seedAnalyticsScenario() {
     .run("bill_pending", a.household, "Água futura", 30_000, a.category, "2026-09-10", a.account, "none", "pending", a.user, "web", AT, AT);
 
   db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run("card_a", a.household, "Nubank", "Nubank", "A", 500_000, 5, 10, AT, AT);
-  db.prepare("INSERT INTO card_purchases(id,household_id,card_id,description,total_cents,purchase_date,installment_count,category_id,status,created_by_user_id,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
-    .run("purchase_active", a.household, "card_a", "Compra parcelada", 30_000, "2026-08-01", 3, a.category, "active", a.user, "web", AT, AT);
+  db.prepare("INSERT INTO card_purchases(id,household_id,card_id,description,total_cents,purchase_date,installment_count,category_id,subcategory_id,status,created_by_user_id,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run("purchase_active", a.household, "card_a", "Compra parcelada", 30_000, "2026-08-01", 3, a.category, a.subcategory, "active", a.user, "web", AT, AT);
   db.prepare("INSERT INTO card_purchases(id,household_id,card_id,description,total_cents,purchase_date,installment_count,category_id,status,created_by_user_id,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
     .run("purchase_cancelled", a.household, "card_a", "Compra cancelada", 40_000, "2026-08-01", 1, a.category, "cancelled", a.user, "web", AT, AT);
   for (const [month, due, number, status] of [["2026-09", "2026-09-10", 1, "paid"], ["2026-10", "2026-10-10", 2, "pending"], ["2026-11", "2026-11-10", 3, "pending"]]) {
@@ -86,6 +86,7 @@ test("eventos financeiros unificam dinheiro e cartão sem duplicar pagamentos", 
   assert.equal(income, 200_000);
   assert.equal(expense, 46_000);
   assert.equal(rows.filter((row) => row.entity_type === "card_installment").length, 1);
+  assert.equal(rows.find((row) => row.entity_type === "card_installment")?.subcategory_id, a.subcategory);
   assert.ok(!rows.some((row) => row.id === "bill_pending" || row.id === "invoice_payment" || row.description === "Compra cancelada"));
   assert.ok(!events(db, a.household).some((row) => row.description === "Compra cancelada"));
   assert.equal(rows.filter((row) => row.description === "Energia").length, 1);
@@ -108,9 +109,20 @@ test("categoria, subcategoria e ausência de subcategoria são agregadas sem inf
     WHERE e.household_id = ? AND e.type = 'expense' AND e.event_date BETWEEN ? AND ?
     GROUP BY category_id, subcategory_id
   `).all(a.household, a.household, a.household, "2026-09-01", "2026-09-30");
-  assert.equal(rows.find((row) => row.subcategory_id === a.subcategory)?.total, 10_000);
+  assert.equal(rows.find((row) => row.subcategory_id === a.subcategory)?.total, 20_000);
   assert.equal(rows.find((row) => row.subcategory_id === "subcategory_fuel")?.total, 5_000);
-  assert.equal(rows.filter((row) => row.subcategory_id === null).reduce((sum, row) => sum + row.total, 0), 31_000);
+  assert.equal(rows.filter((row) => row.subcategory_id === null).reduce((sum, row) => sum + row.total, 0), 21_000);
+});
+
+test("analytics preserva compra de cartão legada sem subcategoria", () => {
+  const { db, a } = seedAnalyticsScenario();
+  db.prepare("INSERT INTO card_purchases(id,household_id,card_id,description,total_cents,purchase_date,installment_count,category_id,subcategory_id,status,created_by_user_id,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run("purchase_legacy", a.household, "card_a", "Compra legada", 500, "2026-11-01", 1, a.category, null, "active", a.user, "web", AT, AT);
+  db.prepare("INSERT INTO card_installments(id,household_id,purchase_id,invoice_id,installment_number,installment_count,amount_cents,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    .run("installment_legacy", a.household, "purchase_legacy", "invoice_cancelled", 1, 1, 500, "pending", AT, AT);
+  const legacy = events(db, a.household).find((row) => row.id === "installment_legacy");
+  assert.equal(legacy?.subcategory_id, null);
+  assert.equal(legacy?.amount_cents, 500);
 });
 
 test("saldo usa todo o histórico, ignora futuro e mantém contas inativas separadas", () => {

@@ -245,8 +245,7 @@ function prepareIntent(intent: FinancialIntent, context: HouseholdContext) {
   }
   if (prepared.type === "expense" && !prepared.categoryId) missing.add("categoria");
   else if (prepared.type && categoryCandidates.length && !prepared.categoryId) missing.add("categoria");
-  const legacyCard = paymentFlow === "credit_card" && (legacyFlow || prepared.legacyCardCompatible === true);
-  if (prepared.categoryId && !legacyCard) {
+  if (prepared.categoryId) {
     const subcategoryCandidates = eligibleSubcategories(prepared, context);
     if (prepared.subcategoryId && !subcategoryCandidates.some((subcategory) => subcategory.id === prepared.subcategoryId)) prepared.subcategoryId = null;
     if (subcategoryCandidates.length && !prepared.subcategoryId) missing.add("subcategoria");
@@ -432,7 +431,7 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
     const persistenceTarget = telegramFinancialPersistenceTarget(intent, state.financialIntent);
     try {
       if (persistenceTarget === "card_purchase" && intent.cardId) {
-        const result = await createCardPurchase({ cardId: intent.cardId, description: intent.description!, totalCents: intent.amountCents!, purchaseDate: intent.purchaseDate!, installmentCount: intent.installmentCount ?? 1, categoryId: intent.categoryId }, { householdId: link.householdId, userId: link.userId, origin: "telegram", source, clearTelegramStateFor: telegramUserId });
+        const result = await createCardPurchase({ cardId: intent.cardId, description: intent.description!, totalCents: intent.amountCents!, purchaseDate: intent.purchaseDate!, installmentCount: intent.installmentCount ?? 1, categoryId: intent.categoryId!, subcategoryId: intent.subcategoryId ?? null }, { householdId: link.householdId, userId: link.userId, origin: "telegram", source, clearTelegramStateFor: telegramUserId });
         return { text: `✅ Compra de ${formatBrl(intent.amountCents!)} registrada no cartão ${result.cardName}.` };
       }
       if (persistenceTarget === "transaction") {
