@@ -1,9 +1,115 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
+import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { hasTelegramDeliveryFailure } from "../lib/telegram-delivery.mjs";
 import { classifyTelegramUpdate } from "../lib/telegram-update.mjs";
+
+const handlerTestEnv = {};
+globalThis.__telegramHandlerTestEnv = handlerTestEnv;
+const loaderSource = `
+  import { existsSync, statSync } from "node:fs";
+  import { dirname, extname, resolve as resolvePath } from "node:path";
+  import { fileURLToPath, pathToFileURL } from "node:url";
+  const root = ${JSON.stringify(process.cwd())};
+  function resolveFile(path) {
+    const candidates = extname(path) ? [path] : [path, path + ".ts", path + ".mjs", path + ".tsx", resolvePath(path, "index.ts")];
+    return candidates.find((candidate) => existsSync(candidate) && statSync(candidate).isFile());
+  }
+  export async function resolve(specifier, context, nextResolve) {
+    if (specifier === "cloudflare:workers") {
+      return { shortCircuit: true, url: "data:text/javascript,export const env=globalThis.__telegramHandlerTestEnv" };
+    }
+    if (specifier.startsWith("@/")) {
+      const path = resolveFile(resolvePath(root, specifier.slice(2)));
+      if (!path) throw new Error("Módulo de teste não encontrado: " + specifier);
+      return { shortCircuit: true, url: pathToFileURL(path).href };
+    }
+    if ((specifier.startsWith("./") || specifier.startsWith("../")) && context.parentURL?.startsWith("file:") && !extname(specifier)) {
+      const path = resolveFile(resolvePath(dirname(fileURLToPath(context.parentURL)), specifier));
+      if (path) return { shortCircuit: true, url: pathToFileURL(path).href };
+    }
+    return nextResolve(specifier, context);
+  }
+`;
+register(`data:text/javascript,${encodeURIComponent(loaderSource)}`, import.meta.url);
+const { handleTelegramUpdate } = await import("../lib/telegram-handler.ts?telegram-integration");
+
+class LocalStatement {
+  constructor(db, sql, bindings = []) {
+    this.db = db;
+    this.sql = sql;
+    this.bindings = bindings;
+  }
+
+  bind(...bindings) {
+    return new LocalStatement(this.db, this.sql, bindings);
+  }
+
+  async first(column) {
+    const row = this.db.prepare(this.sql).get(...this.bindings) ?? null;
+    return column && row ? row[column] : row;
+  }
+
+  async all() {
+    return { success: true, results: this.db.prepare(this.sql).all(...this.bindings), meta: { changes: 0 } };
+  }
+
+  async raw() {
+    const statement = this.db.prepare(this.sql);
+    const columns = statement.columns().map((column) => column.name);
+    return statement.all(...this.bindings).map((row) => columns.map((column) => row[column]));
+  }
+
+  runSync() {
+    const result = this.db.prepare(this.sql).run(...this.bindings);
+    return { success: true, results: [], meta: { changes: result.changes } };
+  }
+
+  async run() {
+    return this.runSync();
+  }
+}
+
+class LocalD1 {
+  constructor(db) {
+    this.db = db;
+    this.financialBatchBarrier = null;
+  }
+
+  prepare(sql) {
+    return new LocalStatement(this.db, sql);
+  }
+
+  async batch(statements) {
+    if (this.financialBatchBarrier && statements.some((statement) => statement.bindings.some((value) => String(value).startsWith("financial:")))) {
+      await this.financialBatchBarrier.wait();
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const results = statements.map((statement) => statement.runSync());
+      this.db.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+}
+
+function requestBarrier(expected) {
+  let arrivals = 0;
+  let release;
+  const ready = new Promise((resolve) => { release = resolve; });
+  return {
+    async wait() {
+      arrivals += 1;
+      if (arrivals === expected) release();
+      await ready;
+    },
+  };
+}
 
 function database() {
   const db = new DatabaseSync(":memory:");
@@ -23,6 +129,43 @@ function seed(db) {
     db.prepare("INSERT INTO accounts(id,household_id,name,type,created_at,updated_at) VALUES(?,?,?,?,?,?)").run(`a${suffix}`, `h${suffix}`, `Account ${suffix}`, "bank", at, at);
   }
   return at;
+}
+
+function seedTelegramContext(db) {
+  const at = seed(db);
+  db.prepare("UPDATE accounts SET name='Nubank' WHERE id='aa'").run();
+  db.prepare("INSERT INTO categories(id,household_id,name,type,created_at,updated_at) VALUES(?,?,?,?,?,?)").run("category-market", "ha", "Mercado", "expense", at, at);
+  db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run("card-nubank", "ha", "Nubank", "Nubank", "User a", 100_000, 5, 12, at, at);
+  db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,linked_at,updated_at) VALUES(?,?,?,?,?,?,?)").run("link-handler", "ha", "ua", "42", "42", at, at);
+  handlerTestEnv.DB = new LocalD1(db);
+  return at;
+}
+
+function messageUpdate(updateId, text) {
+  return { update_id: updateId, message: { text, chat: { id: 42, type: "private" }, from: { id: 42 } } };
+}
+
+function callbackUpdate(updateId, data) {
+  return { update_id: updateId, callback_query: { id: `callback-${updateId}`, data, from: { id: 42 }, message: { chat: { id: 42, type: "private" } } } };
+}
+
+function storedFinancialState(db) {
+  const row = db.prepare("SELECT payload_json FROM telegram_conversation_states WHERE telegram_user_id='42' AND household_id='ha'").get();
+  return row ? JSON.parse(row.payload_json) : null;
+}
+
+async function beginFinancialConversation(db, updateId, text = "Gastei 85 no mercado no pix") {
+  const response = await handleTelegramUpdate(messageUpdate(updateId, text));
+  const state = storedFinancialState(db);
+  assert.ok(state?.sessionId);
+  assert.equal(state.phase, "confirming");
+  return { response, state };
+}
+
+function callbackByText(response, text) {
+  const button = response.buttons?.flat().find((item) => item.text.includes(text));
+  assert.ok(button, `Botão ${text} não encontrado.`);
+  return button.callback_data;
 }
 
 function atomic(db, operation) {
@@ -52,22 +195,122 @@ test("código expirado ou consumido não satisfaz o consumo condicional", () => 
   assert.equal(consume.run(at, "used", at).changes, 0);
 });
 
-test("confirmação atômica cria transação, auditoria e update uma única vez", () => {
-  const db = database(); const at = seed(db);
-  db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,linked_at,updated_at) VALUES(?,?,?,?,?,?,?)").run("link", "ha", "ua", "42", "42", at, at);
-  db.prepare("INSERT INTO telegram_conversation_states(telegram_user_id,household_id,payload_json,expires_at,updated_at) VALUES(?,?,?,?,?)").run("42", "ha", "{}", "2026-09-11T13:00:00.000Z", at);
-  const confirm = (updateId, transactionId) => atomic(db, () => {
-    db.prepare("INSERT INTO telegram_processed_updates(update_id,received_at) VALUES(?,?)").run(updateId, at);
-    db.prepare("INSERT INTO transactions(id,household_id,type,amount_cents,description,transaction_date,responsible_user_id,account_id,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(transactionId, "ha", "expense", 8_500, "Mercado", "2026-09-11", "ua", "aa", "confirmed", "telegram", at, at);
-    db.prepare("INSERT INTO audit_logs(id,household_id,user_id,action,entity_type,entity_id,new_data,created_at) VALUES(?,?,?,?,?,?,?,?)").run(`audit-${transactionId}`, "ha", "ua", "create", "transaction", transactionId, JSON.stringify({ source: { originalTelegramUpdateId: "100" } }), at);
-    db.prepare("DELETE FROM telegram_conversation_states WHERE telegram_user_id=? AND household_id=?").run("42", "ha");
-  });
-  confirm("101", "t1");
+test("handler impede duas confirmações da mesma sessão com update_id diferentes", async () => {
+  const db = database(); seedTelegramContext(db);
+  const { response, state } = await beginFinancialConversation(db, 1001);
+  const confirm = callbackByText(response, "Confirmar");
+  handlerTestEnv.DB.financialBatchBarrier = requestBarrier(2);
+
+  const attempts = await Promise.allSettled([
+    handleTelegramUpdate(callbackUpdate(1002, confirm)),
+    handleTelegramUpdate(callbackUpdate(1003, confirm)),
+  ]);
+
+  assert.deepEqual(attempts.map((result) => result.status), ["fulfilled", "fulfilled"]);
   assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE origin='telegram'").get().total, 1);
-  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_id='t1'").get().total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id=?").get(`financial:${state.sessionId}`).total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_type='transaction'").get().total, 1);
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
-  assert.throws(() => confirm("101", "t2"), /UNIQUE/);
+});
+
+test("handler responde de forma amigável à confirmação depois do consumo da sessão", async () => {
+  const db = database(); seedTelegramContext(db);
+  const { response } = await beginFinancialConversation(db, 1101);
+  const confirm = callbackByText(response, "Confirmar");
+  await handleTelegramUpdate(callbackUpdate(1102, confirm));
+  const repeated = await handleTelegramUpdate(callbackUpdate(1103, confirm));
+
+  assert.match(repeated.text ?? "", /outra operação|expirou|finalizada/iu);
   assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE origin='telegram'").get().total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
+});
+
+test("cancelamento real consome a sessão atomicamente e impede confirmação posterior", async () => {
+  const db = database(); seedTelegramContext(db);
+  const { response, state } = await beginFinancialConversation(db, 1201);
+  const cancel = callbackByText(response, "Cancelar");
+  const confirm = callbackByText(response, "Confirmar");
+  const cancelled = await handleTelegramUpdate(callbackUpdate(1202, cancel));
+
+  assert.match(cancelled.text ?? "", /cancelada/iu);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id=?").get(`financial:${state.sessionId}`).total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM card_purchases").get().total, 0);
+
+  await handleTelegramUpdate(callbackUpdate(1203, confirm));
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM card_purchases").get().total, 0);
+});
+
+test("cancelamento antigo depois da confirmação não desfaz movimentação nem altera nova sessão", async () => {
+  const db = database(); seedTelegramContext(db);
+  const first = await beginFinancialConversation(db, 1301);
+  const oldConfirm = callbackByText(first.response, "Confirmar");
+  const oldCancel = callbackByText(first.response, "Cancelar");
+  await handleTelegramUpdate(callbackUpdate(1302, oldConfirm));
+  const second = await beginFinancialConversation(db, 1303, "Gastei 40 no mercado no pix");
+  const stateBefore = db.prepare("SELECT payload_json, updated_at FROM telegram_conversation_states WHERE telegram_user_id='42'").get();
+
+  const rejected = await handleTelegramUpdate(callbackUpdate(1304, oldCancel));
+  const stateAfter = db.prepare("SELECT payload_json, updated_at FROM telegram_conversation_states WHERE telegram_user_id='42'").get();
+
+  assert.match(rejected.text ?? "", /outra operação|expirou/iu);
+  assert.notEqual(first.state.sessionId, second.state.sessionId);
+  assert.deepEqual(stateAfter, stateBefore);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE origin='telegram'").get().total, 1);
+});
+
+test("callback de sessão anterior não altera o state da conversa nova", async () => {
+  const db = database(); seedTelegramContext(db);
+  const first = await beginFinancialConversation(db, 1401);
+  const oldAlter = callbackByText(first.response, "Alterar");
+  await handleTelegramUpdate(callbackUpdate(1402, callbackByText(first.response, "Cancelar")));
+  const second = await beginFinancialConversation(db, 1403, "Gastei 25 no mercado no pix");
+  const stateBefore = db.prepare("SELECT payload_json, updated_at FROM telegram_conversation_states WHERE telegram_user_id='42'").get();
+
+  await handleTelegramUpdate(callbackUpdate(1404, oldAlter));
+
+  const stateAfter = db.prepare("SELECT payload_json, updated_at FROM telegram_conversation_states WHERE telegram_user_id='42'").get();
+  assert.notEqual(first.state.sessionId, second.state.sessionId);
+  assert.deepEqual(stateAfter, stateBefore);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+});
+
+test("callback com sessionId adulterado passa pelo handler sem alterar state ou finanças", async () => {
+  const db = database(); seedTelegramContext(db);
+  const current = await beginFinancialConversation(db, 1501);
+  const confirm = callbackByText(current.response, "Confirmar");
+  const replacement = confirm[0] === "A" ? "B" : "A";
+  const adulterated = `${replacement}${confirm.slice(1)}`;
+  const stateBefore = db.prepare("SELECT payload_json, updated_at FROM telegram_conversation_states WHERE telegram_user_id='42'").get();
+
+  await handleTelegramUpdate(callbackUpdate(1502, adulterated));
+
+  const stateAfter = db.prepare("SELECT payload_json, updated_at FROM telegram_conversation_states WHERE telegram_user_id='42'").get();
+  assert.deepEqual(stateAfter, stateBefore);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM card_purchases").get().total, 0);
+});
+
+test("cartão legado homônimo persiste pelo handler uma única compra parcelada", async () => {
+  const db = database(); seedTelegramContext(db);
+  const started = await beginFinancialConversation(db, 1601, "Comprei 50 no Nubank em 2x no mercado");
+  assert.equal(started.state.financialIntent.paymentFlow, "credit_card");
+  assert.equal(started.state.financialIntent.cardId, "card-nubank");
+  assert.equal(started.state.financialIntent.installmentCount, 2);
+  assert.equal(started.state.financialIntent.legacyCardCompatible, true);
+  const confirm = callbackByText(started.response, "Confirmar");
+
+  await handleTelegramUpdate(callbackUpdate(1602, confirm));
+  await handleTelegramUpdate(callbackUpdate(1603, confirm));
+
+  assert.equal(db.prepare("SELECT count(*) total FROM card_purchases WHERE origin='telegram'").get().total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM card_installments").get().total, 2);
+  assert.equal(db.prepare("SELECT sum(amount_cents) total FROM card_installments").get().total, 5_000);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id=?").get(`financial:${started.state.sessionId}`).total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
 });
 
 test("falha na auditoria reverte update e transação", () => {

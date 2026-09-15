@@ -21,16 +21,16 @@ test("parser reconhece despesas, entradas e valores brasileiros", () => {
 
 test("datas relativas usam o calendário de São Paulo", () => {
   assert.equal(dateInSaoPaulo(now), "2026-09-11");
-  assert.equal(parseTelegramMessage("recebi 200 do cliente hoje", context, { now }).transactionDate, "2026-09-11");
-  assert.equal(parseTelegramMessage("gastei 10 no mercado ontem", context, { now }).transactionDate, "2026-09-10");
-  assert.equal(parseTelegramMessage("paguei 20 de gasolina anteontem", context, { now }).transactionDate, "2026-09-09");
+  assert.equal(parseTelegramMessage("recebi 200 do cliente hoje", context, { now }).purchaseDate, "2026-09-11");
+  assert.equal(parseTelegramMessage("gastei 10 no mercado ontem", context, { now }).purchaseDate, "2026-09-10");
+  assert.equal(parseTelegramMessage("paguei 20 de gasolina anteontem", context, { now }).purchaseDate, "2026-09-09");
 });
 
 test("categorias, subcategorias, contas e cartões vêm somente do contexto", () => {
   const fuel = parseTelegramMessage("paguei 120 de gasolina", context, { now });
   assert.equal(fuel.categoryId, "transport"); assert.equal(fuel.subcategoryId, "fuel");
   const card = parseTelegramMessage("gastei 100 de gasolina no Nubank em 2x", context, { now });
-  assert.equal(card.cardId, "nubank"); assert.equal(card.paymentMethod, "credit_card"); assert.equal(card.installmentCount, 2);
+  assert.equal(card.cardId, "nubank"); assert.equal(card.paymentFlow, "credit_card"); assert.equal(card.paymentMethod, null); assert.equal(card.installmentCount, 2);
   const cash = parseTelegramMessage("gastei 50 em dinheiro", context, { now });
   assert.equal(cash.paymentMethod, "cash"); assert.equal(cash.accountId, null);
   assert.equal(parseTelegramMessage("gastei 50 no Banco Inventado", context, { now }).accountId, null);

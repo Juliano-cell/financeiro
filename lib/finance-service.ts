@@ -7,8 +7,12 @@ import { buildInstallmentPlan } from "@/lib/finance-rules.mjs";
 export class FinanceValidationError extends Error {}
 export class DuplicateTelegramUpdateError extends Error {}
 
+export function telegramFinancialOperationUpdateId(operationId: string) {
+  return `financial:${operationId}`;
+}
+
 type Origin = "dashboard" | "telegram";
-type AuditSource = { updateId?: string; originalUpdateId?: string; originalText?: string; telegramUserId?: string };
+type AuditSource = { updateId?: string; operationId?: string; originalUpdateId?: string; originalText?: string; telegramUserId?: string };
 
 type TransactionInput = {
   type: "income" | "expense";
@@ -102,6 +106,7 @@ function idempotencyStatements(context: CreationContext, at: string) {
   const d1 = database();
   const statements: D1PreparedStatement[] = [];
   if (context.source?.updateId) statements.push(d1.prepare("INSERT INTO telegram_processed_updates (update_id, received_at) VALUES (?, ?)").bind(context.source.updateId, at));
+  if (context.source?.operationId) statements.push(d1.prepare("INSERT INTO telegram_processed_updates (update_id, received_at) VALUES (?, ?)").bind(telegramFinancialOperationUpdateId(context.source.operationId), at));
   return statements;
 }
 
