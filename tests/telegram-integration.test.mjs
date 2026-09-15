@@ -141,22 +141,22 @@ function seedTelegramContext(db) {
   return at;
 }
 
-function messageUpdate(updateId, text) {
-  return { update_id: updateId, message: { text, chat: { id: 42, type: "private" }, from: { id: 42 } } };
+function messageUpdate(updateId, text, telegramId = 42) {
+  return { update_id: updateId, message: { text, chat: { id: telegramId, type: "private" }, from: { id: telegramId } } };
 }
 
-function callbackUpdate(updateId, data) {
-  return { update_id: updateId, callback_query: { id: `callback-${updateId}`, data, from: { id: 42 }, message: { chat: { id: 42, type: "private" } } } };
+function callbackUpdate(updateId, data, telegramId = 42) {
+  return { update_id: updateId, callback_query: { id: `callback-${updateId}`, data, from: { id: telegramId }, message: { chat: { id: telegramId, type: "private" } } } };
 }
 
-function storedFinancialState(db) {
-  const row = db.prepare("SELECT payload_json FROM telegram_conversation_states WHERE telegram_user_id='42' AND household_id='ha'").get();
+function storedFinancialState(db, telegramId = 42) {
+  const row = db.prepare("SELECT payload_json FROM telegram_conversation_states WHERE telegram_user_id=? AND household_id='ha'").get(String(telegramId));
   return row ? JSON.parse(row.payload_json) : null;
 }
 
-async function beginFinancialConversation(db, updateId, text = "Gastei 85 no mercado no pix") {
-  const response = await handleTelegramUpdate(messageUpdate(updateId, text));
-  const state = storedFinancialState(db);
+async function beginFinancialConversation(db, updateId, text = "Gastei 85 no mercado no pix", telegramId = 42) {
+  const response = await handleTelegramUpdate(messageUpdate(updateId, text, telegramId));
+  const state = storedFinancialState(db, telegramId);
   assert.ok(state?.sessionId);
   assert.equal(state.phase, "confirming");
   return { response, state };
@@ -237,10 +237,12 @@ test("cancelamento real consome a sessão atomicamente e impede confirmação po
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
   assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
   assert.equal(db.prepare("SELECT count(*) total FROM card_purchases").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM bills").get().total, 0);
 
   await handleTelegramUpdate(callbackUpdate(1203, confirm));
   assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
   assert.equal(db.prepare("SELECT count(*) total FROM card_purchases").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM bills").get().total, 0);
 });
 
 test("cancelamento antigo depois da confirmação não desfaz movimentação nem altera nova sessão", async () => {
@@ -311,6 +313,71 @@ test("cartão legado homônimo persiste pelo handler uma única compra parcelada
   assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id=?").get(`financial:${started.state.sessionId}`).total, 1);
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
+});
+
+test("future_bill confirmado cria um único vencimento pending sem transaction", async () => {
+  const db = database(); seedTelegramContext(db);
+  const started = await beginFinancialConversation(db, 1701, "Comprei uma camiseta de 50 no mercado e pago em 20/10/2026");
+  assert.equal(started.state.financialIntent.paymentFlow, "future_bill");
+  assert.equal(started.state.financialIntent.dueDate, "2026-10-20");
+  assert.equal(started.state.financialIntent.accountId, null);
+  assert.match(started.response.text ?? "", /Pagamento: Pendente/);
+  assert.match(started.response.text ?? "", /Compra:/);
+  assert.match(started.response.text ?? "", /Vencimento: 2026-10-20/);
+  const confirm = callbackByText(started.response, "Confirmar");
+
+  const result = await handleTelegramUpdate(callbackUpdate(1702, confirm));
+  await handleTelegramUpdate(callbackUpdate(1703, confirm));
+
+  assert.match(result.text ?? "", /Vencimento.*criado/iu);
+  const bill = db.prepare("SELECT status,amount_cents,due_date,account_id,recurrence,created_by_user_id,origin FROM bills WHERE household_id='ha'").get();
+  assert.deepEqual({ ...bill }, { status: "pending", amount_cents: 5000, due_date: "2026-10-20", account_id: null, recurrence: "none", created_by_user_id: "ua", origin: "telegram" });
+  assert.equal(db.prepare("SELECT count(*) total FROM bills WHERE household_id='ha'").get().total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE household_id='ha'").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_type='bill'").get().total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id=?").get(`financial:${started.state.sessionId}`).total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states WHERE telegram_user_id='42'").get().total, 0);
+});
+
+test("future_bill deriva created_by de cada vínculo ativo no mesmo household", async () => {
+  const db = database(); const at = seedTelegramContext(db);
+  db.prepare("INSERT INTO users(id,name,email,created_at,updated_at) VALUES(?,?,?,?,?)").run("ua2", "User a2", "a2@example.com", at, at);
+  db.prepare("INSERT INTO household_members(id,household_id,user_id,role,status,joined_at,created_at) VALUES(?,?,?,?,?,?,?)").run("ma2", "ha", "ua2", "member", "active", at, at);
+  db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,linked_at,updated_at) VALUES(?,?,?,?,?,?,?)").run("link-handler-2", "ha", "ua2", "43", "43", at, at);
+
+  const first = await beginFinancialConversation(db, 1801, "Comprei uma camiseta de 10 no mercado e pago dia 20");
+  await handleTelegramUpdate(callbackUpdate(1802, callbackByText(first.response, "Confirmar")));
+  const second = await beginFinancialConversation(db, 1803, "Comprei um tênis de 20 no mercado e pago dia 21", 43);
+  await handleTelegramUpdate(callbackUpdate(1804, callbackByText(second.response, "Confirmar"), 43));
+
+  assert.deepEqual(db.prepare("SELECT created_by_user_id FROM bills WHERE household_id='ha' ORDER BY amount_cents").all().map((row) => row.created_by_user_id), ["ua", "ua2"]);
+});
+
+test("mês-alvo incompleto é preservado até o usuário informar o dia", async () => {
+  const db = database(); seedTelegramContext(db);
+  const initial = await handleTelegramUpdate(messageUpdate(1901, "Comprei uma camiseta de 30 no mercado e pago mês que vem"));
+  let state = storedFinancialState(db);
+  assert.equal(state.phase, "collecting");
+  assert.equal(state.field, "vencimento");
+  assert.equal(state.financialIntent.dueMonth, "2026-10");
+  assert.match(initial.text ?? "", /vencimento/iu);
+
+  const completed = await handleTelegramUpdate(messageUpdate(1902, "dia 10"));
+  state = storedFinancialState(db);
+  assert.equal(state.phase, "confirming");
+  assert.equal(state.financialIntent.dueDate, "2026-10-10");
+  assert.equal(state.financialIntent.dueMonth, null);
+  assert.match(completed.text ?? "", /Vencimento: 2026-10-10/);
+});
+
+test("direct_installments continua sem persistência", async () => {
+  const db = database(); seedTelegramContext(db);
+  const started = await beginFinancialConversation(db, 2001, "Comprei uma bicicleta de 300 no mercado em 3 parcelas direto na loja, primeiro vencimento dia 20");
+  assert.equal(started.state.financialIntent.paymentFlow, "direct_installments");
+  const response = await handleTelegramUpdate(callbackUpdate(2002, callbackByText(started.response, "Confirmar")));
+  assert.match(response.text ?? "", /ainda não está disponível/iu);
+  assert.equal(db.prepare("SELECT count(*) total FROM bills").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
 });
 
 test("falha na auditoria reverte update e transação", () => {

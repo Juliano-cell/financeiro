@@ -149,6 +149,81 @@ test("novas bills exigem categoria e subcategoria ativa quando aplicável", asyn
   assert.deepEqual(db.prepare("SELECT DISTINCT subcategory_id FROM bills WHERE recurrence_series_id=?").all(recurring.seriesId).map((row) => row.subcategory_id), [a.subcategory]);
 });
 
+test("createBill rejeita datas civis inválidas e preserva datas válidas da web", async () => {
+  const db = database();
+  const a = seedHousehold(db, "date");
+  const base = { description: "Conta", amountCents: 1000, categoryId: a.categoryWithoutSubs, subcategoryId: null, recurrence: "none", accountId: null };
+  await assert.rejects(createBill({ ...base, dueDate: "2026-02-31" }, context(db, a)), assertBillError(400));
+  await assert.rejects(createBill({ ...base, dueDate: "2027-02-29" }, context(db, a)), assertBillError(400));
+  const created = await createBill({ ...base, dueDate: "2028-02-29" }, context(db, a));
+  assert.equal(db.prepare("SELECT due_date, origin FROM bills WHERE id=?").get(created.ids[0]).due_date, "2028-02-29");
+  assert.equal(db.prepare("SELECT due_date, origin FROM bills WHERE id=?").get(created.ids[0]).origin, "web");
+});
+
+test("future bill Telegram cria pending com conta nula, auditoria e consumo atômico", async () => {
+  const db = database();
+  const a = seedHousehold(db, "telegram");
+  db.prepare("INSERT INTO telegram_conversation_states(telegram_user_id,household_id,payload_json,expires_at,updated_at) VALUES(?,?,?,?,?)").run("tg-user", a.household, '{"sessionId":"session1234"}', "2026-09-14T13:00:00.000Z", AT);
+  const beforeBalance = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-13", a.household, "2026-09-13", a.household).find((row) => row.account_id === a.account).current_balance_cents;
+  const result = await createBill({ description: "Camiseta", amountCents: 12_000, dueDate: "2026-10-10", categoryId: a.categoryWithoutSubs, subcategoryId: null, accountId: null, recurrence: "none", notes: null }, {
+    ...context(db, a), origin: "telegram", clearTelegramStateFor: "tg-user",
+    source: { updateId: "tg-confirm-1", operationId: "session1234", originalUpdateId: "tg-start-1", originalText: "Comprei camiseta e pago mês que vem", telegramUserId: "tg-user", purchaseDate: "2026-09-14" },
+  });
+  const bill = db.prepare("SELECT status,amount_cents,due_date,account_id,recurrence,created_by_user_id,origin FROM bills WHERE id=?").get(result.ids[0]);
+  assert.deepEqual({ ...bill }, { status: "pending", amount_cents: 12_000, due_date: "2026-10-10", account_id: null, recurrence: "none", created_by_user_id: a.user, origin: "telegram" });
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_type='bill' AND entity_id=?").get(result.ids[0]).total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id IN ('tg-confirm-1','financial:session1234')").get().total, 2);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states WHERE telegram_user_id='tg-user'").get().total, 0);
+  const afterBalance = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-13", a.household, "2026-09-13", a.household).find((row) => row.account_id === a.account).current_balance_cents;
+  assert.equal(afterBalance, beforeBalance);
+  assert.equal(db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT count(*) total FROM financial_events`).get(a.household, a.household).total, 0);
+  const audit = JSON.parse(db.prepare("SELECT new_data FROM audit_logs WHERE entity_id=?").get(result.ids[0]).new_data);
+  assert.equal(audit.source.purchaseDate, "2026-09-14");
+
+  const paid = await payBill({ id: result.ids[0], accountId: a.account }, context(db, a));
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE id=? AND payment_method='conta_a_pagar'").get(paid.transactionId).total, 1);
+  assert.equal(db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT count(*) total FROM financial_events WHERE payment_method='conta_a_pagar'`).get(a.household, a.household).total, 1);
+  await undoBillPayment(result.ids[0], context(db, a));
+  assert.equal(db.prepare("SELECT status FROM bills WHERE id=?").get(result.ids[0]).status, "pending");
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE id=?").get(paid.transactionId).total, 0);
+  const restoredBalance = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-13", a.household, "2026-09-13", a.household).find((row) => row.account_id === a.account).current_balance_cents;
+  assert.equal(restoredBalance, beforeBalance);
+});
+
+test("idempotência por sessão limita future bill a um registro", async () => {
+  const db = database();
+  const a = seedHousehold(db, "bill-idempotent");
+  const input = { description: "Conta futura", amountCents: 5000, dueDate: "2026-10-20", categoryId: a.categoryWithoutSubs, subcategoryId: null, accountId: null, recurrence: "none" };
+  const firstContext = { ...context(db, a), origin: "telegram", source: { updateId: "bill-update-1", operationId: "samebill01", telegramUserId: "tg" } };
+  await createBill(input, firstContext);
+  await assert.rejects(createBill(input, { ...firstContext, source: { ...firstContext.source, updateId: "bill-update-2" } }), (error) => error instanceof BillServiceError && error.code === "TELEGRAM_UPDATE_ALREADY_PROCESSED");
+  assert.equal(db.prepare("SELECT count(*) total FROM bills WHERE household_id=? AND origin='telegram'").get(a.household).total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id='bill-update-2'").get().total, 0);
+});
+
+test("falha no batch Telegram não deixa bill, auditoria ou marcador parcial", async () => {
+  const db = database();
+  const a = seedHousehold(db, "bill-rollback");
+  db.prepare("INSERT INTO telegram_conversation_states(telegram_user_id,household_id,payload_json,expires_at,updated_at) VALUES(?,?,?,?,?)").run("tg-rollback", a.household, '{"sessionId":"rollback01"}', "2026-09-14T13:00:00.000Z", AT);
+  db.exec("CREATE TRIGGER force_bill_audit_failure BEFORE INSERT ON audit_logs WHEN NEW.entity_type='bill' BEGIN SELECT RAISE(ABORT, 'forced bill audit failure'); END");
+  await assert.rejects(createBill({ description: "Falha", amountCents: 1000, dueDate: "2026-10-20", categoryId: a.categoryWithoutSubs, subcategoryId: null, accountId: null, recurrence: "none" }, { ...context(db, a), origin: "telegram", clearTelegramStateFor: "tg-rollback", source: { updateId: "rollback-update", operationId: "rollback01", telegramUserId: "tg-rollback" } }), /forced bill audit failure/);
+  assert.equal(db.prepare("SELECT count(*) total FROM bills WHERE household_id=?").get(a.household).total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE household_id=?").get(a.household).total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id IN ('rollback-update','financial:rollback01')").get().total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states WHERE telegram_user_id='tg-rollback'").get().total, 1);
+});
+
+test("callback antigo não cria bill nem consome conversation state novo", async () => {
+  const db = database();
+  const a = seedHousehold(db, "bill-stale");
+  db.prepare("INSERT INTO telegram_conversation_states(telegram_user_id,household_id,payload_json,expires_at,updated_at) VALUES(?,?,?,?,?)").run("tg-stale", a.household, '{"sessionId":"newsession"}', "2026-09-14T13:00:00.000Z", AT);
+  await assert.rejects(createBill({ description: "Antigo", amountCents: 1000, dueDate: "2026-10-20", categoryId: a.categoryWithoutSubs, subcategoryId: null, accountId: null, recurrence: "none" }, { ...context(db, a), origin: "telegram", clearTelegramStateFor: "tg-stale", source: { updateId: "stale-update", operationId: "oldsession", telegramUserId: "tg-stale" } }), (error) => error instanceof BillServiceError && error.code === "TELEGRAM_UPDATE_ALREADY_PROCESSED");
+  assert.equal(db.prepare("SELECT count(*) total FROM bills WHERE household_id=?").get(a.household).total, 0);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id IN ('stale-update','financial:oldsession')").get().total, 0);
+  assert.equal(JSON.parse(db.prepare("SELECT payload_json FROM telegram_conversation_states WHERE telegram_user_id='tg-stale'").get().payload_json).sessionId, "newsession");
+});
+
 test("edição valida classificação e mantém bills legadas legíveis", async () => {
   const db = database();
   const a = seedHousehold(db, "a");

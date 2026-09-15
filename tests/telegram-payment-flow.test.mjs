@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { parseTelegramMessage } from "../lib/telegram-parser.mjs";
 import { buildTelegramInstallmentPreview, isLegacyTelegramCardPersistence, parseTelegramInstallmentCount, resolveTelegramDueDate, telegramFinancialPersistenceTarget, transitionTelegramPaymentFlow } from "../lib/telegram-payment-flow.mjs";
+import { updateTelegramIntentField } from "../lib/telegram-conversation.mjs";
 
 const now = new Date("2026-09-14T12:00:00.000Z");
 const context = {
@@ -84,22 +85,46 @@ test("parcelamento ou menção explícita ao cartão desambigua conta e cartão 
 });
 
 test("troca de paymentFlow limpa somente campos incompatíveis", () => {
-  const full = { paymentFlow: "credit_card", paymentMethod: "pix", accountId: "account", cardId: "card", dueDate: "2026-10-10", installmentCount: 3, firstDueDate: "2026-10-20", installmentDayOfMonth: 20, categoryId: "category", subcategoryId: "subcategory" };
-  assert.deepEqual(transitionTelegramPaymentFlow(full, "immediate"), { ...full, paymentFlow: "immediate", legacyCardCompatible: false, cardId: null, dueDate: null, installmentCount: null, firstDueDate: null, installmentDayOfMonth: null });
+  const full = { paymentFlow: "credit_card", paymentMethod: "pix", accountId: "account", cardId: "card", dueDate: "2026-10-10", dueMonth: "2026-10", installmentCount: 3, firstDueDate: "2026-10-20", installmentDayOfMonth: 20, categoryId: "category", subcategoryId: "subcategory" };
+  assert.deepEqual(transitionTelegramPaymentFlow(full, "immediate"), { ...full, paymentFlow: "immediate", legacyCardCompatible: false, cardId: null, dueDate: null, dueMonth: null, installmentCount: null, firstDueDate: null, installmentDayOfMonth: null });
   assert.deepEqual(transitionTelegramPaymentFlow(full, "future_bill"), { ...full, paymentFlow: "future_bill", legacyCardCompatible: false, cardId: null, accountId: null, paymentMethod: null, installmentCount: null, firstDueDate: null, installmentDayOfMonth: null });
-  assert.deepEqual(transitionTelegramPaymentFlow(full, "credit_card"), { ...full, paymentFlow: "credit_card", accountId: null, paymentMethod: null, dueDate: null, firstDueDate: null, installmentDayOfMonth: null });
-  assert.deepEqual(transitionTelegramPaymentFlow(full, "direct_installments"), { ...full, paymentFlow: "direct_installments", legacyCardCompatible: false, accountId: null, paymentMethod: null, cardId: null, dueDate: null });
+  assert.deepEqual(transitionTelegramPaymentFlow(full, "credit_card"), { ...full, paymentFlow: "credit_card", accountId: null, paymentMethod: null, dueDate: null, dueMonth: null, firstDueDate: null, installmentDayOfMonth: null });
+  assert.deepEqual(transitionTelegramPaymentFlow(full, "direct_installments"), { ...full, paymentFlow: "direct_installments", legacyCardCompatible: false, accountId: null, paymentMethod: null, cardId: null, dueDate: null, dueMonth: null });
 });
 
 test("datas futuras são determinísticas em virada de ano e ano bissexto", () => {
   assert.deepEqual(resolveTelegramDueDate("ficou para dia 20", "2026-09-14"), { status: "resolved", date: "2026-09-20", desiredDay: 20 });
-  assert.deepEqual(resolveTelegramDueDate("vence dia 20", "2026-09-20"), { status: "resolved", date: "2026-10-20", desiredDay: 20 });
+  assert.deepEqual(resolveTelegramDueDate("vence dia 20", "2026-09-20"), { status: "resolved", date: "2026-09-20", desiredDay: 20 });
   assert.equal(resolveTelegramDueDate("vou pagar dia 15/10", "2026-10-15").date, "2026-10-15");
   assert.equal(resolveTelegramDueDate("vou pagar dia 15/10", "2026-10-16").date, "2027-10-15");
   assert.equal(resolveTelegramDueDate("vence dia 10", "2026-12-20").date, "2027-01-10");
   assert.equal(resolveTelegramDueDate("vou pagar dia 29/02", "2027-03-01").date, "2028-02-29");
   assert.equal(resolveTelegramDueDate("pago mês que vem", "2026-09-14").status, "incomplete");
   assert.equal(resolveTelegramDueDate("vou pagar 2026-02-30", "2026-01-01").status, "invalid");
+});
+
+test("datas naturais preservam mês-alvo e rejeitam dias inexistentes", () => {
+  assert.deepEqual(resolveTelegramDueDate("pago amanhã", "2026-09-14"), { status: "resolved", date: "2026-09-15", desiredDay: 15 });
+  assert.equal(resolveTelegramDueDate("pago em 20/09", "2026-09-14").date, "2026-09-20");
+  assert.equal(resolveTelegramDueDate("pago em 20/09/2026", "2026-09-14").date, "2026-09-20");
+  assert.deepEqual(resolveTelegramDueDate("pago mês que vem", "2026-12-14"), { status: "incomplete", date: null, desiredDay: null, targetMonth: "2027-01" });
+  assert.equal(resolveTelegramDueDate("dia 10", "2026-12-14", "2027-01").date, "2027-01-10");
+  assert.deepEqual(resolveTelegramDueDate("ficou para outubro", "2026-09-14"), { status: "incomplete", date: null, desiredDay: null, targetMonth: "2026-10" });
+  assert.equal(resolveTelegramDueDate("dia 15", "2026-09-14", "2026-10").date, "2026-10-15");
+  assert.equal(resolveTelegramDueDate("pago dia 31 do mês que vem", "2026-03-14").status, "invalid");
+  assert.equal(resolveTelegramDueDate("pago em 31/02", "2026-01-01").status, "invalid");
+  assert.equal(resolveTelegramDueDate("pago em 29/02/2027", "2026-01-01").status, "invalid");
+  assert.equal(resolveTelegramDueDate("pago em 29/02/2028", "2026-01-01").date, "2028-02-29");
+  assert.equal(resolveTelegramDueDate("pago dia 20", "2026-09-25").date, "2026-10-20");
+  assert.equal(resolveTelegramDueDate("pago em 20/09/2025", "2026-01-01").status, "invalid");
+});
+
+test("edição da compra invalida vencimento anterior e mantém o fluxo direto legado", () => {
+  assert.deepEqual(updateTelegramIntentField({ purchaseDate: "2026-09-14", dueDate: "2026-09-20", dueMonth: null }, "date", "2026-09-21"), { purchaseDate: "2026-09-21", dueDate: null, dueMonth: null });
+  assert.deepEqual(updateTelegramIntentField({ purchaseDate: "2026-09-14", dueDate: null, dueMonth: "2026-09" }, "date", "2026-10-01"), { purchaseDate: "2026-10-01", dueDate: null, dueMonth: null });
+  assert.deepEqual(updateTelegramIntentField({ dueDate: null, dueMonth: "2026-10" }, "dueDate", "2026-10-10"), { dueDate: "2026-10-10", dueMonth: null });
+  assert.equal(resolveTelegramDueDate("primeiro vencimento dia 20", "2026-09-20", null, false).date, "2026-10-20");
+  assert.equal(resolveTelegramDueDate("primeiro vencimento dia 31 do mês que vem", "2026-03-14", null, false).date, "2026-04-30");
 });
 
 test("parser reconhece pago dia N como vencimento futuro sem inventar descrição", () => {
@@ -136,17 +161,16 @@ test("cartão legado é marcado somente quando cartão e parcelas já estão exp
   assert.equal(parseTelegramMessage("Passei 300 no crédito em 2x", context, { now }).legacyCardCompatible, false);
   assert.equal(isLegacyTelegramCardPersistence(parseTelegramMessage("Passei 300 no crédito em 2x", context, { now })), false);
   assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "immediate", accountId: "bank" }), "transaction");
-  assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "future_bill" }), null);
+  assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "future_bill" }), "bill");
   assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "direct_installments" }), null);
   assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "credit_card", cardId: "nubank-card" }), null);
   assert.equal(transitionTelegramPaymentFlow({ paymentFlow: "credit_card", legacyCardCompatible: true, cardId: "nubank-card" }, "future_bill").legacyCardCompatible, false);
 });
 
-test("confirmação de fluxos futuros não possui fallback para transaction ou persistência prematura", () => {
+test("confirmação persiste somente future_bill e mantém outros novos fluxos sem fallback", () => {
   const handler = readFileSync(new URL("../lib/telegram-handler.ts", import.meta.url), "utf8");
-  assert.match(handler, /if \(paymentFlow !== "immediate"\)[\s\S]+Nenhum lançamento foi criado/);
   assert.match(handler, /persistenceTarget === "card_purchase" && intent\.cardId/);
-  assert.doesNotMatch(handler, /createBill\(/);
+  assert.match(handler, /persistenceTarget === "bill"[\s\S]+await createBill\(/);
   assert.doesNotMatch(handler, /createRecurring/);
   assert.match(handler, /if \(persistenceTarget === "transaction"\)[\s\S]+await createTransaction/);
   assert.match(handler, /if \(paymentFlow !== "immediate"\)[\s\S]+Nenhum lançamento foi criado/);

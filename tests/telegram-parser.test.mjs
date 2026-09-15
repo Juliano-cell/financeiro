@@ -61,3 +61,21 @@ test("mensagens acima do limite são rejeitadas", () => {
   const parsed = parseTelegramMessage("x".repeat(1_001), context, { now });
   assert.equal(parsed.intent, "unknown"); assert.equal(parsed.error, "message_too_long");
 });
+
+test("parser exige contexto futuro de despesa e preserva mês-alvo incompleto", () => {
+  const tomorrow = parseTelegramMessage("Gastei 80 mas ficou para pagar amanhã", context, { now });
+  assert.equal(tomorrow.paymentFlow, "future_bill");
+  assert.equal(tomorrow.dueDate, "2026-09-12");
+
+  const nextMonth = parseTelegramMessage("Comprei 300 e ficou para mês que vem", context, { now });
+  assert.equal(nextMonth.paymentFlow, "future_bill");
+  assert.equal(nextMonth.dueDate, null);
+  assert.equal(nextMonth.dueMonth, "2026-10");
+
+  const namedMonth = parseTelegramMessage("Comprei 100 e ficou para outubro", context, { now });
+  assert.equal(namedMonth.paymentFlow, "future_bill");
+  assert.equal(namedMonth.dueMonth, "2026-10");
+
+  assert.notEqual(parseTelegramMessage("Recebi 50 dia 20", context, { now }).paymentFlow, "future_bill");
+  assert.notEqual(parseTelegramMessage("Ganhei 100 ontem", context, { now }).paymentFlow, "future_bill");
+});

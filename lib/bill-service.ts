@@ -5,6 +5,16 @@ type BillContext = {
   householdId: string;
   userId: string;
   timestamp?: string;
+  origin?: "web" | "telegram";
+  source?: {
+    updateId?: string;
+    operationId?: string;
+    originalUpdateId?: string;
+    originalText?: string;
+    telegramUserId?: string;
+    purchaseDate?: string;
+  };
+  clearTelegramStateFor?: string;
 };
 
 type BillClassification = {
@@ -92,6 +102,29 @@ function assertMoney(value: number) {
 
 function assertDate(value: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) throw new BillServiceError("Data inválida.");
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) throw new BillServiceError("Data inválida.");
+}
+
+function billAuditPayload(input: CreateBillInput, context: BillContext, billIds: string[], seriesId: string | null) {
+  const source = context.source ? {
+    telegramUpdateId: context.source.updateId,
+    originalTelegramUpdateId: context.source.originalUpdateId,
+    telegramUserId: context.source.telegramUserId,
+    originalText: context.source.originalText?.slice(0, 1_000),
+    purchaseDate: context.source.purchaseDate,
+  } : undefined;
+  return JSON.stringify({ input, billIds, seriesId, ...(source ? { source } : {}) });
+}
+
+function isDuplicateTelegramMarker(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /telegram_processed_updates|UNIQUE constraint failed.*update_id/iu.test(message);
+}
+
+function telegramBillOperationUpdateId(operationId: string) {
+  return `financial:${operationId}`;
 }
 
 async function assertActiveMembership(context: BillContext) {
@@ -269,6 +302,7 @@ export async function createBill(input: CreateBillInput, context: BillContext) {
   await validateAccount(context, input.accountId);
 
   const timestamp = isoTimestamp(context);
+  const origin = context.origin ?? "web";
   const recurrenceEndDate = input.recurrence === "monthly" ? (input.recurrenceEndDate ?? null) : null;
   const seriesId = input.recurrence === "monthly" ? uid("bill_series") : null;
   const maxMonths = input.recurrence === "monthly" ? 24 : 1;
@@ -282,9 +316,26 @@ export async function createBill(input: CreateBillInput, context: BillContext) {
   }
 
   const statements: D1PreparedStatement[] = [];
-  if (seriesId) statements.push(context.d1.prepare("INSERT INTO recurring_bill_series (id, household_id, description, amount_cents, category_id, subcategory_id, account_id, day_of_month, starts_on, ends_on, is_active, notes, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'web', ?, ?)").bind(seriesId, context.householdId, input.description.trim(), input.amountCents, input.categoryId, input.subcategoryId ?? null, input.accountId ?? null, Number(input.dueDate.slice(8)), input.dueDate, recurrenceEndDate, input.notes ?? null, context.userId, timestamp, timestamp));
-  for (const occurrence of occurrences) statements.push(context.d1.prepare("INSERT INTO bills (id, household_id, description, amount_cents, category_id, subcategory_id, due_date, account_id, recurrence, recurrence_series_id, recurrence_end_date, notes, status, paid_at, payment_transaction_id, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, 'web', ?, ?)").bind(occurrence.id, context.householdId, input.description.trim(), input.amountCents, input.categoryId, input.subcategoryId ?? null, occurrence.dueDate, input.accountId ?? null, input.recurrence, seriesId, recurrenceEndDate, input.notes ?? null, context.userId, timestamp, timestamp));
-  await context.d1.batch(statements);
+  if (context.source?.updateId) statements.push(context.d1.prepare("INSERT INTO telegram_processed_updates (update_id, received_at) VALUES (?, ?)").bind(context.source.updateId, timestamp));
+  if (context.source?.operationId) statements.push(context.d1.prepare("INSERT INTO telegram_processed_updates (update_id, received_at) VALUES (?, ?)").bind(telegramBillOperationUpdateId(context.source.operationId), timestamp));
+  if (context.source?.updateId && context.source.operationId && context.clearTelegramStateFor) {
+    statements.push(context.d1.prepare("INSERT INTO telegram_processed_updates (update_id, received_at) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM telegram_conversation_states WHERE telegram_user_id = ? AND household_id = ? AND json_extract(payload_json, '$.sessionId') = ?)").bind(context.source.updateId, timestamp, context.clearTelegramStateFor, context.householdId, context.source.operationId));
+  }
+  if (seriesId) statements.push(context.d1.prepare("INSERT INTO recurring_bill_series (id, household_id, description, amount_cents, category_id, subcategory_id, account_id, day_of_month, starts_on, ends_on, is_active, notes, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)").bind(seriesId, context.householdId, input.description.trim(), input.amountCents, input.categoryId, input.subcategoryId ?? null, input.accountId ?? null, Number(input.dueDate.slice(8)), input.dueDate, recurrenceEndDate, input.notes ?? null, context.userId, origin, timestamp, timestamp));
+  for (const occurrence of occurrences) statements.push(context.d1.prepare("INSERT INTO bills (id, household_id, description, amount_cents, category_id, subcategory_id, due_date, account_id, recurrence, recurrence_series_id, recurrence_end_date, notes, status, paid_at, payment_transaction_id, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?, ?)").bind(occurrence.id, context.householdId, input.description.trim(), input.amountCents, input.categoryId, input.subcategoryId ?? null, occurrence.dueDate, input.accountId ?? null, input.recurrence, seriesId, recurrenceEndDate, input.notes ?? null, context.userId, origin, timestamp, timestamp));
+  if (context.source) statements.push(context.d1.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) VALUES (?, ?, ?, 'create', 'bill', ?, NULL, ?, ?)").bind(uid("audit"), context.householdId, context.userId, occurrences[0].id, billAuditPayload(input, context, occurrences.map((occurrence) => occurrence.id), seriesId), timestamp));
+  if (context.clearTelegramStateFor) {
+    const sessionId = context.source?.operationId;
+    statements.push(sessionId
+      ? context.d1.prepare("DELETE FROM telegram_conversation_states WHERE telegram_user_id = ? AND household_id = ? AND json_extract(payload_json, '$.sessionId') = ?").bind(context.clearTelegramStateFor, context.householdId, sessionId)
+      : context.d1.prepare("DELETE FROM telegram_conversation_states WHERE telegram_user_id = ? AND household_id = ?").bind(context.clearTelegramStateFor, context.householdId));
+  }
+  try {
+    await context.d1.batch(statements);
+  } catch (error) {
+    if (context.source && isDuplicateTelegramMarker(error)) throw new BillServiceError("Update do Telegram já processado.", 409, "TELEGRAM_UPDATE_ALREADY_PROCESSED");
+    throw error;
+  }
   return { ids: occurrences.map((occurrence) => occurrence.id), seriesId };
 }
 

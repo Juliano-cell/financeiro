@@ -4,6 +4,7 @@ import { z } from "zod";
 import { getDb } from "@/db";
 import { accounts, categories, creditCards, householdMembers, invoicePayments, subcategories, telegramConversationStates, telegramLinks, transactions } from "@/db/schema";
 import { createCardPurchase, createTransaction, DuplicateTelegramUpdateError, FinanceValidationError, isTelegramUpdateProcessed, telegramFinancialOperationUpdateId } from "@/lib/finance-service";
+import { BillServiceError, createBill } from "@/lib/bill-service";
 import { parseBrazilianMoney, splitInstallments } from "@/lib/finance-rules.mjs";
 import { digestToken } from "@/lib/auth-crypto.mjs";
 import { clearRateLimit, consumeRateLimit, RateLimitError } from "@/lib/rate-limit";
@@ -24,6 +25,7 @@ type FinancialIntent = {
   paymentFlow?: "immediate" | "future_bill" | "credit_card" | "direct_installments" | null;
   legacyCardCompatible?: boolean;
   dueDate?: string | null;
+  dueMonth?: string | null;
   firstDueDate?: string | null;
   installmentDayOfMonth?: number | null;
   installmentCount?: number | null;
@@ -39,7 +41,7 @@ type FinancialIntent = {
 };
 
 const financialIntentSchema = z.object({
-  intent: z.string(), type: z.enum(["income", "expense"]).nullable().optional(), amountCents: z.number().int().positive().nullable().optional(), description: z.string().max(120).nullable().optional(), purchaseDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(), transactionDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(), paymentFlow: z.enum(["immediate", "future_bill", "credit_card", "direct_installments"]).nullable().optional(), legacyCardCompatible: z.boolean().optional(), dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).nullable().optional(), firstDueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).nullable().optional(), installmentDayOfMonth: z.number().int().min(1).max(31).nullable().optional(), installmentCount: z.number().int().min(1).max(120).nullable().optional(), paymentMethod: z.string().max(30).nullable().optional(), cardId: z.string().max(80).nullable().optional(), accountId: z.string().max(80).nullable().optional(), categoryId: z.string().max(80).nullable().optional(), subcategoryId: z.string().max(80).nullable().optional(), subcategorySkipped: z.boolean().optional(), missing: z.array(z.string().max(30)).max(10).optional(), ambiguous: z.boolean().optional(), ambiguity: z.string().max(40).nullable().optional(),
+  intent: z.string(), type: z.enum(["income", "expense"]).nullable().optional(), amountCents: z.number().int().positive().nullable().optional(), description: z.string().max(120).nullable().optional(), purchaseDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(), transactionDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(), paymentFlow: z.enum(["immediate", "future_bill", "credit_card", "direct_installments"]).nullable().optional(), legacyCardCompatible: z.boolean().optional(), dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).nullable().optional(), dueMonth: z.string().regex(/^\d{4}-\d{2}$/u).nullable().optional(), firstDueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).nullable().optional(), installmentDayOfMonth: z.number().int().min(1).max(31).nullable().optional(), installmentCount: z.number().int().min(1).max(120).nullable().optional(), paymentMethod: z.string().max(30).nullable().optional(), cardId: z.string().max(80).nullable().optional(), accountId: z.string().max(80).nullable().optional(), categoryId: z.string().max(80).nullable().optional(), subcategoryId: z.string().max(80).nullable().optional(), subcategorySkipped: z.boolean().optional(), missing: z.array(z.string().max(30)).max(10).optional(), ambiguous: z.boolean().optional(), ambiguity: z.string().max(40).nullable().optional(),
 }).passthrough();
 
 const conversationStateSchema = z.object({
@@ -220,8 +222,9 @@ function prepareIntent(intent: FinancialIntent, context: HouseholdContext) {
   } else if (paymentFlow === "future_bill") {
     if (!prepared.dueDate || !isValidTelegramDate(prepared.dueDate) || prepared.dueDate < prepared.purchaseDate!) {
       prepared.dueDate = null;
+      if (!prepared.dueMonth || !/^\d{4}-\d{2}$/u.test(prepared.dueMonth) || prepared.dueMonth < prepared.purchaseDate!.slice(0, 7)) prepared.dueMonth = null;
       missing.add("vencimento");
-    }
+    } else prepared.dueMonth = null;
   } else if (paymentFlow === "direct_installments") {
     if (!Number.isInteger(prepared.installmentCount) || prepared.installmentCount! < 2 || prepared.installmentCount! > 120 || Boolean(prepared.amountCents && prepared.installmentCount! > prepared.amountCents)) {
       prepared.installmentCount = null;
@@ -424,7 +427,7 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
     const intent = prepareIntent(state.financialIntent, context);
     const selectionChanged = intent.accountId !== state.financialIntent.accountId || intent.cardId !== state.financialIntent.cardId || intent.categoryId !== state.financialIntent.categoryId || intent.subcategoryId !== state.financialIntent.subcategoryId;
     if (intent.missing?.length || selectionChanged) return presentIntent(updateId, telegramUserId, link.householdId, { ...state, financialIntent: intent }, context, "Alguns dados mudaram; confirme novamente a seleção.");
-    const source = { updateId, operationId: state.sessionId, originalUpdateId: state.originalUpdateId, originalText: state.originalText, telegramUserId };
+    const source = { updateId, operationId: state.sessionId, originalUpdateId: state.originalUpdateId, originalText: state.originalText, telegramUserId, purchaseDate: intent.purchaseDate };
     const paymentFlow = effectiveTelegramPaymentFlow(intent);
     const persistenceTarget = telegramFinancialPersistenceTarget(intent, state.financialIntent);
     try {
@@ -436,8 +439,13 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
         await createTransaction({ type: intent.type!, amountCents: intent.amountCents!, description: intent.description!, categoryId: intent.categoryId, subcategoryId: intent.subcategoryId, transactionDate: intent.purchaseDate!, accountId: intent.accountId!, paymentMethod: intent.paymentMethod, status: "confirmed" }, { householdId: link.householdId, userId: link.userId, origin: "telegram", source, clearTelegramStateFor: telegramUserId });
         return { text: `✅ ${intent.type === "income" ? "Entrada" : "Despesa"} de ${formatBrl(intent.amountCents!)} registrada.` };
       }
+      if (persistenceTarget === "bill") {
+        await createBill({ description: intent.description!, amountCents: intent.amountCents!, dueDate: intent.dueDate!, accountId: null, recurrence: "none", categoryId: intent.categoryId!, subcategoryId: intent.subcategoryId ?? null, notes: null }, { d1: database(), householdId: link.householdId, userId: link.userId, origin: "telegram", source, clearTelegramStateFor: telegramUserId });
+        return { text: `✅ Vencimento de ${formatBrl(intent.amountCents!)} criado para ${intent.dueDate}. A conta será definida ao pagar.` };
+      }
     } catch (error) {
-      if (!(error instanceof DuplicateTelegramUpdateError)) throw error;
+      const duplicateBill = error instanceof BillServiceError && error.code === "TELEGRAM_UPDATE_ALREADY_PROCESSED";
+      if (!(error instanceof DuplicateTelegramUpdateError) && !duplicateBill) throw error;
       try {
         await commitUpdate(updateId);
       } catch (commitError) {
@@ -572,9 +580,10 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
   }
   if (state?.phase === "editing_due_date" || state?.phase === "editing_first_due_date") {
     const purchaseDate = state.financialIntent.purchaseDate ?? state.financialIntent.transactionDate ?? dateInSaoPaulo();
-    const due = resolveTelegramDueDate(text, purchaseDate);
+    const due = resolveTelegramDueDate(text, purchaseDate, state.phase === "editing_due_date" ? state.financialIntent.dueMonth : null, state.phase === "editing_due_date");
     if (due.status !== "resolved") {
-      await saveState(updateId, telegramUserId, link.householdId, state);
+      const financialIntent = due.status === "incomplete" && due.targetMonth ? { ...state.financialIntent, dueDate: null, dueMonth: due.targetMonth } : state.financialIntent;
+      await saveState(updateId, telegramUserId, link.householdId, { ...state, financialIntent });
       return { text: due.status === "incomplete" ? "Informe também o dia do vencimento." : "Vencimento inválido. Use dia 20, DD/MM ou AAAA-MM-DD.", buttons: telegramCancelButtons(state.sessionId!) };
     }
     const field = state.phase === "editing_due_date" ? "dueDate" : "firstDueDate";
@@ -615,9 +624,10 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
       }
     } else if (state.field === "vencimento" || state.field === "primeiro_vencimento") {
       const purchaseDate = intent.purchaseDate ?? intent.transactionDate ?? dateInSaoPaulo();
-      const due = resolveTelegramDueDate(text, purchaseDate);
+      const due = resolveTelegramDueDate(text, purchaseDate, state.field === "vencimento" ? intent.dueMonth : null, state.field === "vencimento");
       if (due.status !== "resolved") {
-        await saveState(updateId, telegramUserId, link.householdId, state);
+        if (due.status === "incomplete" && due.targetMonth) intent = { ...intent, dueDate: null, dueMonth: due.targetMonth };
+        await saveState(updateId, telegramUserId, link.householdId, { ...state, financialIntent: intent });
         return { text: due.status === "incomplete" ? "Informe também o dia do vencimento." : "Vencimento inválido. Use dia 20, DD/MM ou AAAA-MM-DD.", buttons: telegramCancelButtons(state.sessionId!) };
       }
       intent = updateTelegramIntentField(intent, state.field === "vencimento" ? "dueDate" : "firstDueDate", state.field === "vencimento" ? due.date : { date: due.date, desiredDay: due.desiredDay }) as FinancialIntent;
