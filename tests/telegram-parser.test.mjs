@@ -10,6 +10,48 @@ const context = {
   subcategories: [{ id: "market", householdId: "h1", categoryId: "food", name: "Mercado" }, { id: "fuel", householdId: "h1", categoryId: "transport", name: "Combustível" }, { id: "internet", householdId: "h1", categoryId: "home", name: "Internet" }, { id: "health", householdId: "h1", categoryId: "other", name: "Saúde" }, { id: "daily", householdId: "h1", categoryId: "income", name: "Diárias" }, { id: "services", householdId: "h1", categoryId: "income", name: "Serviços" }],
 };
 
+for (const [text, cents, description] of [
+  ["Comprei teste C2 por 1,12 no cartão", 112, "Teste C2"],
+  ["Comprei teste por 1,12 no cartão", 112, "Teste"],
+  ["Comprei teste C3 por 1,12 no cartão", 112, "Teste C3"],
+  ["Comprei teste C10 por 1,12 no cartão", 112, "Teste C10"],
+  ["Comprei teste C2 por R$ 1,12 no cartão", 112, "Teste C2"],
+  ["Comprei teste C2 por 1,12 reais no cartão", 112, "Teste C2"],
+  ["Comprei teste C2 por 2,50 no cartão", 250, "Teste C2"],
+  ["Comprei teste C2 por 10,50 no cartão", 1050, "Teste C2"],
+  ["Comprei teste C2 por 112,00 no cartão", 11200, "Teste C2"],
+  ["Comprei capa iPhone 15 por 50,00 no cartão", 5000, "Capa iPhone 15"],
+  ["Comprei cabo USB 2.0 por 25,90 no cartão", 2590, "Cabo USB 2.0"],
+  ["Comprei camiseta tamanho 42 por 79,90 no cartão", 7990, "Camiseta tamanho 42"],
+  ["Comprei 2 camisetas por 30,00 no cartão", 3000, "2 camisetas"],
+  ["Comprei teste C2 R$ 1,12 no cartão", 112, "Teste C2"],
+  ["Comprei teste C2 1,12 reais no cartão", 112, "Teste C2"],
+  ["Comprei iPhone 15 por 1200 no cartão", 120000, "iPhone 15"],
+  ["Comprei teste C2 por R$ 1.250,90 no cartão", 125090, "Teste C2"],
+]) {
+  test(`preço contextual não remove números da descrição: ${text}`, () => {
+    const parsed = parseTelegramMessage(text, context, { now });
+    assert.equal(parsed.amountCents, cents);
+    assert.equal(parsed.description, description);
+    assert.equal(parsed.paymentFlow, "credit_card");
+  });
+}
+
+test("identificadores e múltiplos preços ambíguos não inventam valor", () => {
+  for (const text of [
+    "Comprei C2 no cartão", "Comprei C10 no cartão", "Comprei A15 no cartão", "Comprei S23 no cartão",
+    "Comprei iPhone 15 tamanho 42 no cartão", "Comprei 2 camisetas 30 no cartão",
+    "Comprei teste por R$ 10 ou R$ 20 no cartão",
+  ]) {
+    const parsed = parseTelegramMessage(text, context, { now });
+    assert.equal(parsed.amountCents, null, text);
+    assert.ok(parsed.missing.includes("valor"), text);
+  }
+  assert.equal(parseTelegramMessage("Comprei teste C2 50 no cartão", context, { now }).amountCents, 5000);
+  assert.equal(parseTelegramMessage("Gastei 85, no mercado", context, { now }).amountCents, 8500);
+  assert.equal(parseTelegramMessage("Gastei 85. no mercado", context, { now }).amountCents, 8500);
+});
+
 test("parser reconhece despesas, entradas e valores brasileiros", () => {
   const expense = parseTelegramMessage("gastei 85 no mercado", context, { now });
   assert.equal(expense.type, "expense"); assert.equal(expense.amountCents, 8_500); assert.equal(expense.description, "Mercado"); assert.equal(expense.subcategoryId, "market");

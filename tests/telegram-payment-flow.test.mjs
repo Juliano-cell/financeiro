@@ -13,6 +13,23 @@ const context = {
   subcategories: [{ id: "shirts", categoryId: "clothes", name: "Camisetas" }],
 };
 
+test("preço contextual em C2 preserva parcelas válidas, ausentes e inválidas", () => {
+  const valid = parseTelegramMessage("Comprei teste C2 por 10,50 no cartão em 2x", context, { now });
+  assert.equal(valid.amountCents, 1050);
+  assert.equal(valid.description, "Teste C2");
+  assert.equal(valid.installmentCount, 2);
+  assert.equal(valid.installmentInputStatus, "valid");
+  const absent = parseTelegramMessage("Comprei teste C2 por 10,50 no cartão", context, { now });
+  assert.equal(absent.installmentCount, null);
+  assert.equal(absent.installmentInputStatus, "absent");
+  for (const input of ["0x", "-2x", "121x"]) {
+    const invalid = parseTelegramMessage(`Comprei teste C2 por 10,50 no cartão em ${input}`, context, { now });
+    assert.equal(invalid.amountCents, 1050, input);
+    assert.equal(invalid.installmentInputStatus, "invalid", input);
+    assert.equal(invalid.installmentCount, null, input);
+  }
+});
+
 test("parser reconhece os quatro paymentFlow e preserva paymentMethod somente no imediato", () => {
   for (const phrase of ["Gastei 80 no pix", "Paguei 80 no débito", "Paguei 80 em dinheiro", "Paguei 80 na hora"]) {
     assert.equal(parseTelegramMessage(phrase, context, { now }).paymentFlow, "immediate", phrase);

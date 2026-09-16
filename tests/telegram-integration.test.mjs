@@ -188,6 +188,106 @@ function assertNoCardCreation(db) {
   assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_type='card_purchase'").get().total, 0);
 }
 
+function seedMonetaryRegressionContext(db) {
+  const at = seedTelegramContext(db);
+  db.prepare("INSERT INTO categories(id,household_id,name,type,created_at,updated_at) VALUES(?,?,?,?,?,?)").run("category-debt", "ha", "Dívidas", "expense", at, at);
+  db.prepare("INSERT INTO subcategories(id,household_id,category_id,name,created_at,updated_at) VALUES(?,?,?,?,?,?)").run("subcategory-card", "ha", "category-debt", "Cartão", at, at);
+}
+
+for (const [text, cents, count] of [
+  ["Comprei teste C2 por 1,12 no cartão", 112, 1],
+  ["Comprei teste por 1,12 no cartão", 112, 1],
+  ["Comprei teste C2 por 10,50 no cartão em 2x", 1050, 2],
+]) {
+  test(`handler real usa preço contextual e mantém classificação/cartão: ${text}`, async () => {
+    const db = database(); seedMonetaryRegressionContext(db);
+    try {
+      const response = await handleTelegramUpdate(messageUpdate(98001, text));
+      const state = storedFinancialState(db);
+      assert.equal(state.phase, "confirming");
+      const intent = state.financialIntent;
+      assert.equal(intent.amountCents, cents);
+      assert.equal(intent.description, text.includes("C2") ? "Teste C2" : "Teste");
+      assert.equal(intent.paymentFlow, "credit_card");
+      assert.equal(intent.categoryId, "category-debt");
+      assert.equal(intent.subcategoryId, "subcategory-card");
+      assert.equal(intent.cardId, "card-nubank");
+      assert.equal(intent.installmentCount, count);
+      assert.equal(intent.installmentInputStatus, "valid");
+      assert.match(response.text, cents === 112 ? /R\$\s*1,12/u : /R\$\s*10,50/u);
+      assert.doesNotMatch(response.text, /R\$\s*2,00/u);
+      assert.match(response.text, /Categoria: Dívidas\nSubcategoria: Cartão/u);
+      assert.match(response.text, /Pagamento: Cartão de crédito\nCartão: Nubank/u);
+      assert.match(response.text, new RegExp(`Parcelamento: ${count}x`, "u"));
+      assertNoCardCreation(db);
+    } finally { db.close(); }
+  });
+}
+
+for (const [price, input] of [["10,50", "0x"], ["10,50", "-2x"], ["10,50", "121x"], ["0,02", "3x"]]) {
+  test(`handler não converte parcelas inválidas em 1x após preço contextual: ${input}/${price}`, async () => {
+    const db = database(); seedMonetaryRegressionContext(db);
+    try {
+      await handleTelegramUpdate(messageUpdate(98002, `Comprei teste C2 por ${price} no cartão em ${input}`));
+      const state = storedFinancialState(db);
+      assert.notEqual(state.phase, "confirming");
+      assert.equal(state.financialIntent.amountCents, price === "0,02" ? 2 : 1050);
+      assert.equal(state.financialIntent.installmentInputStatus, "invalid");
+      assert.equal(state.financialIntent.installmentCount, null);
+      assert.ok(state.financialIntent.missing.includes("parcelas"));
+      assertNoCardCreation(db);
+    } finally { db.close(); }
+  });
+}
+
+test("cancelar e iniciar C2 cria sessão limpa com o preço correto", async () => {
+  const db = database(); seedMonetaryRegressionContext(db);
+  try {
+    const old = await beginFinancialConversation(db, 98003, "Gastei anterior 9 no mercado no pix");
+    await handleTelegramUpdate(callbackUpdate(98004, callbackByText(old.response, "Cancelar")));
+    assert.equal(storedFinancialState(db), null);
+    await handleTelegramUpdate(messageUpdate(98005, "Comprei teste C2 por 1,12 no cartão"));
+    const state = storedFinancialState(db);
+    assert.notEqual(state.sessionId, old.state.sessionId);
+    assert.equal(state.phase, "confirming");
+    assert.deepEqual(Object.fromEntries(["amountCents", "description", "categoryId", "subcategoryId", "cardId", "installmentCount", "installmentInputStatus", "paymentFlow"].map((key) => [key, state.financialIntent[key]])), {
+      amountCents: 112, description: "Teste C2", categoryId: "category-debt", subcategoryId: "subcategory-card", cardId: "card-nubank", installmentCount: 1, installmentInputStatus: "valid", paymentFlow: "credit_card",
+    });
+    assertNoCardCreation(db);
+  } finally { db.close(); }
+});
+
+test("handler pede esclarecimento de valor ambíguo sem gravar finanças", async () => {
+  const db = database(); seedMonetaryRegressionContext(db);
+  try {
+    const response = await handleTelegramUpdate(messageUpdate(98006, "Comprei 2 camisetas 30 no cartão"));
+    const state = storedFinancialState(db);
+    assert.equal(state.phase, "collecting");
+    assert.equal(state.field, "valor");
+    assert.equal(state.financialIntent.amountCents, null);
+    assert.match(response.text, /valor/iu);
+    assertNoCardCreation(db);
+  } finally { db.close(); }
+});
+
+for (const cardCount of [0, 2]) {
+  test(`preço C2 não dispensa escolha/resolução do cartão: ${cardCount} ativos`, async () => {
+    const db = database(); seedMonetaryRegressionContext(db);
+    try {
+      if (cardCount === 0) db.prepare("UPDATE credit_cards SET is_active=0 WHERE household_id='ha'").run();
+      else addCard(db);
+      await handleTelegramUpdate(messageUpdate(98007, "Comprei teste C2 por 1,12 no cartão"));
+      const state = storedFinancialState(db);
+      assert.equal(state.phase, "selecting_card");
+      assert.equal(state.financialIntent.amountCents, 112);
+      assert.equal(state.financialIntent.cardId, null);
+      assert.equal(state.financialIntent.installmentCount, null);
+      assert.equal(state.financialIntent.installmentInputStatus, "absent");
+      assertNoCardCreation(db);
+    } finally { db.close(); }
+  });
+}
+
 async function completeCardClassification(db, response, updateId) {
   if (storedFinancialState(db).phase === "selecting_category") response = await handleTelegramUpdate(callbackUpdate(updateId++, callbackByText(response, "Mercado")));
   if (storedFinancialState(db).phase === "selecting_subcategory") response = await handleTelegramUpdate(callbackUpdate(updateId++, callbackByText(response, "Feira")));
