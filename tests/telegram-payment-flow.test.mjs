@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { parseTelegramMessage } from "../lib/telegram-parser.mjs";
-import { buildTelegramInstallmentPreview, isLegacyTelegramCardPersistence, parseTelegramInstallmentCount, resolveTelegramDueDate, telegramFinancialPersistenceTarget, transitionTelegramPaymentFlow } from "../lib/telegram-payment-flow.mjs";
+import { buildTelegramInstallmentPreview, isCompleteTelegramCardIntent, parseTelegramInstallmentCount, parseTelegramInstallmentInput, resolveTelegramDueDate, telegramFinancialPersistenceTarget, transitionTelegramPaymentFlow } from "../lib/telegram-payment-flow.mjs";
 import { updateTelegramIntentField } from "../lib/telegram-conversation.mjs";
 
 const now = new Date("2026-09-14T12:00:00.000Z");
@@ -86,8 +86,8 @@ test("parcelamento ou menção explícita ao cartão desambigua conta e cartão 
 
 test("troca de paymentFlow limpa somente campos incompatíveis", () => {
   const full = { paymentFlow: "credit_card", paymentMethod: "pix", accountId: "account", cardId: "card", dueDate: "2026-10-10", dueMonth: "2026-10", installmentCount: 3, firstDueDate: "2026-10-20", installmentDayOfMonth: 20, categoryId: "category", subcategoryId: "subcategory" };
-  assert.deepEqual(transitionTelegramPaymentFlow(full, "immediate"), { ...full, paymentFlow: "immediate", legacyCardCompatible: false, cardId: null, dueDate: null, dueMonth: null, installmentCount: null, firstDueDate: null, installmentDayOfMonth: null });
-  assert.deepEqual(transitionTelegramPaymentFlow(full, "future_bill"), { ...full, paymentFlow: "future_bill", legacyCardCompatible: false, cardId: null, accountId: null, paymentMethod: null, installmentCount: null, firstDueDate: null, installmentDayOfMonth: null });
+  assert.deepEqual(transitionTelegramPaymentFlow(full, "immediate"), { ...full, paymentFlow: "immediate", legacyCardCompatible: false, cardId: null, dueDate: null, dueMonth: null, installmentCount: null, installmentInputStatus: "absent", firstDueDate: null, installmentDayOfMonth: null });
+  assert.deepEqual(transitionTelegramPaymentFlow(full, "future_bill"), { ...full, paymentFlow: "future_bill", legacyCardCompatible: false, cardId: null, accountId: null, paymentMethod: null, installmentCount: null, installmentInputStatus: "absent", firstDueDate: null, installmentDayOfMonth: null });
   assert.deepEqual(transitionTelegramPaymentFlow(full, "credit_card"), { ...full, paymentFlow: "credit_card", accountId: null, paymentMethod: null, dueDate: null, dueMonth: null, firstDueDate: null, installmentDayOfMonth: null });
   assert.deepEqual(transitionTelegramPaymentFlow(full, "direct_installments"), { ...full, paymentFlow: "direct_installments", legacyCardCompatible: false, accountId: null, paymentMethod: null, cardId: null, dueDate: null, dueMonth: null });
 });
@@ -152,14 +152,18 @@ test("parcelas reconhecem formatos, preservam centavos e o dia desejado", () => 
   assert.throws(() => buildTelegramInstallmentPreview({ totalCents: 1, count: 120, firstDueDate: "2027-01-31", desiredDay: 31 }), /Parcelamento inválido/);
 });
 
-test("cartão legado é marcado somente quando cartão e parcelas já estão explícitos", () => {
-  const supported = parseTelegramMessage("Comprei 300 no cartão Nubank em 2x", context, { now });
+test("cartão completo persiste sem depender do marcador legado", () => {
+  const supported = parseTelegramMessage("Comprei 300 em vestuário no cartão Nubank em 2x", context, { now });
   assert.equal(supported.legacyCardCompatible, true);
-  assert.equal(isLegacyTelegramCardPersistence(supported), true);
+  supported.subcategoryId = "shirts";
+  assert.equal(isCompleteTelegramCardIntent(supported), true);
   assert.equal(telegramFinancialPersistenceTarget(supported), "card_purchase");
+  assert.equal(telegramFinancialPersistenceTarget({ ...supported, legacyCardCompatible: false }), "card_purchase");
+  for (const patch of [{ cardId: null }, { categoryId: null }, { installmentCount: null }, { installmentInputStatus: "invalid" }, { missing: ["subcategoria"] }, { type: "income" }, { accountId: "bank" }, { purchaseDate: "2026-02-30" }]) {
+    assert.equal(telegramFinancialPersistenceTarget({ ...supported, ...patch }), null);
+  }
   assert.equal(parseTelegramMessage("Comprei 300 no cartão Nubank", context, { now }).legacyCardCompatible, false);
   assert.equal(parseTelegramMessage("Passei 300 no crédito em 2x", context, { now }).legacyCardCompatible, false);
-  assert.equal(isLegacyTelegramCardPersistence(parseTelegramMessage("Passei 300 no crédito em 2x", context, { now })), false);
   assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "immediate", accountId: "bank" }), "transaction");
   assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "future_bill" }), "bill");
   assert.equal(telegramFinancialPersistenceTarget({ paymentFlow: "direct_installments" }), null);
@@ -167,11 +171,116 @@ test("cartão legado é marcado somente quando cartão e parcelas já estão exp
   assert.equal(transitionTelegramPaymentFlow({ paymentFlow: "credit_card", legacyCardCompatible: true, cardId: "nubank-card" }, "future_bill").legacyCardCompatible, false);
 });
 
-test("confirmação persiste somente future_bill e mantém outros novos fluxos sem fallback", () => {
+test("confirmação usa serviços canônicos e parcelamento direto segue sem fallback", () => {
   const handler = readFileSync(new URL("../lib/telegram-handler.ts", import.meta.url), "utf8");
   assert.match(handler, /persistenceTarget === "card_purchase" && intent\.cardId/);
   assert.match(handler, /persistenceTarget === "bill"[\s\S]+await createBill\(/);
   assert.doesNotMatch(handler, /createRecurring/);
   assert.match(handler, /if \(persistenceTarget === "transaction"\)[\s\S]+await createTransaction/);
   assert.match(handler, /if \(paymentFlow !== "immediate"\)[\s\S]+Nenhum lançamento foi criado/);
+});
+
+test("parcelas distinguem ausência, validade e erro explícito sem truncar números", () => {
+  assert.deepEqual(parseTelegramInstallmentInput("Comprei 150 no cartão Nubank"), { status: "absent", count: null });
+  assert.deepEqual(parseTelegramInstallmentInput("em 3x"), { status: "valid", count: 3 });
+  for (const input of ["0x", "-2x", "121x", "1000x", "2,5x", ".5x", "1/2x", "2e3x", "- 2 parcelas", "em 2x ou 3x"]) {
+    assert.deepEqual(parseTelegramInstallmentInput(input), { status: "invalid", count: null }, input);
+    assert.equal(parseTelegramMessage(`Comprei 150 no cartão Nubank em ${input}`, context, { now }).installmentInputStatus, "invalid", input);
+  }
+  assert.equal(parseTelegramMessage("Comprei 150 no cartão Nubank em 0x à vista", context, { now }).installmentInputStatus, "invalid");
+});
+
+test("cartão explícito vence sinal de data da fatura sem alterar future_bill", () => {
+  const card = parseTelegramMessage("Comprei 100 no cartão Nubank e a fatura vence dia 20", context, { now });
+  assert.equal(card.paymentFlow, "credit_card");
+  assert.equal(card.cardId, "nubank-card");
+  assert.equal(card.dueDate, null);
+  for (const phrase of ["Comprei 100 e pago dia 20", "Comprei 100 e pago mês que vem", "Comprei 100 e fica para dia 10"]) {
+    assert.equal(parseTelegramMessage(phrase, context, { now }).paymentFlow, "future_bill", phrase);
+  }
+});
+
+test("carnê é parcelamento direto e parcelas sozinhas não presumem cartão", () => {
+  const direct = parseTelegramMessage("Comprei bicicleta 600 em 3x no carnê", context, { now });
+  assert.equal(direct.paymentFlow, "direct_installments");
+  assert.equal(telegramFinancialPersistenceTarget(direct), null);
+  assert.equal(parseTelegramMessage("Comprei bicicleta 600 em 3x", context, { now }).paymentFlow, null);
+  assert.equal(parseTelegramMessage("Comprei teste parcelado por R$ 3,00 no cartão Cartão teste em 3x", { ...context, cards: [{ id: "test", name: "Cartão teste" }] }, { now }).description, "Teste parcelado");
+});
+
+test("C2 bloqueador 1: menção descritiva de cartão não elimina future_bill", () => {
+  for (const phrase of [
+    "Comprei 100 uma capa para cartão de crédito e pago dia 20 no mercado",
+    "Comprei uma capa para cartão por 50 e pago amanhã",
+    "Comprei um porta cartão por 50 e pago amanhã",
+    "Comprei 100 seguro para cartão e pago dia 20",
+    "Comprei 100 taxa do cartão e pago dia 20",
+    "Comprei 100 segunda via do cartão e pago dia 20",
+    "Comprei 100 um livro sobre crédito e pago mês que vem",
+    "Comprei 100 e pago dia 20",
+  ]) {
+    const parsed = parseTelegramMessage(phrase, context, { now });
+    assert.equal(parsed.paymentFlow, "future_bill", phrase);
+    assert.equal(parsed.cardId, null, phrase);
+  }
+  for (const phrase of ["Comprei 100 uma capa para cartão de crédito", "Comprei 100 um livro sobre crédito"]) {
+    assert.equal(parseTelegramMessage(phrase, context, { now }).paymentFlow, null, phrase);
+  }
+  for (const phrase of [
+    "Comprei 100 no cartão de crédito e a fatura vence dia 20",
+    "Comprei 100 no cartão Nubank e a fatura vence dia 20",
+    "Paguei 100 no cartão Nubank",
+    "Comprei 100 e pago no cartão Nubank",
+    "Comprei 100 no crédito do Nubank",
+    "Comprei 100 em 3x no cartão Nubank",
+  ]) {
+    const parsed = parseTelegramMessage(phrase, context, { now });
+    assert.equal(parsed.paymentFlow, "credit_card", phrase);
+    assert.equal(parsed.dueDate, null, phrase);
+  }
+});
+
+test("C2 bloqueador 2: status e quantidade permanecem coerentes nas transições", () => {
+  const valid = { paymentFlow: "credit_card", installmentCount: 3, installmentInputStatus: "valid" };
+  for (const flow of ["credit_card", "direct_installments"]) {
+    const next = transitionTelegramPaymentFlow(valid, flow);
+    assert.equal(next.installmentInputStatus, "valid");
+    assert.equal(next.installmentCount, 3);
+  }
+  for (const flow of ["immediate", "future_bill"]) {
+    const next = transitionTelegramPaymentFlow(valid, flow);
+    assert.equal(next.installmentInputStatus, "absent");
+    assert.equal(next.installmentCount, null);
+  }
+  let invalid = { ...valid, installmentInputStatus: "invalid", installmentCount: null };
+  for (const flow of ["immediate", "future_bill", "direct_installments", "credit_card"]) {
+    invalid = transitionTelegramPaymentFlow(invalid, flow);
+    assert.equal(invalid.installmentInputStatus, "invalid", flow);
+    assert.equal(invalid.installmentCount, null, flow);
+  }
+  assert.equal(transitionTelegramPaymentFlow({ ...valid, installmentCount: null }, "credit_card").installmentInputStatus, "invalid");
+  for (const phrase of ["Comprei 10 no pix em 3x", "Comprei 10 em 3x e pago dia 20"]) {
+    const parsed = parseTelegramMessage(phrase, context, { now });
+    assert.equal(parsed.installmentInputStatus, "absent", phrase);
+    assert.equal(parsed.installmentCount, null, phrase);
+  }
+  for (const input of ["0x", "-2x", "121x", "122x", "999x"]) {
+    assert.deepEqual(parseTelegramInstallmentInput(input), { status: "invalid", count: null });
+  }
+  for (const count of [1, 2, 120]) assert.deepEqual(parseTelegramInstallmentInput(`${count}x`), { status: "valid", count });
+});
+
+test("C2 bloqueador 3: por é removido somente quando introduz o valor", () => {
+  for (const phrase of [
+    "Comprei pizza por R$ 50 no cartão Nubank",
+    "Comprei pizza por 50 reais no cartão Nubank",
+    "Comprei pizza por 50 no cartão Nubank",
+  ]) assert.equal(parseTelegramMessage(phrase, context, { now }).description, "Pizza", phrase);
+  assert.equal(parseTelegramMessage("Comprei teste parcelado por R$ 3,00 no cartão Cartão teste em 3x", { ...context, cards: [{ id: "test", name: "Cartão teste" }] }, { now }).description, "Teste parcelado");
+  for (const phrase of [
+    "Comprei por R$ 20 o livro Por no cartão Nubank",
+    "Comprei o livro Por por R$ 20 no cartão Nubank",
+    "Comprei R$ 20 o livro Por no cartão Nubank",
+  ]) assert.equal(parseTelegramMessage(phrase, context, { now }).description, "O livro por", phrase);
+  assert.equal(parseTelegramMessage("Recebi 150 por serviços", context, { now }).description, "Por serviços");
 });

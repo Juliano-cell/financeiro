@@ -79,6 +79,19 @@ test("alteração de descrição preserva todos os demais campos", () => {
   assert.deepEqual(updateTelegramIntentField(baseIntent, "description", "Padaria"), { ...baseIntent, description: "Padaria" });
 });
 
+test("escolha posterior de cartão preserva parcelas inválidas e edição válida corrige o status", () => {
+  const pending = { ...baseIntent, paymentFlow: "credit_card", legacyCardCompatible: false, cardId: null, installmentCount: null, installmentInputStatus: "invalid" };
+  const selected = updateTelegramIntentField(pending, "card", "card-a");
+  assert.equal(selected.installmentInputStatus, "invalid");
+  assert.equal(selected.legacyCardCompatible, false);
+  for (const flow of ["immediate", "future_bill"]) {
+    const switched = updateTelegramIntentField(updateTelegramIntentField(selected, "paymentFlow", flow), "paymentFlow", "credit_card");
+    assert.equal(switched.installmentInputStatus, "invalid");
+    assert.equal(switched.installmentCount, null);
+  }
+  assert.deepEqual(updateTelegramIntentField(selected, "installmentCount", 3), { ...selected, installmentCount: 3, installmentInputStatus: "valid" });
+});
+
 test("alteração de conta preserva todos os demais campos", () => {
   assert.deepEqual(updateTelegramIntentField(baseIntent, "account", "account-new"), { ...baseIntent, accountId: "account-new" });
 });

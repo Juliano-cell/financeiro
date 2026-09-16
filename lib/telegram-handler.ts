@@ -29,6 +29,7 @@ type FinancialIntent = {
   firstDueDate?: string | null;
   installmentDayOfMonth?: number | null;
   installmentCount?: number | null;
+  installmentInputStatus?: "absent" | "valid" | "invalid";
   paymentMethod?: string | null;
   cardId?: string | null;
   accountId?: string | null;
@@ -41,6 +42,7 @@ type FinancialIntent = {
 };
 
 const financialIntentSchema = z.object({
+  installmentInputStatus: z.enum(["absent", "valid", "invalid"]).optional(),
   intent: z.string(), type: z.enum(["income", "expense"]).nullable().optional(), amountCents: z.number().int().positive().nullable().optional(), description: z.string().max(120).nullable().optional(), purchaseDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(), transactionDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).optional(), paymentFlow: z.enum(["immediate", "future_bill", "credit_card", "direct_installments"]).nullable().optional(), legacyCardCompatible: z.boolean().optional(), dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).nullable().optional(), dueMonth: z.string().regex(/^\d{4}-\d{2}$/u).nullable().optional(), firstDueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).nullable().optional(), installmentDayOfMonth: z.number().int().min(1).max(31).nullable().optional(), installmentCount: z.number().int().min(1).max(120).nullable().optional(), paymentMethod: z.string().max(30).nullable().optional(), cardId: z.string().max(80).nullable().optional(), accountId: z.string().max(80).nullable().optional(), categoryId: z.string().max(80).nullable().optional(), subcategoryId: z.string().max(80).nullable().optional(), subcategorySkipped: z.boolean().optional(), missing: z.array(z.string().max(30)).max(10).optional(), ambiguous: z.boolean().optional(), ambiguity: z.string().max(40).nullable().optional(),
 }).passthrough();
 
@@ -208,10 +210,16 @@ function prepareIntent(intent: FinancialIntent, context: HouseholdContext) {
       if (context.cards.length === 1) prepared.cardId = context.cards[0].id;
       else missing.add("cartão");
     }
-    if (!Number.isInteger(prepared.installmentCount) || prepared.installmentCount! < 1 || prepared.installmentCount! > 120 || Boolean(prepared.amountCents && prepared.installmentCount! > prepared.amountCents)) {
+    if (prepared.cardId && prepared.installmentCount == null && prepared.installmentInputStatus === "absent") {
+      prepared.installmentCount = 1;
+      prepared.installmentInputStatus = "valid";
+    }
+    if (prepared.installmentInputStatus === "invalid" || !Number.isInteger(prepared.installmentCount) || prepared.installmentCount! < 1 || prepared.installmentCount! > 120 || Boolean(prepared.amountCents && prepared.installmentCount! > prepared.amountCents)) {
+      // Descartamos a quantidade inválida: mesmo após aumentar o valor, ela deve ser informada novamente.
+      if (prepared.installmentCount != null || prepared.installmentInputStatus === "valid") prepared.installmentInputStatus = "invalid";
       prepared.installmentCount = null;
       missing.add("parcelas");
-    }
+    } else prepared.installmentInputStatus = "valid";
   } else if (paymentFlow === "immediate") {
     const candidates = eligibleAccounts(prepared, context);
     if (prepared.accountId && !candidates.some((account) => account.id === prepared.accountId)) prepared.accountId = null;
@@ -226,10 +234,11 @@ function prepareIntent(intent: FinancialIntent, context: HouseholdContext) {
       missing.add("vencimento");
     } else prepared.dueMonth = null;
   } else if (paymentFlow === "direct_installments") {
-    if (!Number.isInteger(prepared.installmentCount) || prepared.installmentCount! < 2 || prepared.installmentCount! > 120 || Boolean(prepared.amountCents && prepared.installmentCount! > prepared.amountCents)) {
+    if (prepared.installmentInputStatus === "invalid" || !Number.isInteger(prepared.installmentCount) || prepared.installmentCount! < 2 || prepared.installmentCount! > 120 || Boolean(prepared.amountCents && prepared.installmentCount! > prepared.amountCents)) {
+      if (prepared.installmentCount != null || prepared.installmentInputStatus === "valid") prepared.installmentInputStatus = "invalid";
       prepared.installmentCount = null;
       missing.add("parcelas");
-    }
+    } else prepared.installmentInputStatus = "valid";
     if (!prepared.firstDueDate || !isValidTelegramDate(prepared.firstDueDate) || prepared.firstDueDate < prepared.purchaseDate!) {
       prepared.firstDueDate = null;
       prepared.installmentDayOfMonth = null;
@@ -428,10 +437,10 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
     if (intent.missing?.length || selectionChanged) return presentIntent(updateId, telegramUserId, link.householdId, { ...state, financialIntent: intent }, context, "Alguns dados mudaram; confirme novamente a seleção.");
     const source = { updateId, operationId: state.sessionId, originalUpdateId: state.originalUpdateId, originalText: state.originalText, telegramUserId, purchaseDate: intent.purchaseDate };
     const paymentFlow = effectiveTelegramPaymentFlow(intent);
-    const persistenceTarget = telegramFinancialPersistenceTarget(intent, state.financialIntent);
+    const persistenceTarget = telegramFinancialPersistenceTarget(intent);
     try {
       if (persistenceTarget === "card_purchase" && intent.cardId) {
-        const result = await createCardPurchase({ cardId: intent.cardId, description: intent.description!, totalCents: intent.amountCents!, purchaseDate: intent.purchaseDate!, installmentCount: intent.installmentCount ?? 1, categoryId: intent.categoryId!, subcategoryId: intent.subcategoryId ?? null }, { householdId: link.householdId, userId: link.userId, origin: "telegram", source, clearTelegramStateFor: telegramUserId });
+        const result = await createCardPurchase({ cardId: intent.cardId, description: intent.description!, totalCents: intent.amountCents!, purchaseDate: intent.purchaseDate!, installmentCount: intent.installmentCount!, categoryId: intent.categoryId!, subcategoryId: intent.subcategoryId ?? null }, { householdId: link.householdId, userId: link.userId, origin: "telegram", source, clearTelegramStateFor: telegramUserId });
         return { text: `✅ Compra de ${formatBrl(intent.amountCents!)} registrada no cartão ${result.cardName}.` };
       }
       if (persistenceTarget === "transaction") {
@@ -443,6 +452,11 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
         return { text: `✅ Vencimento de ${formatBrl(intent.amountCents!)} criado para ${intent.dueDate}. A conta será definida ao pagar.` };
       }
     } catch (error) {
+      if (persistenceTarget === "card_purchase" && error instanceof FinanceValidationError) {
+        // Consume only this update. Never restore a session cancelled/replaced while validation ran.
+        await commitUpdate(updateId);
+        return { text: `Não foi possível registrar essa compra: ${error.message}`, buttons: telegramConfirmationButtons(state.sessionId!) };
+      }
       const duplicateBill = error instanceof BillServiceError && error.code === "TELEGRAM_UPDATE_ALREADY_PROCESSED";
       if (!(error instanceof DuplicateTelegramUpdateError) && !duplicateBill) throw error;
       try {
