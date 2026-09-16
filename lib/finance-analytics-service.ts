@@ -334,8 +334,8 @@ export async function getFinanceAnalytics(context: AnalyticsContext, filters: An
       a.id AS account_id,
       a.name AS account_name,
       COALESCE(SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE 0 END), 0) AS income_cents,
-      COALESCE(SUM(CASE WHEN am.type IN ('expense', 'settlement') THEN am.amount_cents ELSE 0 END), 0) AS expense_cents,
-      COALESCE(SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE -am.amount_cents END), 0) AS net_movement_cents,
+      COALESCE(SUM(CASE WHEN am.type = 'expense' THEN am.amount_cents ELSE 0 END), 0) AS expense_cents,
+      COALESCE(SUM(CASE WHEN am.type IN ('income', 'settlement_reversal') THEN am.amount_cents ELSE -am.amount_cents END), 0) AS net_movement_cents,
       COALESCE(SUM(am.amount_cents), 0) AS movement_cents,
       COUNT(*) AS movement_count
     FROM account_movements am

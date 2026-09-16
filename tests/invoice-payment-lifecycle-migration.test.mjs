@@ -462,16 +462,16 @@ test("0005 falha tardia desfaz colunas, tabela, índices e triggers na unidade t
   assert.equal(db.prepare("SELECT count(*) n FROM sqlite_master WHERE name='invoice_payments_invoice_unique'").get().n, 1);
 });
 
-test("0005 reproduz o batch financeiro legado sem mudar API ou ativar operações novas", (t) => {
+test("0005 mantém compatibilidade com o batch financeiro legado congelado", (t) => {
   const db = database(t);
   db.prepare("INSERT INTO card_purchases(id,household_id,card_id,description,total_cents,purchase_date,created_by_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)").run("purchase", "ha", "carda", "Fixture", 500, "2026-09-15", "ua", AT, AT);
   db.prepare("INSERT INTO card_installments(id,household_id,purchase_id,invoice_id,installment_number,installment_count,amount_cents,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run("part", "ha", "purchase", "ia", 1, 1, 500, "pending", AT, AT);
-  const source = readFileSync(new URL("../app/api/finance/advanced/route.ts", import.meta.url), "utf8");
-  const paymentBranch = source.slice(source.indexOf('if (action === "pay_invoice")'), source.indexOf('if (action === "create_bill")'));
-  const statements = [...paymentBranch.matchAll(/env\.DB\.prepare\("([^"]+)"\)/gu)].map((match) => match[1]);
-  assert.equal(statements.length, 3);
-  assert.match(paymentBranch, /invoice\.status === "paid"/u);
-  assert.doesNotMatch(paymentBranch, /operation_id|invoice_payment_operations/u);
+  // Frozen pre-lifecycle SQL: migration compatibility, not the current API contract.
+  const statements = [
+    "INSERT INTO invoice_payments (id, household_id, invoice_id, account_id, amount_cents, paid_at, created_by_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    "UPDATE card_invoices SET status='paid', paid_at=?, updated_at=? WHERE id=? AND household_id=?",
+    "UPDATE card_installments SET status='paid', updated_at=? WHERE invoice_id=? AND household_id=? AND status='pending'",
+  ];
   db.exec("BEGIN");
   db.prepare(statements[0]).run("legacy-payment", "ha", "ia", "aa", 500, "2026-09-16", "ua", AT);
   db.prepare(statements[1]).run("2026-09-16", AT, "ia", "ha");

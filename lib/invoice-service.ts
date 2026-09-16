@@ -51,12 +51,13 @@ async function authorize(context: InvoiceContext) {
 }
 
 // All decisive aggregates are scoped and repeated inside the write batch, not trusted from JS.
-const LEDGER_CTE = `WITH totals AS (
-  SELECT i.*,
+const INVOICE_TOTALS_SELECT = `SELECT i.*,
     COALESCE((SELECT SUM(s.amount_cents) FROM card_installments s WHERE s.household_id = i.household_id AND s.invoice_id = i.id AND s.status <> 'cancelled'), 0) AS invoice_total_cents,
     COALESCE((SELECT SUM(p.amount_cents) FROM invoice_payments p WHERE p.household_id = i.household_id AND p.invoice_id = i.id AND NOT EXISTS
       (SELECT 1 FROM invoice_payment_operations r WHERE r.household_id = p.household_id AND r.reversed_payment_id = p.id AND r.kind = 'reversal')), 0) AS paid_cents
-  FROM card_invoices i WHERE i.id = ? AND i.household_id = ?
+  FROM card_invoices i`;
+const LEDGER_CTE = `WITH totals AS (
+  ${INVOICE_TOTALS_SELECT} WHERE i.id = ? AND i.household_id = ?
 ), ledger AS (SELECT totals.*, MAX(invoice_total_cents - paid_cents, 0) AS remaining_cents FROM totals)`;
 
 function state(row: InvoiceRow, today: string) {
@@ -74,6 +75,15 @@ export async function getInvoiceState(invoiceId: string, context: InvoiceContext
   const row = await context.d1.prepare(`${LEDGER_CTE} SELECT * FROM ledger`).bind(invoiceId, context.householdId).first<InvoiceRow>();
   if (!row) throw new InvoiceServiceError("Fatura não encontrada.", 404, "INVOICE_NOT_FOUND");
   return state(row, invoiceCivilDate(at(context)));
+}
+
+// Authenticated/scoped aggregate read for API, limit, projections and notification consumers.
+export async function getHouseholdInvoiceStates(context: InvoiceContext) {
+  await authorize(context);
+  const rows = await context.d1.prepare(`WITH totals AS (${INVOICE_TOTALS_SELECT} WHERE i.household_id = ?)
+    SELECT totals.*, MAX(invoice_total_cents - paid_cents, 0) AS remaining_cents FROM totals`).bind(context.householdId).all<InvoiceRow>();
+  const today = invoiceCivilDate(at(context));
+  return rows.results.map((row) => state(row, today));
 }
 
 async function fingerprint(value: unknown) {

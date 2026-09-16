@@ -2,7 +2,8 @@ import { env } from "cloudflare:workers";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb } from "@/db";
-import { accounts, categories, creditCards, householdMembers, invoicePayments, subcategories, telegramConversationStates, telegramLinks, transactions } from "@/db/schema";
+import { accounts, categories, creditCards, householdMembers, subcategories, telegramConversationStates, telegramLinks } from "@/db/schema";
+import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
 import { createCardPurchase, createTransaction, DuplicateTelegramUpdateError, FinanceValidationError, isTelegramUpdateProcessed, telegramFinancialOperationUpdateId } from "@/lib/finance-service";
 import { BillServiceError, createBill } from "@/lib/bill-service";
 import { parseBrazilianMoney, splitInstallments } from "@/lib/finance-rules.mjs";
@@ -318,13 +319,8 @@ function parseEditedDate(text: string) {
 }
 
 async function balanceText(householdId: string) {
-  const db = getDb();
-  const [accountRows, transactionRows, paymentRows] = await Promise.all([
-    db.select().from(accounts).where(and(eq(accounts.householdId, householdId), eq(accounts.isActive, true))),
-    db.select().from(transactions).where(and(eq(transactions.householdId, householdId), eq(transactions.status, "confirmed"))),
-    db.select().from(invoicePayments).where(eq(invoicePayments.householdId, householdId)),
-  ]);
-  const balance = accountRows.reduce((sum, account) => sum + account.initialBalanceCents + transactionRows.filter((item) => item.accountId === account.id).reduce((value, item) => value + (item.type === "income" ? item.amountCents : -item.amountCents), 0) - paymentRows.filter((item) => item.accountId === account.id).reduce((value, item) => value + item.amountCents, 0), 0);
+  const balances = await getCurrentAccountBalances(householdId, dateInSaoPaulo());
+  const balance = balances.filter((account) => account.isActive).reduce((sum, account) => sum + account.currentBalanceCents, 0);
   return `Saldo das contas: ${formatBrl(balance)}`;
 }
 

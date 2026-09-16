@@ -147,8 +147,8 @@ test("agregação por conta separa entradas, saídas reais e movimento líquido 
     SELECT
       a.id AS account_id,
       SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE 0 END) AS income_cents,
-      SUM(CASE WHEN am.type IN ('expense', 'settlement') THEN am.amount_cents ELSE 0 END) AS expense_cents,
-      SUM(CASE WHEN am.type = 'income' THEN am.amount_cents ELSE -am.amount_cents END) AS net_movement_cents,
+      SUM(CASE WHEN am.type = 'expense' THEN am.amount_cents ELSE 0 END) AS expense_cents,
+      SUM(CASE WHEN am.type IN ('income', 'settlement_reversal') THEN am.amount_cents ELSE -am.amount_cents END) AS net_movement_cents,
       SUM(am.amount_cents) AS movement_cents,
       COUNT(*) AS movement_count
     FROM account_movements am
@@ -161,7 +161,7 @@ test("agregação por conta separa entradas, saídas reais e movimento líquido 
   assert.deepEqual({ ...active }, {
     account_id: a.account,
     income_cents: 200_000,
-    expense_cents: 45_000,
+    expense_cents: 35_000,
     net_movement_cents: 155_000,
     movement_cents: 245_000,
     movement_count: 5,

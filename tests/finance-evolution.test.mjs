@@ -119,7 +119,9 @@ test("código Telegram usa HMAC secreto, limite e consumo condicional", async ()
 
 test("endpoints web forçam origin e validam relações também ao editar transação", () => {
   const advanced = readFileSync(new URL("../app/api/finance/advanced/route.ts", import.meta.url), "utf8"); const finance = readFileSync(new URL("../app/api/finance/route.ts", import.meta.url), "utf8");
-  assert.match(advanced, /createCardPurchase\(parsed, \{ householdId, userId: user\.id, origin: "dashboard" \}\)/); assert.doesNotMatch(advanced, /origin: z\.enum/); assert.match(advanced, /env\.DB\.batch/);
+  assert.match(advanced, /createCardPurchase\(parsed, \{ householdId, userId: user\.id, origin: "dashboard" \}\)/); assert.doesNotMatch(advanced, /origin: z\.enum/);
+  assert.match(advanced, /payInvoiceResidual\(/);
+  assert.match(readFileSync(new URL("../lib/invoice-service.ts", import.meta.url), "utf8"), /context\.d1\.batch/);
   assert.match(finance, /validateTransactionRelations\(db, householdId, parsed\)/); assert.match(finance, /subcategory\.categoryId !== values\.categoryId/);
 });
 
