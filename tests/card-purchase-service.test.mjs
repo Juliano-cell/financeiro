@@ -87,7 +87,7 @@ function setup() {
 }
 
 const baseInput = { cardId: "card-a", description: "Purchase", totalCents: 1000, purchaseDate: "2026-09-01", installmentCount: 1, categoryId: "category-a", subcategoryId: "subcategory-a" };
-const webContext = { householdId: "ha", userId: "ua", origin: "dashboard" };
+const webContext = { householdId: "ha", userId: "ua", origin: "dashboard", timestamp: "2026-09-01T12:00:00Z" };
 
 test("createCardPurchase exige classificação ativa e isolada por household", async () => {
   setup();
@@ -139,7 +139,7 @@ for (const status of ["closed", "paid"]) {
 test("fatura open é reutilizada e concorrência de criação preserva uma competência", async () => {
   const db = setup();
   const at = "2026-09-14T12:00:00.000Z";
-  db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("open", "ha", "card-a", "2026-09", "2026-09-12", at, at);
+  db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'open',?,?)").run("open", "ha", "card-a", "2026-09", "2026-09-12", "2026-09-05", at, at);
   await createCardPurchase(baseInput, webContext);
   assert.equal(db.prepare("SELECT invoice_id FROM card_installments").get().invoice_id, "open");
 
@@ -169,7 +169,7 @@ test("falha tardia na auditoria reverte markers, compra, fatura, parcelas e remo
   db.prepare("INSERT INTO telegram_conversation_states(telegram_user_id,household_id,payload_json,expires_at,updated_at) VALUES(?,?,?,?,?)").run("42", "ha", JSON.stringify({ sessionId: "SESSIONLATE" }), "2026-09-15T12:00:00.000Z", at);
   db.exec("CREATE TEMP TRIGGER reject_card_purchase_audit BEFORE INSERT ON audit_logs WHEN NEW.entity_type = 'card_purchase' BEGIN SELECT RAISE(ABORT, 'forced late audit failure'); END");
 
-  await assert.rejects(createCardPurchase(baseInput, { householdId: "ha", userId: "ua", origin: "telegram", source: { updateId: "9002", operationId: "SESSIONLATE", telegramUserId: "42" }, clearTelegramStateFor: "42" }), /forced late audit failure/iu);
+  await assert.rejects(createCardPurchase(baseInput, { ...webContext, origin: "telegram", source: { updateId: "9002", operationId: "SESSIONLATE", telegramUserId: "42" }, clearTelegramStateFor: "42" }), /forced late audit failure/iu);
 
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id IN ('9002','financial:SESSIONLATE')").get().total, 0);
   assert.equal(db.prepare("SELECT count(*) total FROM card_purchases").get().total, 0);

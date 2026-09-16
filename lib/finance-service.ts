@@ -3,6 +3,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { getDb } from "@/db";
 import { accounts, cardInvoices, categories, creditCards, householdMembers, subcategories, telegramProcessedUpdates } from "@/db/schema";
 import { buildInstallmentPlan } from "@/lib/finance-rules.mjs";
+import { canInvoiceReceivePurchase, invoiceCivilDate, invoiceClosesOn } from "./invoice-service";
 
 export class FinanceValidationError extends Error {}
 export class DuplicateTelegramUpdateError extends Error {}
@@ -43,6 +44,7 @@ type CreationContext = {
   householdId: string;
   userId: string;
   origin: Origin;
+  timestamp?: string;
   source?: AuditSource;
   clearTelegramStateFor?: string;
 };
@@ -188,9 +190,10 @@ export async function createCardPurchase(input: CardPurchaseInput, context: Crea
   const plan = buildInstallmentPlan({ totalCents: input.totalCents, count: input.installmentCount, purchaseDate: input.purchaseDate, closingDay: card.closingDay, dueDay: card.dueDay });
   const months = [...new Set(plan.map((part: { referenceMonth: string }) => part.referenceMonth))];
   const existing = months.length ? await db.select().from(cardInvoices).where(and(eq(cardInvoices.householdId, context.householdId), eq(cardInvoices.cardId, card.id), inArray(cardInvoices.referenceMonth, months))) : [];
-  const blockedInvoice = existing.find((invoice) => invoice.status !== "open");
+  const at = context.timestamp ?? timestamp();
+  const today = invoiceCivilDate(at);
+  const blockedInvoice = existing.find((invoice) => !canInvoiceReceivePurchase(invoice, today));
   if (blockedInvoice) throw new FinanceValidationError(`A fatura de ${blockedInvoice.referenceMonth} não está aberta e não pode receber novas parcelas.`);
-  const at = timestamp();
   const purchaseId = uid("purchase");
   const d1 = database();
   const statements = idempotencyStatements(context, at);
@@ -198,10 +201,10 @@ export async function createCardPurchase(input: CardPurchaseInput, context: Crea
   statements.push(d1.prepare("INSERT INTO card_purchases (id, household_id, card_id, description, total_cents, purchase_date, installment_count, category_id, subcategory_id, notes, status, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)").bind(purchaseId, context.householdId, card.id, input.description.trim(), input.totalCents, input.purchaseDate, input.installmentCount, input.categoryId, input.subcategoryId ?? null, input.notes ?? null, context.userId, context.origin === "telegram" ? "telegram" : "web", at, at));
   for (const referenceMonth of months) {
     const part = plan.find((candidate: { referenceMonth: string }) => candidate.referenceMonth === referenceMonth)!;
-    statements.push(d1.prepare("INSERT INTO card_invoices (id, household_id, card_id, reference_month, due_date, status, paid_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, ?) ON CONFLICT(household_id, card_id, reference_month) DO NOTHING").bind(uid("invoice"), context.householdId, card.id, referenceMonth, part.dueDate, at, at));
+    statements.push(d1.prepare("INSERT INTO card_invoices (id, household_id, card_id, reference_month, due_date, closes_on, status, paid_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?) ON CONFLICT(household_id, card_id, reference_month) DO NOTHING").bind(uid("invoice"), context.householdId, card.id, referenceMonth, part.dueDate, invoiceClosesOn(referenceMonth, card.closingDay, card.dueDay), at, at));
   }
   for (const part of plan as Array<{ referenceMonth: string; dueDate: string; installmentNumber: number; installmentCount: number; amountCents: number }>) {
-    statements.push(d1.prepare("INSERT INTO card_installments (id, household_id, purchase_id, invoice_id, installment_number, installment_count, amount_cents, status, created_at, updated_at) VALUES (?, ?, ?, (SELECT id FROM card_invoices WHERE household_id = ? AND card_id = ? AND reference_month = ? AND status = 'open' LIMIT 1), ?, ?, ?, 'pending', ?, ?)").bind(uid("installment"), context.householdId, purchaseId, context.householdId, card.id, part.referenceMonth, part.installmentNumber, part.installmentCount, part.amountCents, at, at));
+    statements.push(d1.prepare("INSERT INTO card_installments (id, household_id, purchase_id, invoice_id, installment_number, installment_count, amount_cents, status, created_at, updated_at) VALUES (?, ?, ?, (SELECT i.id FROM card_invoices i JOIN credit_cards c ON c.id = i.card_id AND c.household_id = i.household_id WHERE i.household_id = ? AND i.card_id = ? AND i.reference_month = ? AND i.status <> 'closed' AND i.closes_on IS NOT NULL AND i.closes_on >= ? AND c.is_active = 1 AND EXISTS (SELECT 1 FROM household_members m WHERE m.household_id = i.household_id AND m.user_id = ? AND m.status = 'active') LIMIT 1), ?, ?, ?, 'pending', ?, ?)").bind(uid("installment"), context.householdId, purchaseId, context.householdId, card.id, part.referenceMonth, today, context.userId, part.installmentNumber, part.installmentCount, part.amountCents, at, at));
   }
   statements.push(d1.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) VALUES (?, ?, ?, 'create', 'card_purchase', ?, NULL, ?, ?)").bind(uid("audit"), context.householdId, context.userId, purchaseId, sourcePayload(input, context), at));
   try {
@@ -209,7 +212,7 @@ export async function createCardPurchase(input: CardPurchaseInput, context: Crea
   } catch (error) {
     if (error instanceof DuplicateTelegramUpdateError) throw error;
     const currentInvoices = months.length ? await db.select().from(cardInvoices).where(and(eq(cardInvoices.householdId, context.householdId), eq(cardInvoices.cardId, card.id), inArray(cardInvoices.referenceMonth, months))) : [];
-    const currentBlockedInvoice = currentInvoices.find((invoice) => invoice.status !== "open");
+    const currentBlockedInvoice = currentInvoices.find((invoice) => !canInvoiceReceivePurchase(invoice, today));
     if (currentBlockedInvoice) throw new FinanceValidationError(`A fatura de ${currentBlockedInvoice.referenceMonth} não está aberta e não pode receber novas parcelas.`);
     throw error;
   }
