@@ -17,6 +17,7 @@ import { FinanceReports } from "@/app/finance-reports";
 import { SubcategoryManager } from "@/app/subcategory-manager";
 import type { DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import { activeSubcategories, changeTransactionCategory, changeTransactionType, transactionClassificationError } from "@/lib/finance-ui-rules.mjs";
+import { createFinancialRefreshController } from "@/lib/invoice-ui-rules.mjs";
 
 type View = "dashboard" | "reports" | "transactions" | "accounts" | "categories" | "family" | AdvancedView;
 type Account = { id: string; name: string; type: "bank" | "cash" | "savings" | "wallet" | "other"; initialBalanceCents: number; currentBalanceCents: number; isActive: boolean };
@@ -65,37 +66,29 @@ export function FinanceApp() {
   const [editingCategory, setEditingCategory] = useState<Category | null>(null);
   const [reportRevision, setReportRevision] = useState(0);
   const [dashboardNavigationIntent, setDashboardNavigationIntent] = useState<DashboardNavigationIntent | null>(null);
-  const advancedRequestId = useRef(0);
-  const mounted = useRef(false);
+  const [, setFinancialRevision] = useState(0);
+  const [financial] = useState(() => createFinancialRefreshController(() => setFinancialRevision((value) => value + 1)));
+  const refreshMonth = useRef(selectedMonth);
   const needsAdvanced = advancedViews.includes(view as AdvancedView) || transactionOpen;
   const setupComplete = Boolean(data && !data.setupRequired);
 
   const load = useCallback(async () => {
-    try { setData(await api() as unknown as Snapshot); }
-    catch (error) { toast.error(error instanceof Error ? error.message : "Falha ao carregar os dados."); }
-    finally { setLoading(false); }
-  }, []);
+    await financial.read(api, (snapshot: unknown) => { setData(snapshot as Snapshot); setLoading(false); }, (error: unknown) => { toast.error(error instanceof Error ? error.message : "Falha ao carregar os dados."); setLoading(false); });
+  }, [financial]);
   useEffect(() => {
-    mounted.current = true;
+    financial.mount();
     return () => {
-      mounted.current = false;
-      advancedRequestId.current += 1;
+      financial.unmount();
     };
-  }, []);
+  }, [financial]);
   useEffect(() => { void Promise.resolve().then(load); }, [load]);
   const loadAdvanced = useCallback(async () => {
-    const requestId = advancedRequestId.current + 1;
-    advancedRequestId.current = requestId;
-    try {
-      const snapshot = await advancedApi(undefined, selectedMonth) as unknown as AdvancedSnapshot;
-      if (mounted.current && requestId === advancedRequestId.current) setAdvanced(snapshot);
-    } catch (error) {
-      if (!mounted.current || requestId !== advancedRequestId.current) return;
-      toast.error(error instanceof Error ? error.message : "Falha ao carregar o planejamento.");
-    }
-  }, [selectedMonth]);
+    await financial.read(() => advancedApi(undefined, selectedMonth), (snapshot: unknown) => setAdvanced(snapshot as AdvancedSnapshot), (error: unknown) => toast.error(error instanceof Error ? error.message : "Falha ao carregar o planejamento."));
+  }, [selectedMonth, financial]);
   useEffect(() => { if (setupComplete && needsAdvanced) void Promise.resolve().then(loadAdvanced); }, [loadAdvanced, needsAdvanced, setupComplete]);
-  const refresh = useCallback(async () => { if (needsAdvanced) await Promise.all([load(), loadAdvanced()]); else await load(); }, [load, loadAdvanced, needsAdvanced]);
+  useEffect(() => { refreshMonth.current = selectedMonth; }, [selectedMonth]);
+  const refreshFinancial = useCallback(() => financial.refresh(api, () => advancedApi(undefined, refreshMonth.current), (snapshot: unknown, planning: unknown) => { setData(snapshot as Snapshot); setAdvanced(planning as AdvancedSnapshot); setLoading(false); }, (error: unknown) => toast.error(error instanceof Error ? error.message : "Não foi possível atualizar os dados financeiros. Tente novamente.")), [financial]);
+  const refresh = useCallback(async () => { if (needsAdvanced) await refreshFinancial(); else await load(); }, [load, refreshFinancial, needsAdvanced]);
   const consumeDashboardNavigationIntent = useCallback(() => setDashboardNavigationIntent(null), []);
 
   useEffect(() => {
@@ -153,7 +146,7 @@ export function FinanceApp() {
           {view === "accounts" && <AccountsView accounts={accounts} onNew={() => { setEditingAccount(null); setAccountOpen(true); }} onEdit={(item) => { setEditingAccount(item); setAccountOpen(true); }} onDelete={async (item) => { await api({ action: "delete_account", id: item.id }); toast.success("Conta excluída."); await load(); }} />}
           {view === "categories" && <CategoriesView categories={categories} onNew={() => { setEditingCategory(null); setCategoryOpen(true); }} onEdit={(item) => { setEditingCategory(item); setCategoryOpen(true); }} onDelete={async (item) => { await api({ action: "delete_category", id: item.id }); toast.success("Categoria excluída."); await load(); }} onChanged={load} />}
           {view === "family" && <FamilyView data={data} onChanged={load} />}
-          {advancedViews.includes(view as AdvancedView) && <AdvancedFinanceView view={view as AdvancedView} data={advanced} accounts={accounts} categories={categories} onChanged={refresh} />}
+          {advancedViews.includes(view as AdvancedView) && <AdvancedFinanceView view={view as AdvancedView} data={advanced} accounts={accounts} categories={categories} onChanged={refresh} financial={financial} onFinancialRefresh={refreshFinancial} />}
         </div>
       </section>
       <MobileNav current={view} onNavigate={navigate} />
