@@ -43,9 +43,10 @@ class LocalStatement {
 }
 
 class LocalD1 {
-  constructor(db) { this.db = db; }
+  constructor(db) { this.db = db; this.beforeBatch = null; }
   prepare(sql) { return new LocalStatement(this.db, sql); }
   async batch(statements) {
+    if (this.beforeBatch) { const hook = this.beforeBatch; this.beforeBatch = null; await hook(); }
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = statements.map((statement) => statement.runSync());
@@ -153,11 +154,30 @@ test("fatura open é reutilizada e concorrência de criação preserva uma compe
   assert.equal(otherDb.prepare("SELECT count(*) total FROM card_installments").get().total, 2);
 });
 
+test("lazy snapshot reutiliza invoice futura compatível e deixa trilha auditada", async () => {
+  const db = setup(); const at = "2026-09-06T12:00:00Z";
+  db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("legacy-october", "ha", "card-a", "2026-10", "2026-10-12", at, at);
+  await createCardPurchase({ ...baseInput, purchaseDate: "2026-09-06" }, { ...webContext, timestamp: at });
+  assert.equal(db.prepare("SELECT closes_on FROM card_invoices WHERE id='legacy-october'").get().closes_on, "2026-10-05");
+  assert.equal(db.prepare("SELECT invoice_id FROM card_installments").get().invoice_id, "legacy-october");
+  const audits = db.prepare("SELECT old_data,new_data FROM audit_logs WHERE action='snapshot' AND entity_type='card_invoice'").all();
+  assert.equal(audits.length, 1); assert.equal(JSON.parse(audits[0].old_data).closesOn, null); assert.equal(JSON.parse(audits[0].new_data).closesOn, "2026-10-05");
+});
+
+test("mudança concorrente de due_day não usa planejamento obsoleto nem deixa snapshot parcial", async () => {
+  const db = setup(); const at = "2026-09-06T12:00:00Z";
+  db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("legacy-config", "ha", "card-a", "2026-10", "2026-10-12", at, at);
+  serviceEnv.DB.beforeBatch = async () => { db.prepare("UPDATE credit_cards SET due_day=13,updated_at=? WHERE id='card-a'").run("2026-09-06T11:59:00Z"); };
+  await assert.rejects(createCardPurchase({ ...baseInput, purchaseDate: "2026-09-06" }, { ...webContext, timestamp: at }), /dados do cartão mudaram/iu);
+  assert.equal(db.prepare("SELECT closes_on FROM card_invoices WHERE id='legacy-config'").get().closes_on, null);
+  assert.equal(db.prepare("SELECT COUNT(*) total FROM card_purchases").get().total, 0); assert.equal(db.prepare("SELECT COUNT(*) total FROM audit_logs").get().total, 0);
+});
+
 test("guarda Telegram impede sessão antiga de criar compra ou remover state novo", async () => {
   const db = setup();
   const at = "2026-09-14T12:00:00.000Z";
   db.prepare("INSERT INTO telegram_conversation_states(telegram_user_id,household_id,payload_json,expires_at,updated_at) VALUES(?,?,?,?,?)").run("42", "ha", JSON.stringify({ sessionId: "NEWSESSION" }), "2026-09-15T12:00:00.000Z", at);
-  await assert.rejects(createCardPurchase(baseInput, { householdId: "ha", userId: "ua", origin: "telegram", source: { updateId: "9001", operationId: "OLDSESSION", telegramUserId: "42" }, clearTelegramStateFor: "42" }), DuplicateTelegramUpdateError);
+  await assert.rejects(createCardPurchase(baseInput, { householdId: "ha", userId: "ua", origin: "telegram", timestamp: "2026-09-01T12:00:00Z", source: { updateId: "9001", operationId: "OLDSESSION", telegramUserId: "42" }, clearTelegramStateFor: "42" }), DuplicateTelegramUpdateError);
   assert.equal(db.prepare("SELECT count(*) total FROM card_purchases").get().total, 0);
   assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_type='card_purchase'").get().total, 0);
   assert.equal(JSON.parse(db.prepare("SELECT payload_json FROM telegram_conversation_states WHERE telegram_user_id='42'").get().payload_json).sessionId, "NEWSESSION");

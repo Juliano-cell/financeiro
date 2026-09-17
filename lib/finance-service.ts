@@ -3,7 +3,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import { getDb } from "@/db";
 import { accounts, cardInvoices, categories, creditCards, householdMembers, subcategories, telegramProcessedUpdates } from "@/db/schema";
 import { buildInstallmentPlan } from "@/lib/finance-rules.mjs";
-import { canInvoiceReceivePurchase, invoiceCivilDate, invoiceClosesOn } from "./invoice-service";
+import { canInvoiceReceivePurchase, conservativeLegacyInvoiceSnapshot, invoiceCivilDate, invoiceClosesOn } from "./invoice-service";
 
 export class FinanceValidationError extends Error {}
 export class DuplicateTelegramUpdateError extends Error {}
@@ -192,27 +192,94 @@ export async function createCardPurchase(input: CardPurchaseInput, context: Crea
   const existing = months.length ? await db.select().from(cardInvoices).where(and(eq(cardInvoices.householdId, context.householdId), eq(cardInvoices.cardId, card.id), inArray(cardInvoices.referenceMonth, months))) : [];
   const at = context.timestamp ?? timestamp();
   const today = invoiceCivilDate(at);
-  const blockedInvoice = existing.find((invoice) => !canInvoiceReceivePurchase(invoice, today));
-  if (blockedInvoice) throw new FinanceValidationError(`A fatura de ${blockedInvoice.referenceMonth} não está aberta e não pode receber novas parcelas.`);
+  const existingByMonth = new Map(existing.map((invoice) => [invoice.referenceMonth, invoice]));
+  const admissionByMonth = new Map<string, { dueDate: string; closesOn: string; snapshotInvoiceId: string | null }>();
+  let blockedReferenceMonth: string | null = null;
+  for (const referenceMonth of months) {
+    const part = plan.find((candidate: { referenceMonth: string }) => candidate.referenceMonth === referenceMonth)!;
+    const targetClosesOn = invoiceClosesOn(referenceMonth, card.closingDay, card.dueDay);
+    const invoice = existingByMonth.get(referenceMonth);
+    if (!invoice) {
+      if (today > targetClosesOn || input.purchaseDate > targetClosesOn) { blockedReferenceMonth = referenceMonth; break; }
+      admissionByMonth.set(referenceMonth, { dueDate: part.dueDate, closesOn: targetClosesOn, snapshotInvoiceId: null });
+      continue;
+    }
+    if (invoice.closesOn !== null) {
+      if (!canInvoiceReceivePurchase(invoice, today) || input.purchaseDate > invoice.closesOn) { blockedReferenceMonth = referenceMonth; break; }
+      admissionByMonth.set(referenceMonth, { dueDate: invoice.dueDate, closesOn: invoice.closesOn, snapshotInvoiceId: null });
+      continue;
+    }
+    const legacy = conservativeLegacyInvoiceSnapshot({
+      referenceMonth: invoice.referenceMonth,
+      dueDate: invoice.dueDate,
+      status: invoice.status,
+      targetReferenceMonth: referenceMonth,
+      targetDueDate: part.dueDate,
+      targetClosesOn,
+      purchaseDate: input.purchaseDate,
+      today,
+    });
+    if (!legacy) { blockedReferenceMonth = referenceMonth; break; }
+    admissionByMonth.set(referenceMonth, { dueDate: invoice.dueDate, closesOn: legacy.closesOn, snapshotInvoiceId: invoice.id });
+  }
+  if (blockedReferenceMonth) throw new FinanceValidationError(`A fatura de ${blockedReferenceMonth} não está aberta e não pode receber novas parcelas.`);
   const purchaseId = uid("purchase");
   const d1 = database();
   const statements = idempotencyStatements(context, at);
   statements.push(...telegramCardSessionGuardStatements(context, at));
+  for (const [referenceMonth, admission] of admissionByMonth) {
+    if (!admission.snapshotInvoiceId) continue;
+    const oldData = JSON.stringify({ closesOn: null });
+    const newData = JSON.stringify({ closesOn: admission.closesOn, referenceMonth, dueDate: admission.dueDate, reason: "legacy_lazy_snapshot" });
+    statements.push(
+      d1.prepare(`INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at)
+        SELECT ?, ?, ?, 'snapshot', 'card_invoice', ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM card_invoices i JOIN credit_cards c ON c.id = i.card_id AND c.household_id = i.household_id
+          WHERE i.id = ? AND i.household_id = ? AND i.card_id = ? AND i.reference_month = ? AND i.due_date = ?
+            AND i.closes_on IS NULL AND i.status IN ('open','paid') AND c.is_active = 1
+            AND c.closing_day = ? AND c.due_day = ? AND c.updated_at = ?
+            AND EXISTS (SELECT 1 FROM household_members m WHERE m.household_id = i.household_id AND m.user_id = ? AND m.status = 'active')
+        )`).bind(uid("audit"), context.householdId, context.userId, admission.snapshotInvoiceId, oldData, newData, at, admission.snapshotInvoiceId, context.householdId, card.id, referenceMonth, admission.dueDate, card.closingDay, card.dueDay, card.updatedAt, context.userId),
+      d1.prepare(`UPDATE card_invoices SET closes_on = ?, updated_at = ?
+        WHERE id = ? AND household_id = ? AND card_id = ? AND reference_month = ? AND due_date = ?
+          AND closes_on IS NULL AND status IN ('open','paid')
+          AND EXISTS (
+            SELECT 1 FROM credit_cards c WHERE c.id = card_invoices.card_id AND c.household_id = card_invoices.household_id
+              AND c.is_active = 1 AND c.closing_day = ? AND c.due_day = ? AND c.updated_at = ?
+          )
+          AND EXISTS (SELECT 1 FROM household_members m WHERE m.household_id = card_invoices.household_id AND m.user_id = ? AND m.status = 'active')`).bind(admission.closesOn, at, admission.snapshotInvoiceId, context.householdId, card.id, referenceMonth, admission.dueDate, card.closingDay, card.dueDay, card.updatedAt, context.userId),
+    );
+  }
   statements.push(d1.prepare("INSERT INTO card_purchases (id, household_id, card_id, description, total_cents, purchase_date, installment_count, category_id, subcategory_id, notes, status, created_by_user_id, origin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)").bind(purchaseId, context.householdId, card.id, input.description.trim(), input.totalCents, input.purchaseDate, input.installmentCount, input.categoryId, input.subcategoryId ?? null, input.notes ?? null, context.userId, context.origin === "telegram" ? "telegram" : "web", at, at));
   for (const referenceMonth of months) {
     const part = plan.find((candidate: { referenceMonth: string }) => candidate.referenceMonth === referenceMonth)!;
     statements.push(d1.prepare("INSERT INTO card_invoices (id, household_id, card_id, reference_month, due_date, closes_on, status, paid_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?) ON CONFLICT(household_id, card_id, reference_month) DO NOTHING").bind(uid("invoice"), context.householdId, card.id, referenceMonth, part.dueDate, invoiceClosesOn(referenceMonth, card.closingDay, card.dueDay), at, at));
   }
   for (const part of plan as Array<{ referenceMonth: string; dueDate: string; installmentNumber: number; installmentCount: number; amountCents: number }>) {
-    statements.push(d1.prepare("INSERT INTO card_installments (id, household_id, purchase_id, invoice_id, installment_number, installment_count, amount_cents, status, created_at, updated_at) VALUES (?, ?, ?, (SELECT i.id FROM card_invoices i JOIN credit_cards c ON c.id = i.card_id AND c.household_id = i.household_id WHERE i.household_id = ? AND i.card_id = ? AND i.reference_month = ? AND i.status <> 'closed' AND i.closes_on IS NOT NULL AND i.closes_on >= ? AND c.is_active = 1 AND EXISTS (SELECT 1 FROM household_members m WHERE m.household_id = i.household_id AND m.user_id = ? AND m.status = 'active') LIMIT 1), ?, ?, ?, 'pending', ?, ?)").bind(uid("installment"), context.householdId, purchaseId, context.householdId, card.id, part.referenceMonth, today, context.userId, part.installmentNumber, part.installmentCount, part.amountCents, at, at));
+    const admission = admissionByMonth.get(part.referenceMonth)!;
+    statements.push(d1.prepare(`INSERT INTO card_installments (id, household_id, purchase_id, invoice_id, installment_number, installment_count, amount_cents, status, created_at, updated_at)
+      VALUES (?, ?, ?, (
+        SELECT i.id FROM card_invoices i JOIN credit_cards c ON c.id = i.card_id AND c.household_id = i.household_id
+        WHERE i.household_id = ? AND i.card_id = ? AND i.reference_month = ? AND i.due_date = ?
+          AND i.status <> 'closed' AND i.closes_on = ? AND i.closes_on >= ? AND i.closes_on >= ?
+          AND c.is_active = 1 AND c.closing_day = ? AND c.due_day = ? AND c.updated_at = ?
+          AND EXISTS (SELECT 1 FROM household_members m WHERE m.household_id = i.household_id AND m.user_id = ? AND m.status = 'active')
+        LIMIT 1
+      ), ?, ?, ?, 'pending', ?, ?)`).bind(uid("installment"), context.householdId, purchaseId, context.householdId, card.id, part.referenceMonth, admission.dueDate, admission.closesOn, today, input.purchaseDate, card.closingDay, card.dueDay, card.updatedAt, context.userId, part.installmentNumber, part.installmentCount, part.amountCents, at, at));
   }
   statements.push(d1.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) VALUES (?, ?, ?, 'create', 'card_purchase', ?, NULL, ?, ?)").bind(uid("audit"), context.householdId, context.userId, purchaseId, sourcePayload(input, context), at));
   try {
     await runCreationBatch(finalizeCardStatements(statements, context), context.source?.updateId);
   } catch (error) {
     if (error instanceof DuplicateTelegramUpdateError) throw error;
+    const [currentCard] = await db.select().from(creditCards).where(and(eq(creditCards.id, card.id), eq(creditCards.householdId, context.householdId))).limit(1);
+    if (!currentCard || !currentCard.isActive || currentCard.closingDay !== card.closingDay || currentCard.dueDay !== card.dueDay || currentCard.updatedAt !== card.updatedAt) throw new FinanceValidationError("Os dados do cartão mudaram. Atualize e tente novamente.");
     const currentInvoices = months.length ? await db.select().from(cardInvoices).where(and(eq(cardInvoices.householdId, context.householdId), eq(cardInvoices.cardId, card.id), inArray(cardInvoices.referenceMonth, months))) : [];
-    const currentBlockedInvoice = currentInvoices.find((invoice) => !canInvoiceReceivePurchase(invoice, today));
+    const currentBlockedInvoice = currentInvoices.find((invoice) => {
+      const admission = admissionByMonth.get(invoice.referenceMonth);
+      return !admission || invoice.dueDate !== admission.dueDate || invoice.closesOn !== admission.closesOn || !canInvoiceReceivePurchase(invoice, today) || input.purchaseDate > invoice.closesOn;
+    });
     if (currentBlockedInvoice) throw new FinanceValidationError(`A fatura de ${currentBlockedInvoice.referenceMonth} não está aberta e não pode receber novas parcelas.`);
     throw error;
   }

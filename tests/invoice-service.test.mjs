@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { register } from "node:module";
 import { DatabaseSync } from "node:sqlite";
-import { getInvoiceState, getInvoicePaymentHistory, getInvoiceBankEvents, payInvoiceResidual, reverseInvoicePayment, cancelCardPurchase, InvoiceServiceError, invoiceCivilDate } from "../lib/invoice-service.ts";
+import { getInvoiceState, getInvoicePaymentHistory, getInvoiceBankEvents, payInvoiceResidual, reverseInvoicePayment, cancelCardPurchase, conservativeLegacyInvoiceSnapshot, InvoiceServiceError, invoiceCivilDate } from "../lib/invoice-service.ts";
 
 const serviceEnv = globalThis.__telegramHandlerTestEnv ?? {};
 globalThis.__telegramHandlerTestEnv = serviceEnv;
@@ -19,7 +19,7 @@ register(`data:text/javascript,${encodeURIComponent(`
     return path ? { shortCircuit: true, url: pathToFileURL(path).href } : next(specifier, context);
   }
 `)}`, import.meta.url);
-const { createCardPurchase, FinanceValidationError } = await import("../lib/finance-service.ts");
+const { createCardPurchase, DuplicateTelegramUpdateError, FinanceValidationError } = await import("../lib/finance-service.ts");
 
 class Statement {
   constructor(db, sql, bindings = []) { this.db = db; this.sql = sql; this.bindings = bindings; }
@@ -71,6 +71,36 @@ async function reverse(f, payment, changes = {}, context = f.context) {
 }
 function snapshot(db) { return ["card_purchases", "card_invoices", "card_installments", "invoice_payments", "invoice_payment_operations", "transactions", "audit_logs"].map(table => db.prepare(`SELECT * FROM ${table} ORDER BY id`).all()); }
 const isConflict = e => e instanceof InvoiceServiceError && e.status === 409;
+
+function legacyProof(changes = {}) {
+  return conservativeLegacyInvoiceSnapshot({
+    referenceMonth: "2026-10",
+    dueDate: "2026-10-25",
+    status: "open",
+    targetReferenceMonth: "2026-10",
+    targetDueDate: "2026-10-25",
+    targetClosesOn: "2026-10-17",
+    purchaseDate: "2026-09-18",
+    today: "2026-09-18",
+    ...changes,
+  });
+}
+
+test("prova conservadora exige compatibilidade completa e ciclo aberto em toda configuração histórica possível", () => {
+  assert.deepEqual(legacyProof(), { closesOn: "2026-10-17", earliestCompatibleClosesOn: "2026-09-25" });
+  assert.deepEqual(legacyProof({ status: "paid" }), { closesOn: "2026-10-17", earliestCompatibleClosesOn: "2026-09-25" });
+  assert.equal(legacyProof({ status: "closed" }), null);
+  assert.equal(legacyProof({ dueDate: "2026-10-24" }), null);
+  assert.equal(legacyProof({ targetDueDate: "2026-10-24" }), null);
+  assert.equal(legacyProof({ referenceMonth: "2026-09", targetReferenceMonth: "2026-09", dueDate: "2026-09-25", targetDueDate: "2026-09-25", targetClosesOn: "2026-09-17" }), null);
+});
+
+test("prova conservadora trata due_day 29/30/31 truncado como ambíguo em mês curto", () => {
+  const february = { referenceMonth: "2027-02", targetReferenceMonth: "2027-02", dueDate: "2027-02-28", targetDueDate: "2027-02-28", targetClosesOn: "2027-02-17", purchaseDate: "2027-01-27", today: "2027-01-27" };
+  assert.deepEqual(legacyProof(february), { closesOn: "2027-02-17", earliestCompatibleClosesOn: "2027-01-28" });
+  assert.equal(legacyProof({ ...february, purchaseDate: "2027-01-29", today: "2027-01-29" }), null);
+  assert.deepEqual(legacyProof({ referenceMonth: "2026-04", targetReferenceMonth: "2026-04", dueDate: "2026-04-30", targetDueDate: "2026-04-30", targetClosesOn: "2026-04-17", purchaseDate: "2026-03-29", today: "2026-03-29" }), { closesOn: "2026-04-17", earliestCompatibleClosesOn: "2026-03-30" });
+});
 
 test("invoice ledger sem pagamento: unpaid/open e total em centavos", async t => {
   const f = setup(t); await purchase(f); const value = await getInvoiceState(await invoice(f), f.context);
@@ -132,6 +162,85 @@ for (const status of ["open", "paid"]) test(`invoice histórica ${status} com cl
   const f = setup(t); await purchase(f); f.db.prepare("UPDATE card_invoices SET closes_on=NULL,status=?").run(status);
   assert.equal((await getInvoiceState(await invoice(f), f.context)).cycleStatus, "unknown");
   const before = snapshot(f.db); await assert.rejects(purchase(f), FinanceValidationError); assert.deepEqual(snapshot(f.db), before);
+});
+test("invoice legada NULL/open compatível recebe lazy snapshot e auditoria no mesmo batch", async t => {
+  const f = setup(t); const at = "2026-09-18T12:00:00Z";
+  f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("legacy-open", "ha", "carda", "2026-10", "2026-10-25", AT, AT);
+  await purchase(f, { purchaseDate: "2026-09-18" }, { ...f.creation, timestamp: at });
+  assert.equal(f.db.prepare("SELECT closes_on FROM card_invoices WHERE id='legacy-open'").get().closes_on, "2026-10-17");
+  const audit = f.db.prepare("SELECT old_data,new_data FROM audit_logs WHERE entity_type='card_invoice' AND action='snapshot'").get();
+  assert.deepEqual(JSON.parse(audit.old_data), { closesOn: null }); assert.equal(JSON.parse(audit.new_data).closesOn, "2026-10-17");
+  assert.equal(f.db.prepare("SELECT invoice_id FROM card_installments").get().invoice_id, "legacy-open");
+});
+test("invoice legada NULL/paid comprovadamente aberta preserva pagamento e gera apenas residual novo", async t => {
+  const f = setup(t); const context = { ...f.creation, timestamp: "2026-09-18T12:00:00Z" };
+  await purchase(f, { purchaseDate: "2026-09-18" }, context);
+  const invoiceId = await invoice(f); await pay(f, { paidAt: "2026-09-18" }, { ...f.context, timestamp: context.timestamp });
+  const paymentBefore = f.db.prepare("SELECT * FROM invoice_payments WHERE invoice_id=?").get(invoiceId);
+  f.db.prepare("UPDATE card_invoices SET closes_on=NULL,status='paid' WHERE id=?").run(invoiceId);
+  await purchase(f, { purchaseDate: "2026-09-18", totalCents: 10000 }, context);
+  const value = await getInvoiceState(invoiceId, { ...f.context, timestamp: context.timestamp });
+  assert.deepEqual([value.invoiceTotalCents, value.paidCents, value.remainingCents, value.paymentStatus], [60000, 50000, 10000, "partial"]);
+  assert.deepEqual(f.db.prepare("SELECT * FROM invoice_payments WHERE invoice_id=?").get(invoiceId), paymentBefore);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM transactions").get().n, 0);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit_logs WHERE entity_type='card_invoice' AND action='snapshot'").get().n, 1);
+});
+test("due_date incompatível e status closed falham sem snapshot, compra ou parcela", async t => {
+  for (const fixture of [{ id: "bad-due", due: "2026-10-24", status: "open" }, { id: "closed", due: "2026-10-25", status: "closed" }]) {
+    const f = setup(t); f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").run(fixture.id, "ha", "carda", "2026-10", fixture.due, fixture.status, AT, AT);
+    await assert.rejects(purchase(f, { purchaseDate: "2026-09-18" }, { ...f.creation, timestamp: "2026-09-18T12:00:00Z" }), FinanceValidationError);
+    assert.equal(f.db.prepare("SELECT closes_on FROM card_invoices WHERE id=?").get(fixture.id).closes_on, null);
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_purchases").get().n, 0); assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_installments").get().n, 0);
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit_logs").get().n, 0);
+  }
+});
+test("invoice futura NULL só é promovida quando nova compra aponta exatamente para sua competência", async t => {
+  const f = setup(t); await purchase(f, { installmentCount: 3, totalCents: 300, purchaseDate: "2026-09-15" });
+  f.db.exec("UPDATE card_invoices SET closes_on=NULL WHERE reference_month IN ('2026-10','2026-11')");
+  await purchase(f, { totalCents: 100, purchaseDate: "2026-09-18" }, { ...f.creation, timestamp: "2026-09-18T12:00:00Z" });
+  assert.deepEqual(f.db.prepare("SELECT reference_month,closes_on FROM card_invoices ORDER BY reference_month").all().map(row => ({ ...row })), [
+    { reference_month: "2026-09", closes_on: "2026-09-17" },
+    { reference_month: "2026-10", closes_on: "2026-10-17" },
+    { reference_month: "2026-11", closes_on: null },
+  ]);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit_logs WHERE entity_type='card_invoice' AND action='snapshot'").get().n, 1);
+});
+test("duas compras concorrentes convergem no mesmo lazy snapshot sem duplicar auditoria", async t => {
+  const f = setup(t); f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("legacy-race", "ha", "carda", "2026-10", "2026-10-25", AT, AT);
+  const context = { ...f.creation, timestamp: "2026-09-18T12:00:00Z" };
+  await Promise.all([purchase(f, { description: "Race A", purchaseDate: "2026-09-18" }, context), purchase(f, { description: "Race B", purchaseDate: "2026-09-18" }, context)]);
+  assert.equal(f.db.prepare("SELECT closes_on FROM card_invoices WHERE id='legacy-race'").get().closes_on, "2026-10-17");
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_purchases").get().n, 2); assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_installments").get().n, 2);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit_logs WHERE entity_type='card_invoice' AND action='snapshot'").get().n, 1);
+});
+test("retry Telegram não duplica compra, parcelas, snapshot ou auditoria", async t => {
+  const f = setup(t); f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("legacy-retry", "ha", "carda", "2026-10", "2026-10-25", AT, AT);
+  const context = { ...f.creation, origin: "telegram", timestamp: "2026-09-18T12:00:00Z", source: { updateId: "legacy-update", operationId: "legacy-operation" } };
+  await purchase(f, { purchaseDate: "2026-09-18" }, context); await assert.rejects(purchase(f, { purchaseDate: "2026-09-18" }, context), DuplicateTelegramUpdateError);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_purchases").get().n, 1); assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_installments").get().n, 1);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit_logs WHERE entity_type='card_invoice' AND action='snapshot'").get().n, 1);
+});
+test("mudança concorrente da configuração bloqueia snapshot e reverte tudo", async t => {
+  const f = setup(t); f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("legacy-config", "ha", "carda", "2026-10", "2026-10-25", AT, AT);
+  f.d1.beforeBatch = async () => { f.db.prepare("UPDATE credit_cards SET closing_day=18,updated_at=? WHERE id='carda'").run("2026-09-18T11:59:00Z"); };
+  await assert.rejects(purchase(f, { purchaseDate: "2026-09-18" }, { ...f.creation, timestamp: "2026-09-18T12:00:00Z" }), /dados do cartão mudaram/iu);
+  assert.equal(f.db.prepare("SELECT closes_on FROM card_invoices WHERE id='legacy-config'").get().closes_on, null);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_purchases").get().n, 0); assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit_logs").get().n, 0);
+});
+test("pagamento concorrente antes do lazy snapshot permanece e nova compra vira residual", async t => {
+  const f = setup(t); const context = { ...f.creation, timestamp: "2026-09-18T12:00:00Z" }; await purchase(f, { purchaseDate: "2026-09-18" }, context);
+  const invoiceId = await invoice(f); f.db.prepare("UPDATE card_invoices SET closes_on=NULL WHERE id=?").run(invoiceId);
+  f.d1.beforeBatch = async () => { await pay(f, { paidAt: "2026-09-18" }, { ...f.context, timestamp: context.timestamp }); };
+  await purchase(f, { purchaseDate: "2026-09-18", totalCents: 10000 }, context);
+  const value = await getInvoiceState(invoiceId, { ...f.context, timestamp: context.timestamp });
+  assert.deepEqual([value.invoiceTotalCents, value.paidCents, value.remainingCents, value.paymentStatus], [60000, 50000, 10000, "partial"]);
+});
+test("falha tardia reverte lazy snapshot, auditoria, compra e parcelas integralmente", async t => {
+  const f = setup(t); f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,'open',?,?)").run("legacy-late", "ha", "carda", "2026-10", "2026-10-25", AT, AT);
+  f.db.exec("CREATE TEMP TRIGGER reject_purchase_audit BEFORE INSERT ON audit_logs WHEN NEW.entity_type='card_purchase' BEGIN SELECT RAISE(ABORT,'forced legacy late failure'); END");
+  await assert.rejects(purchase(f, { purchaseDate: "2026-09-18" }, { ...f.creation, timestamp: "2026-09-18T12:00:00Z" }), FinanceValidationError);
+  assert.equal(f.db.prepare("SELECT closes_on FROM card_invoices WHERE id='legacy-late'").get().closes_on, null);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_purchases").get().n, 0); assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_installments").get().n, 0); assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit_logs").get().n, 0);
 });
 test("status legado paid não determina quitação; parcela paid soma e cancelled não soma", async t => {
   const f = setup(t); await purchase(f); await purchase(f, { totalCents: 10000 });

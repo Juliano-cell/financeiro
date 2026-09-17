@@ -23,12 +23,16 @@ export function invoiceCivilDate(timestamp = new Date().toISOString()) {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
-function assertDate(value: string) {
-  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value) || value < "0001-01-01") throw new InvoiceServiceError("Data inválida.");
+function isCivilDate(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value) || value < "0001-01-01") return false;
   const year = Number(value.slice(0, 4)); const month = Number(value.slice(5, 7)); const day = Number(value.slice(8));
   const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const lengths = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  if (month < 1 || month > 12 || day < 1 || day > lengths[month - 1]) throw new InvoiceServiceError("Data inválida.");
+  return month >= 1 && month <= 12 && day >= 1 && day <= lengths[month - 1];
+}
+
+function assertDate(value: string) {
+  if (!isCivilDate(value)) throw new InvoiceServiceError("Data inválida.");
 }
 
 function assertIdentifier(value: string) {
@@ -43,6 +47,40 @@ export function invoiceClosesOn(referenceMonth: string, closingDay: number, dueD
 
 export function canInvoiceReceivePurchase(invoice: { status: string; closesOn: string | null }, today: string) {
   return invoice.status !== "closed" && invoice.closesOn !== null && today <= invoice.closesOn;
+}
+
+export function conservativeLegacyInvoiceSnapshot(input: {
+  referenceMonth: string;
+  dueDate: string;
+  status: string;
+  targetReferenceMonth: string;
+  targetDueDate: string;
+  targetClosesOn: string;
+  purchaseDate: string;
+  today: string;
+}) {
+  const { referenceMonth, dueDate, status, targetReferenceMonth, targetDueDate, targetClosesOn, purchaseDate, today } = input;
+  if (!/^\d{4}-\d{2}$/u.test(referenceMonth) || referenceMonth !== targetReferenceMonth || dueDate !== targetDueDate) return null;
+  if ((status !== "open" && status !== "paid") || !isCivilDate(dueDate) || !isCivilDate(targetClosesOn) || !isCivilDate(purchaseDate) || !isCivilDate(today)) return null;
+  if (dueDate.slice(0, 7) !== referenceMonth) return null;
+
+  const persistedDueDay = Number(dueDate.slice(8));
+  const monthLength = daysInMonth(referenceMonth);
+  const compatibleDueDays = Array.from({ length: 31 }, (_, index) => index + 1)
+    .filter((dueDay) => Math.min(dueDay, monthLength) === persistedDueDay);
+  if (!compatibleDueDays.length) return null;
+
+  let earliestCompatibleClosesOn: string | null = null;
+  for (const dueDay of compatibleDueDays) {
+    for (let closingDay = 1; closingDay <= 31; closingDay += 1) {
+      const candidate = invoiceClosesOn(referenceMonth, closingDay, dueDay);
+      if (earliestCompatibleClosesOn === null || candidate < earliestCompatibleClosesOn) earliestCompatibleClosesOn = candidate;
+    }
+  }
+
+  const relevantDate = purchaseDate > today ? purchaseDate : today;
+  if (earliestCompatibleClosesOn === null || earliestCompatibleClosesOn < relevantDate || targetClosesOn < relevantDate) return null;
+  return { closesOn: targetClosesOn, earliestCompatibleClosesOn };
 }
 
 async function authorize(context: InvoiceContext) {
