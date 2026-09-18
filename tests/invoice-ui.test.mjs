@@ -13,6 +13,7 @@ const invoice = { id: "fixture-invoice", cardId: "fixture-card", referenceMonth:
 const reopened = { ...invoice, invoiceTotalCents: 60000, remainingCents: 10000, paymentStatus: "partial" };
 const accounts = [{ id: "fixture-account", name: "Conta de teste", isActive: true }, { id: "inactive", name: "Conta inativa", isActive: false }];
 const source = readFileSync(new URL("../app/invoice-lifecycle.tsx", import.meta.url), "utf8");
+const detailSource = readFileSync(new URL("../app/invoice-detail-dialog.tsx", import.meta.url), "utf8");
 const advanced = readFileSync(new URL("../app/advanced-finance.tsx", import.meta.url), "utf8");
 const parent = readFileSync(new URL("../app/finance-app.tsx", import.meta.url), "utf8");
 
@@ -22,9 +23,16 @@ const primitives = `import {createElement} from ${JSON.stringify(import.meta.res
 ${["Button", "Badge", "Input", "Label", "Dialog", "DialogContent", "DialogDescription", "DialogFooter", "DialogHeader", "DialogTitle"].map((name) => `export function ${name}({children,...props}) { return createElement(${JSON.stringify(({ Button: "button", Input: "input", Label: "label", DialogTitle: "h2" })[name] ?? "div")}, props, children); }`).join("\n")}`;
 const primitiveUrl = `data:text/javascript,${encodeURIComponent(primitives)}`;
 const apiUrl = `data:text/javascript,${encodeURIComponent("export class AdvancedApiError extends Error {} export async function advancedApi(){throw new Error('transport not enabled in render test')} ")}`;
+let compiledDetail = ts.transpileModule(detailSource, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
+compiledDetail = compiledDetail.replace(/from "([^"]+)"/gu, (_, specifier) => {
+  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : import.meta.resolve(specifier);
+  return `from ${JSON.stringify(url)}`;
+});
+const detailUrl = `data:text/javascript,${encodeURIComponent(compiledDetail)}`;
+const { InvoiceDetailItems } = await import(detailUrl);
 let compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiled = compiled.replace(/from "([^"]+)"/gu, (_, specifier) => {
-  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/app/advanced-finance" ? apiUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
+  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/app/advanced-finance" ? apiUrl : specifier === "@/app/invoice-detail-dialog" ? detailUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
   return `from ${JSON.stringify(url)}`;
 });
 const { InvoiceLifecycle, InvoiceOperationDialog } = await import(`data:text/javascript,${encodeURIComponent(compiled)}`);
@@ -52,6 +60,25 @@ test("componente real mostra total500/pago500/restante0, quitada e ciclo aberto"
   assert.match(html, /Total da fatura/); assert.match(html, /Já pago/); assert.match(html, /Restante/);
   assert.match(html, /500,00/); assert.match(html, /Quitada/); assert.match(html, /Ciclo aberto/);
   assert.doesNotMatch(html, /Pagar restante/);
+  assert.match(html, /Ver fatura/);
+});
+
+test("detalhamento mostra valor da parcela, numeração, classificação e cancelados separados", () => {
+  const basePage = { page: 1, pageSize: 10, totalItems: 2, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
+  const item = { installmentId: "i1", purchaseId: "p1", purchaseDate: "2026-09-18", description: "Internet", categoryId: "cat", categoryName: "Casa", subcategoryId: "sub", subcategoryName: "Internet", installmentAmountCents: 11200, installmentNumber: 1, installmentCount: 1, purchaseTotalCents: 11200, origin: "web", status: "pending", includedInTotal: true };
+  const detail = { invoice, active: { ...basePage, items: [item, { ...item, installmentId: "i2", description: "Celular", installmentAmountCents: 18000, installmentNumber: 2, installmentCount: 10, purchaseTotalCents: 180000, origin: "telegram" }] }, cancelled: { ...basePage, totalItems: 1, items: [{ ...item, installmentId: "cancelled", description: "Cancelada", status: "cancelled", includedInTotal: false }] } };
+  const html = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail, onActivePage() {}, onCancelledPage() {} }));
+  for (const expected of ["Internet", "Casa / Internet", "Parcela 1/1", "R$ 112,00", "Celular", "Parcela 2/10", "R$ 180,00", "Valor original da compra: R$ 1.800,00", "Origem: Telegram", "Itens cancelados", "Cancelada", "Não incluído no total da fatura"]) assert.ok(html.includes(expected), expected);
+  assert.equal((html.match(/R\$ 1\.800,00/gu) ?? []).length, 1);
+});
+
+test("detalhamento possui paginação responsiva sem householdId no cliente", () => {
+  assert.match(detailSource, /URLSearchParams\(\{ invoiceId, activePage:/);
+  assert.match(detailSource, /pageSize: String\(PAGE_SIZE\)/);
+  assert.doesNotMatch(detailSource, /householdId|household_id/);
+  assert.match(detailSource, /return \(\) => controller.abort\(\)/);
+  assert.match(detailSource, /if \(!controller.signal.aborted\)/);
+  assert.doesNotMatch(detailSource, /<table|overflow-x-auto/);
 });
 test("nova compra mostra total600/pago500/restante100 apesar de status legado paid", () => {
   const html = renderInvoice(reopened);
@@ -221,6 +248,7 @@ function hookHarness(transport = async () => ({})) {
   class ApiError extends Error { constructor(message, status) { super(message); this.status = status; } }
   const jsx = (type, props, key) => ({ type, props: props ?? {}, key });
   const visuals = new Proxy({}, { get: (_target, name) => name });
+  let invoiceDetail = {};
   function compile(text, advancedExports) {
     const output = ts.transpileModule(text, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
     const exports = {};
@@ -232,12 +260,14 @@ function hookHarness(transport = async () => ({})) {
       if (name === "@/lib/finance-ui-rules.mjs") return classificationRules;
       if (name === "@/lib/bill-ui-rules.mjs") return billRules;
       if (name === "@/app/advanced-finance") return advancedExports ?? { advancedApi: transport, AdvancedApiError: ApiError, AdvancedFinanceView: "AdvancedFinanceView", MonthNavigator: "MonthNavigator" };
+      if (name === "@/app/invoice-detail-dialog") return invoiceDetail;
       if (name === "@/app/invoice-lifecycle") return lifecycle;
       return visuals;
     };
     new Function("exports", "require", output)(exports, dependencies);
     return exports;
   }
+  invoiceDetail = compile(detailSource);
   const lifecycle = compile(source);
   const cards = compile(advanced);
   const root = compile(parent);

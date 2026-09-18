@@ -24,6 +24,7 @@ register(`data:text/javascript,${encodeURIComponent(`
   }
 `)}`, import.meta.url);
 const advanced = await import("../app/api/finance/advanced/route.ts");
+const invoiceDetails = await import("../app/api/finance/invoice-details/route.ts");
 const main = await import("../app/api/finance/route.ts");
 const notifications = await import("../app/api/notifications/run/route.ts");
 const { getCurrentAccountBalances, getFinanceAnalytics } = await import("../lib/finance-analytics-service.ts");
@@ -104,6 +105,11 @@ function reverse(paymentId, fields = {}) { return action("reverse_invoice_paymen
 async function snapshot(month = "2026-09") {
   const response = await advanced.GET(new Request(`https://fixture.invalid/api/finance/advanced?month=${month}`));
   assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "private, no-store"); return response.json();
+}
+async function detail(parameters = {}) {
+  const query = new URLSearchParams({ invoiceId: String(parameters.invoiceId ?? ""), activePage: String(parameters.activePage ?? 1), cancelledPage: String(parameters.cancelledPage ?? 1), pageSize: String(parameters.pageSize ?? 20) });
+  const response = await invoiceDetails.GET(new Request(`https://fixture.invalid/api/finance/invoice-details?${query}`));
+  return { status: response.status, headers: response.headers, body: await response.json() };
 }
 async function balance(date) { return (await getCurrentAccountBalances("ha", date)).find(a => a.accountId === "aa").currentBalanceCents; }
 function analytics(from = "2026-09-01", to = "2026-09-30", changes = {}) {
@@ -256,4 +262,70 @@ test("cancelamento legado não apaga pagamento nem compra quitada", async t => {
   const f = await setup(t); const p = await pay(f); const purchaseId = f.db.prepare("SELECT id FROM card_purchases").get().id;
   assert.equal((await action("delete_card_purchase", { id: purchaseId })).status, 409); assert.equal(count(f, "invoice_payments"), 1); assert.equal(count(f, "card_purchases"), 1);
   await reverse(p.body.paymentId); assert.equal((await action("delete_card_purchase", { id: purchaseId })).status, 200); assert.equal(count(f, "invoice_payments"), 1); assert.equal(f.db.prepare("SELECT status FROM card_purchases").get().status, "cancelled");
+});
+
+test("detalhe lazy da invoice 1x retorna contrato tipado sem qualquer escrita", async t => {
+  const f = await setup(t);
+  const before = ["card_purchases", "card_invoices", "card_installments", "invoice_payments", "invoice_payment_operations", "transactions", "audit_logs"].map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
+  const response = await detail({ invoiceId: f.invoiceId });
+  assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "private, no-store");
+  assert.deepEqual(response.body.invoice, { id: f.invoiceId, cardId: "carda", cardName: "Fixture", referenceMonth: "2026-09", dueDate: "2026-09-25", closesOn: "2026-09-17", invoiceTotalCents: 50000, paidCents: 0, remainingCents: 50000, cycleStatus: "closed", paymentStatus: "unpaid" });
+  assert.deepEqual(response.body.active.items.map(item => ({ number: item.installmentNumber, count: item.installmentCount, amount: item.installmentAmountCents, total: item.purchaseTotalCents, category: item.categoryName, subcategory: item.subcategoryName, status: item.status, included: item.includedInTotal })), [{ number: 1, count: 1, amount: 50000, total: 50000, category: "Fixture", subcategory: null, status: "pending", included: true }]);
+  assert.equal(response.body.cancelled.totalItems, 0);
+  const after = ["card_purchases", "card_invoices", "card_installments", "invoice_payments", "invoice_payment_operations", "transactions", "audit_logs"].map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
+  assert.deepEqual(after, before);
+});
+
+test("detalhe mostra somente a parcela da competência com numeração e valor original", async t => {
+  const f = await setup(t);
+  await createCardPurchase({ cardId: "carda", categoryId: "cata", description: "Parcelada", totalCents: 30000, purchaseDate: "2026-09-16", installmentCount: 3 }, { householdId: "ha", userId: "ua", origin: "dashboard", timestamp: AT });
+  const october = f.db.prepare("SELECT id FROM card_invoices WHERE household_id='ha' AND reference_month='2026-10'").get().id;
+  const response = await detail({ invoiceId: october });
+  assert.equal(response.status, 200); assert.equal(response.body.active.totalItems, 1);
+  assert.deepEqual(response.body.active.items.map(item => [item.description, item.installmentNumber, item.installmentCount, item.installmentAmountCents, item.purchaseTotalCents]), [["Parcelada", 2, 3, 10000, 30000]]);
+});
+
+test("detalhe traz categoria/subcategoria e ordenação determinística", async t => {
+  const f = await setup(t);
+  f.db.prepare("INSERT INTO subcategories(id,household_id,category_id,name,created_at,updated_at) VALUES(?,?,?,?,?,?)").run("suba", "ha", "cata", "Subcategoria", AT, AT);
+  for (const [description, purchaseDate, timestamp] of [["Primeira", "2026-09-14", "2026-09-14T10:00:00Z"], ["Segunda", "2026-09-15", "2026-09-15T10:00:00Z"]]) {
+    await createCardPurchase({ cardId: "carda", categoryId: "cata", subcategoryId: "suba", description, totalCents: 1000, purchaseDate, installmentCount: 1 }, { householdId: "ha", userId: "ua", origin: "dashboard", timestamp });
+  }
+  const response = await detail({ invoiceId: f.invoiceId });
+  assert.deepEqual(response.body.active.items.map(item => item.description), ["Primeira", "Segunda", "Fixture"]);
+  assert.equal(response.body.active.items[0].categoryName, "Fixture"); assert.equal(response.body.active.items[0].subcategoryName, "Subcategoria");
+});
+
+test("cancelados ficam em seção separada e não alteram total canônico", async t => {
+  const f = await setup(t); const created = await buy(f, 12000); assert.equal((await action("delete_card_purchase", { id: created.id })).status, 200);
+  const response = await detail({ invoiceId: f.invoiceId });
+  assert.equal(response.body.invoice.invoiceTotalCents, 50000); assert.equal(response.body.active.totalItems, 1); assert.equal(response.body.cancelled.totalItems, 1);
+  assert.deepEqual(response.body.cancelled.items.map(item => [item.status, item.includedInTotal, item.installmentAmountCents]), [["cancelled", false, 12000]]);
+});
+
+test("paginação é limitada e separada para itens ativos e cancelados", async t => {
+  const f = await setup(t); await buy(f, 1000); await buy(f, 2000);
+  const first = await detail({ invoiceId: f.invoiceId, pageSize: 2 }); const second = await detail({ invoiceId: f.invoiceId, pageSize: 2, activePage: 2 });
+  assert.equal(first.body.active.totalItems, 3); assert.equal(first.body.active.items.length, 2); assert.equal(first.body.active.hasNextPage, true);
+  assert.equal(second.body.active.items.length, 1); assert.equal(second.body.active.hasPreviousPage, true); assert.equal(second.body.active.hasNextPage, false);
+  assert.equal((await detail({ invoiceId: f.invoiceId, pageSize: 51 })).status, 400); assert.equal((await detail({ invoiceId: f.invoiceId, activePage: 0 })).status, 400);
+});
+
+test("detalhe preserva estados quitado, parcial, aberto e legado", async t => {
+  const f = await setup(t); await pay(f); let response = await detail({ invoiceId: f.invoiceId });
+  assert.deepEqual([response.body.invoice.paymentStatus, response.body.invoice.cycleStatus, response.body.invoice.remainingCents], ["settled", "closed", 0]);
+  await buy(f, 10000); response = await detail({ invoiceId: f.invoiceId });
+  assert.deepEqual([response.body.invoice.paymentStatus, response.body.invoice.invoiceTotalCents, response.body.invoice.paidCents, response.body.invoice.remainingCents], ["partial", 60000, 50000, 10000]);
+  f.db.exec("UPDATE card_invoices SET closes_on=NULL"); response = await detail({ invoiceId: f.invoiceId }); assert.equal(response.body.invoice.cycleStatus, "unknown");
+});
+
+test("detalhe reconhece invoice com ciclo ainda aberto", async t => {
+  const f = await setup(t, "2026-09-16T12:00:00Z"); const response = await detail({ invoiceId: f.invoiceId });
+  assert.equal(response.body.invoice.cycleStatus, "open"); assert.equal(response.body.invoice.paymentStatus, "unpaid");
+});
+
+test("detalhe inexistente/cross-household não vaza e autenticação é obrigatória", async t => {
+  const f = await setup(t); await buy(f, 12000, "b"); const foreign = f.db.prepare("SELECT id FROM card_invoices WHERE household_id='hb'").get().id;
+  assert.equal((await detail({ invoiceId: "missing" })).status, 404); const denied = await detail({ invoiceId: foreign }); assert.equal(denied.status, 404); assert.doesNotMatch(JSON.stringify(denied.body), /12000|Fixture b|cardb/u);
+  globalThis.__invoiceTestCookie = undefined; assert.equal((await detail({ invoiceId: f.invoiceId })).status, 401);
 });
