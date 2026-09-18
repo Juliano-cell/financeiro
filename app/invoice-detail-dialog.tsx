@@ -17,14 +17,65 @@ class InvoiceDetailApiError extends Error {
   constructor(message: string, public status: number) { super(message); this.name = "InvoiceDetailApiError"; }
 }
 
-async function loadInvoiceDetail(invoiceId: string, activePage: number, cancelledPage: number, signal: AbortSignal) {
+const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const text = (value: unknown): value is string => typeof value === "string";
+const nullableText = (value: unknown): value is string | null => value === null || text(value);
+const safeInteger = (value: unknown, minimum = 0): value is number => Number.isSafeInteger(value) && Number(value) >= minimum;
+const civilDate = (value: unknown): value is string => {
+  if (!text(value) || !/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
+};
+const referenceMonth = (value: unknown): value is string => text(value) && /^\d{4}-(0[1-9]|1[0-2])$/u.test(value);
+
+function validItem(value: unknown, cancelled: boolean): value is InvoiceDetailItem {
+  if (!record(value)) return false;
+  const count = value.installmentCount;
+  const number = value.installmentNumber;
+  return text(value.installmentId) && text(value.purchaseId) && civilDate(value.purchaseDate) && text(value.description)
+    && nullableText(value.categoryId) && nullableText(value.categoryName) && nullableText(value.subcategoryId) && nullableText(value.subcategoryName)
+    && safeInteger(value.installmentAmountCents, 1) && safeInteger(value.purchaseTotalCents, 1)
+    && safeInteger(count, 1) && Number(count) <= 120 && safeInteger(number, 1) && Number(number) <= Number(count)
+    && (value.origin === "web" || value.origin === "telegram" || value.origin === "system")
+    && (value.status === "pending" || value.status === "paid" || value.status === "cancelled")
+    && typeof value.includedInTotal === "boolean"
+    && (cancelled ? value.status === "cancelled" && value.includedInTotal === false : value.status !== "cancelled" && value.includedInTotal === true);
+}
+
+function validPage(value: unknown, cancelled: boolean): value is InvoiceDetailPage {
+  if (!record(value) || !Array.isArray(value.items) || !safeInteger(value.page, 1) || !safeInteger(value.pageSize, 1) || Number(value.pageSize) > 50
+    || !safeInteger(value.totalItems) || !safeInteger(value.totalPages, 1) || typeof value.hasPreviousPage !== "boolean" || typeof value.hasNextPage !== "boolean") return false;
+  const expectedPages = Math.max(1, Math.ceil(Number(value.totalItems) / Number(value.pageSize)));
+  const expectedItems = Math.min(Number(value.pageSize), Math.max(0, Number(value.totalItems) - (Number(value.page) - 1) * Number(value.pageSize)));
+  return Number(value.page) <= expectedPages && Number(value.totalPages) === expectedPages && value.items.length === expectedItems
+    && value.hasPreviousPage === (Number(value.page) > 1) && value.hasNextPage === (Number(value.page) < expectedPages)
+    && value.items.every((item) => validItem(item, cancelled));
+}
+
+export function parseInvoiceDetailPayload(value: unknown): InvoiceDetailResponse | null {
+  if (!record(value) || !record(value.invoice) || !validPage(value.active, false) || !validPage(value.cancelled, true)) return null;
+  const invoice = value.invoice;
+  if (!text(invoice.id) || !text(invoice.cardId) || !text(invoice.cardName) || !referenceMonth(invoice.referenceMonth)
+    || !civilDate(invoice.dueDate) || !(invoice.closesOn === null || civilDate(invoice.closesOn))
+    || !safeInteger(invoice.invoiceTotalCents) || !safeInteger(invoice.paidCents) || !safeInteger(invoice.remainingCents)
+    || !(invoice.cycleStatus === "open" || invoice.cycleStatus === "closed" || invoice.cycleStatus === "unknown")
+    || !(invoice.paymentStatus === "unpaid" || invoice.paymentStatus === "partial" || invoice.paymentStatus === "settled")) return null;
+  const remaining = Math.max(Number(invoice.invoiceTotalCents) - Number(invoice.paidCents), 0);
+  const paymentStatus = remaining === 0 ? "settled" : Number(invoice.paidCents) === 0 ? "unpaid" : "partial";
+  if (Number(invoice.remainingCents) !== remaining || invoice.paymentStatus !== paymentStatus) return null;
+  return value as unknown as InvoiceDetailResponse;
+}
+
+export async function loadInvoiceDetail(invoiceId: string, activePage: number, cancelledPage: number, signal: AbortSignal) {
   const query = new URLSearchParams({ invoiceId, activePage: String(activePage), cancelledPage: String(cancelledPage), pageSize: String(PAGE_SIZE) });
   const response = await fetch(`/api/finance/invoice-details?${query}`, { cache: "no-store", signal });
-  let body: InvoiceDetailResponse | { error?: string };
-  try { body = await response.json() as InvoiceDetailResponse | { error?: string }; }
+  let body: unknown;
+  try { body = await response.json(); }
   catch { throw new InvoiceDetailApiError("Não foi possível interpretar o detalhamento da fatura.", response.status); }
-  if (!response.ok) throw new InvoiceDetailApiError("error" in body && body.error ? body.error : "Não foi possível carregar o detalhamento da fatura.", response.status);
-  return body as InvoiceDetailResponse;
+  if (!response.ok) throw new InvoiceDetailApiError(record(body) && text(body.error) && body.error ? body.error : "Não foi possível carregar o detalhamento da fatura.", response.status);
+  const detail = parseInvoiceDetailPayload(body);
+  if (!detail || detail.invoice.id !== invoiceId) throw new InvoiceDetailApiError("O detalhamento recebido é inválido. Tente novamente.", 502);
+  return detail;
 }
 
 function Item({ item }: { item: InvoiceDetailItem }) {

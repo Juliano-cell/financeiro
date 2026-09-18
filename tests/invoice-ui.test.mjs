@@ -29,7 +29,7 @@ compiledDetail = compiledDetail.replace(/from "([^"]+)"/gu, (_, specifier) => {
   return `from ${JSON.stringify(url)}`;
 });
 const detailUrl = `data:text/javascript,${encodeURIComponent(compiledDetail)}`;
-const { InvoiceDetailItems } = await import(detailUrl);
+const { InvoiceDetailItems, loadInvoiceDetail, parseInvoiceDetailPayload } = await import(detailUrl);
 let compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiled = compiled.replace(/from "([^"]+)"/gu, (_, specifier) => {
   const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/app/advanced-finance" ? apiUrl : specifier === "@/app/invoice-detail-dialog" ? detailUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
@@ -79,6 +79,36 @@ test("detalhamento possui paginação responsiva sem householdId no cliente", ()
   assert.match(detailSource, /return \(\) => controller.abort\(\)/);
   assert.match(detailSource, /if \(!controller.signal.aborted\)/);
   assert.doesNotMatch(detailSource, /<table|overflow-x-auto/);
+});
+
+const detailItem = { installmentId: "i1", purchaseId: "p1", purchaseDate: "2026-09-18", description: "Internet", categoryId: "cat", categoryName: "Casa", subcategoryId: null, subcategoryName: null, installmentAmountCents: 11200, installmentNumber: 1, installmentCount: 1, purchaseTotalCents: 11200, origin: "web", status: "pending", includedInTotal: true };
+const detailPage = { items: [detailItem], page: 1, pageSize: 10, totalItems: 1, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
+const validDetail = { invoice: { ...invoice, cardName: "Cartão de teste" }, active: detailPage, cancelled: { items: [], page: 1, pageSize: 10, totalItems: 0, totalPages: 1, hasPreviousPage: false, hasNextPage: false } };
+
+test("validação runtime aceita contrato válido e rejeita estruturas financeiras incompletas", async () => {
+  assert.deepEqual(parseInvoiceDetailPayload(validDetail), validDetail);
+  const withoutInvoice = { active: validDetail.active, cancelled: validDetail.cancelled };
+  const withoutTotal = structuredClone(validDetail); delete withoutTotal.invoice.invoiceTotalCents;
+  const stringTotal = structuredClone(validDetail); stringTotal.invoice.invoiceTotalCents = "11200";
+  const unsafeTotal = structuredClone(validDetail); unsafeTotal.invoice.invoiceTotalCents = Number.MAX_SAFE_INTEGER + 1;
+  const withoutItems = structuredClone(validDetail); delete withoutItems.active.items;
+  const incompleteItem = structuredClone(validDetail); incompleteItem.active.items = [{ description: "incompleto" }];
+  const unknownStatus = structuredClone(validDetail); unknownStatus.invoice.paymentStatus = "mystery";
+  const invalidPage = structuredClone(validDetail); invalidPage.active.page = 2;
+  const invalidInstallment = structuredClone(validDetail); invalidInstallment.active.items[0].installmentNumber = 2;
+  const invalidNull = structuredClone(validDetail); invalidNull.invoice.dueDate = null;
+  const invalidPayloads = [{}, withoutInvoice, withoutTotal, stringTotal, unsafeTotal, withoutItems, incompleteItem, unknownStatus, invalidPage, invalidInstallment, invalidNull];
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const payload of invalidPayloads) {
+      globalThis.fetch = async () => Response.json(payload);
+      await assert.rejects(loadInvoiceDetail(invoice.id, 1, 1, new AbortController().signal), error => error.status === 502 && /inválido/u.test(error.message));
+    }
+    globalThis.fetch = async () => Response.json(validDetail);
+    assert.deepEqual(await loadInvoiceDetail(invoice.id, 1, 1, new AbortController().signal), validDetail);
+    globalThis.fetch = async () => Response.json({ ...validDetail, invoice: { ...validDetail.invoice, id: "outra-invoice" } });
+    await assert.rejects(loadInvoiceDetail(invoice.id, 1, 1, new AbortController().signal), error => error.status === 502);
+  } finally { globalThis.fetch = originalFetch; }
 });
 test("nova compra mostra total600/pago500/restante100 apesar de status legado paid", () => {
   const html = renderInvoice(reopened);
@@ -272,7 +302,7 @@ function hookHarness(transport = async () => ({})) {
   const cards = compile(advanced);
   const root = compile(parent);
   return {
-    ...lifecycle, ...cards, ...root, ApiError, notifications,
+    ...invoiceDetail, ...lifecycle, ...cards, ...root, ApiError, notifications,
     store: () => ({ cursor: 0, values: [], effects: new Map(), queue: [], updates: 0 }),
     render(component, props, store) { current = store; store.cursor = 0; const tree = component(props); for (const effect of store.queue.splice(0)) effect(); return tree; },
     unmount(store) { for (const effect of store.effects.values()) effect.cleanup?.(); },
@@ -388,6 +418,43 @@ test("histórico real recarregado não oferece reversal de pagamento já reverti
   const h = hookHarness(async () => history), store = h.store(), props = { invoice: reopened, accounts, financial: financialFixture(), onChanged: async () => {} };
   control(h.render(h.InvoiceLifecycle, props, store), "Histórico de pagamentos").props.onClick(); h.render(h.InvoiceLifecycle, props, store); await flush();
   const tree = h.render(h.InvoiceLifecycle, props, store); assert.equal(control(tree, "Reverter pagamento"), undefined); assert.ok(text(tree).includes("Pagamento revertido"));
+});
+
+function detailResponse(summary, description) {
+  return {
+    invoice: { id: summary.id, cardId: summary.cardId, cardName: "Cartão de teste", referenceMonth: summary.referenceMonth, dueDate: summary.dueDate, closesOn: summary.closesOn, invoiceTotalCents: summary.invoiceTotalCents, paidCents: summary.paidCents, remainingCents: summary.remainingCents, cycleStatus: summary.cycleStatus, paymentStatus: summary.paymentStatus },
+    active: { items: [{ ...detailItem, installmentId: `item-${summary.id}`, purchaseId: `purchase-${summary.id}`, description }], page: 1, pageSize: 10, totalItems: 1, totalPages: 1, hasPreviousPage: false, hasNextPage: false },
+    cancelled: { items: [], page: 1, pageSize: 10, totalItems: 0, totalPages: 1, hasPreviousPage: false, hasNextPage: false },
+  };
+}
+
+test("detalhamento aborta invoice A e resposta antiga não sobrescreve invoice B", async () => {
+  const originalFetch = globalThis.fetch; const requests = [];
+  globalThis.fetch = (_url, options) => { const request = deferred(); requests.push({ ...request, signal: options.signal }); return request.promise.then(Response.json); };
+  try {
+    const h = hookHarness(), store = h.store(); const invoiceA = { ...invoice, id: "invoice-a" }; const invoiceB = { ...invoice, id: "invoice-b" };
+    h.render(h.InvoiceDetailDialog, { invoice: invoiceA, onClose() {} }, store);
+    h.render(h.InvoiceDetailDialog, { invoice: invoiceB, onClose() {} }, store);
+    assert.equal(requests.length, 2); assert.equal(requests[0].signal.aborted, true); assert.equal(requests[1].signal.aborted, false);
+    requests[1].resolve(detailResponse(invoiceB, "Resposta nova B")); await flush();
+    h.render(h.InvoiceDetailDialog, { invoice: invoiceB, onClose() {} }, store);
+    assert.equal(store.values[3].detail.active.items[0].description, "Resposta nova B"); assert.match(store.values[3].key, /^invoice-b:/u);
+    const updates = store.updates; requests[0].resolve(detailResponse(invoiceA, "Resposta antiga A")); await flush();
+    h.render(h.InvoiceDetailDialog, { invoice: invoiceB, onClose() {} }, store);
+    assert.equal(store.updates, updates); assert.equal(store.values[3].detail.active.items[0].description, "Resposta nova B"); assert.match(store.values[3].key, /^invoice-b:/u);
+    h.unmount(store);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("fechar detalhamento aborta request e não atualiza componente desmontado", async () => {
+  const originalFetch = globalThis.fetch; const request = deferred(); let signal;
+  globalThis.fetch = (_url, options) => { signal = options.signal; return request.promise.then(Response.json); };
+  try {
+    const h = hookHarness(), store = h.store(); h.render(h.InvoiceDetailDialog, { invoice, onClose() {} }, store);
+    h.unmount(store); assert.equal(signal.aborted, true); const updates = store.updates;
+    request.resolve(detailResponse(invoice, "Resposta depois do fechamento")); await flush();
+    assert.equal(store.updates, updates);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 const purchaseCategories = [

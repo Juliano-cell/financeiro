@@ -308,7 +308,69 @@ test("paginação é limitada e separada para itens ativos e cancelados", async 
   const first = await detail({ invoiceId: f.invoiceId, pageSize: 2 }); const second = await detail({ invoiceId: f.invoiceId, pageSize: 2, activePage: 2 });
   assert.equal(first.body.active.totalItems, 3); assert.equal(first.body.active.items.length, 2); assert.equal(first.body.active.hasNextPage, true);
   assert.equal(second.body.active.items.length, 1); assert.equal(second.body.active.hasPreviousPage, true); assert.equal(second.body.active.hasNextPage, false);
+  assert.equal((await detail({ invoiceId: f.invoiceId, activePage: 3, pageSize: 2 })).status, 400);
+  assert.equal((await detail({ invoiceId: f.invoiceId, activePage: 999, pageSize: 2 })).status, 400);
   assert.equal((await detail({ invoiceId: f.invoiceId, pageSize: 51 })).status, 400); assert.equal((await detail({ invoiceId: f.invoiceId, activePage: 0 })).status, 400);
+});
+
+test("detalhe vazio preserva a primeira página coerente e rejeita páginas posteriores", async t => {
+  const f = await setup(t);
+  f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("empty-invoice", "ha", "carda", "2027-01", "2027-01-25", "2027-01-17", "open", AT, AT);
+  const response = await detail({ invoiceId: "empty-invoice" });
+  assert.equal(response.status, 200);
+  for (const page of [response.body.active, response.body.cancelled]) {
+    assert.deepEqual(page, { items: [], page: 1, pageSize: 20, totalItems: 0, totalPages: 1, hasPreviousPage: false, hasNextPage: false });
+  }
+  assert.equal((await detail({ invoiceId: "empty-invoice", activePage: 2 })).status, 400);
+  assert.equal((await detail({ invoiceId: "empty-invoice", cancelledPage: 999 })).status, 400);
+});
+
+test("invoice somente com cancelados permanece histórica e paginada separadamente", async t => {
+  const f = await setup(t);
+  f.db.exec("UPDATE card_purchases SET status='cancelled'; UPDATE card_installments SET status='cancelled'");
+  const response = await detail({ invoiceId: f.invoiceId });
+  assert.equal(response.status, 200); assert.equal(response.body.invoice.invoiceTotalCents, 0);
+  assert.deepEqual([response.body.active.totalItems, response.body.active.totalPages, response.body.active.items.length], [0, 1, 0]);
+  assert.deepEqual([response.body.cancelled.totalItems, response.body.cancelled.totalPages, response.body.cancelled.items.length], [1, 1, 1]);
+  assert.equal(response.body.cancelled.items[0].includedInTotal, false);
+});
+
+test("detalhe pagina mais de cinquenta itens com descrição longa e classificação nula", async t => {
+  const f = await setup(t); const longDescription = `Descrição ${"muito longa ".repeat(80)}`;
+  const purchase = f.db.prepare("INSERT INTO card_purchases(id,household_id,card_id,description,total_cents,purchase_date,installment_count,category_id,subcategory_id,status,created_by_user_id,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+  const installment = f.db.prepare("INSERT INTO card_installments(id,household_id,purchase_id,invoice_id,installment_number,installment_count,amount_cents,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)");
+  for (let index = 0; index < 55; index++) {
+    const id = `bulk-${String(index).padStart(2, "0")}`; const description = index === 0 ? longDescription : `Compra ${index}`;
+    const createdAt = `2026-09-10T12:00:${String(index).padStart(2, "0")}Z`;
+    purchase.run(id, "ha", "carda", description, 100, "2026-09-10", 1, null, null, "active", "ua", "web", createdAt, createdAt);
+    installment.run(`installment-${id}`, "ha", id, f.invoiceId, 1, 1, 100, "pending", createdAt, createdAt);
+  }
+  const first = await detail({ invoiceId: f.invoiceId, pageSize: 50 }); const last = await detail({ invoiceId: f.invoiceId, pageSize: 50, activePage: 2 });
+  assert.equal(first.status, 200); assert.deepEqual([first.body.active.totalItems, first.body.active.totalPages, first.body.active.items.length], [56, 2, 50]);
+  assert.deepEqual([last.body.active.page, last.body.active.items.length, last.body.active.hasNextPage], [2, 6, false]);
+  const identifiers = [...first.body.active.items, ...last.body.active.items].map(item => item.installmentId);
+  assert.equal(new Set(identifiers).size, 56);
+  const nullable = first.body.active.items.find(item => item.description === longDescription);
+  assert.ok(nullable); assert.equal(nullable.categoryId, null); assert.equal(nullable.categoryName, null); assert.equal(nullable.subcategoryId, null); assert.equal(nullable.subcategoryName, null);
+  assert.equal((await detail({ invoiceId: f.invoiceId, pageSize: 50, activePage: 3 })).status, 400);
+  assert.equal((await detail({ invoiceId: f.invoiceId, pageSize: 50, activePage: 9999 })).status, 400);
+});
+
+test("relação entre purchase e invoice de cartões distintos falha fechada sem escrever", async t => {
+  const f = await setup(t); assert.equal((await detail({ invoiceId: f.invoiceId })).status, 200);
+  f.db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    .run("carda-two", "ha", "Segundo cartão", "Fixture", "Fixture", 500000, 17, 25, AT, AT);
+  f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("mismatched-invoice", "ha", "carda-two", "2026-09", "2026-09-25", "2026-09-17", "open", AT, AT);
+  f.db.prepare("UPDATE card_installments SET invoice_id=? WHERE household_id=? AND invoice_id=?").run("mismatched-invoice", "ha", f.invoiceId);
+  const tables = ["card_purchases", "card_invoices", "card_installments", "invoice_payments", "invoice_payment_operations", "transactions", "audit_logs"];
+  const before = tables.map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
+  const response = await detail({ invoiceId: "mismatched-invoice" });
+  assert.equal(response.status, 409); assert.equal(response.body.code, "INVOICE_DETAIL_INCONSISTENT");
+  assert.doesNotMatch(JSON.stringify(response.body), /carda|Segundo cartão|Fixture|50000|active|invoiceTotalCents/u);
+  const after = tables.map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
+  assert.deepEqual(after, before);
 });
 
 test("detalhe preserva estados quitado, parcial, aberto e legado", async t => {
