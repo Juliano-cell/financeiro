@@ -90,7 +90,8 @@ async function authorize(context: InvoiceContext) {
 
 // All decisive aggregates are scoped and repeated inside the write batch, not trusted from JS.
 const INVOICE_TOTALS_SELECT = `SELECT i.*,
-    COALESCE((SELECT SUM(s.amount_cents) FROM card_installments s WHERE s.household_id = i.household_id AND s.invoice_id = i.id AND s.status <> 'cancelled'), 0) AS invoice_total_cents,
+    COALESCE((SELECT SUM(s.amount_cents) FROM card_installments s WHERE s.household_id = i.household_id AND s.invoice_id = i.id AND s.status <> 'cancelled'), 0)
+      + COALESCE((SELECT SUM(a.amount_cents) FROM card_invoice_adjustments a WHERE a.household_id = i.household_id AND a.invoice_id = i.id AND a.status = 'active'), 0) AS invoice_total_cents,
     COALESCE((SELECT SUM(p.amount_cents) FROM invoice_payments p WHERE p.household_id = i.household_id AND p.invoice_id = i.id AND NOT EXISTS
       (SELECT 1 FROM invoice_payment_operations r WHERE r.household_id = p.household_id AND r.reversed_payment_id = p.id AND r.kind = 'reversal')), 0) AS paid_cents
   FROM card_invoices i`;

@@ -363,6 +363,9 @@ test("relação entre purchase e invoice de cartões distintos falha fechada sem
     .run("carda-two", "ha", "Segundo cartão", "Fixture", "Fixture", 500000, 17, 25, AT, AT);
   f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
     .run("mismatched-invoice", "ha", "carda-two", "2026-09", "2026-09-25", "2026-09-17", "open", AT, AT);
+  // Simula um banco legado/corrompido para manter a defesa em profundidade do endpoint;
+  // a migration 0006 bloqueia esta mutação em bancos normais.
+  f.db.exec("DROP TRIGGER card_installments_card_match_update");
   f.db.prepare("UPDATE card_installments SET invoice_id=? WHERE household_id=? AND invoice_id=?").run("mismatched-invoice", "ha", f.invoiceId);
   const tables = ["card_purchases", "card_invoices", "card_installments", "invoice_payments", "invoice_payment_operations", "transactions", "audit_logs"];
   const before = tables.map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());

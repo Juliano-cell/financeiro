@@ -88,6 +88,83 @@ export const cardInstallments = sqliteTable("card_installments", {
   id: text("id").primaryKey(), householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }), purchaseId: text("purchase_id").notNull(), invoiceId: text("invoice_id").notNull(), installmentNumber: integer("installment_number").notNull(), installmentCount: integer("installment_count").notNull(), amountCents: integer("amount_cents").notNull(), status: text("status", { enum: ["pending", "paid", "cancelled"] }).notNull().default("pending"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 }, (table) => [uniqueIndex("card_installments_purchase_number_unique").on(table.purchaseId, table.installmentNumber), index("idx_card_installments_household_invoice").on(table.householdId, table.invoiceId), check("card_installments_count_check", sql`${table.installmentCount} between 1 and 120`), check("card_installments_number_check", sql`${table.installmentNumber} between 1 and ${table.installmentCount}`), check("card_installments_amount_check", sql`${table.amountCents} > 0`), check("card_installments_status_check", sql`${table.status} in ('pending','paid','cancelled')`), foreignKey({ columns: [table.householdId, table.purchaseId], foreignColumns: [cardPurchases.householdId, cardPurchases.id], name: "card_installments_household_purchase_fk" }).onDelete("cascade"), foreignKey({ columns: [table.householdId, table.invoiceId], foreignColumns: [cardInvoices.householdId, cardInvoices.id], name: "card_installments_household_invoice_fk" })]);
 
+export const cardImportBatches = sqliteTable("card_import_batches", {
+  id: text("id").primaryKey(),
+  householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }),
+  cardId: text("card_id").notNull(),
+  createdByUserId: text("created_by_user_id").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  requestFingerprint: text("request_fingerprint").notNull(),
+  initialReferenceMonth: text("initial_reference_month").notNull(),
+  declaredInvoiceTotalCents: integer("declared_invoice_total_cents").notNull(),
+  openingBalanceCents: integer("opening_balance_cents").notNull(),
+  importedPurchaseCount: integer("imported_purchase_count").notNull(),
+  importedInstallmentCount: integer("imported_installment_count").notNull(),
+  status: text("status", { enum: ["pending", "completed", "voided"] }).notNull().default("pending"),
+  createdAt: text("created_at").notNull(),
+  completedAt: text("completed_at"),
+  voidedAt: text("voided_at"),
+}, (table) => [
+  unique("card_import_batches_household_id_unique").on(table.householdId, table.id),
+  uniqueIndex("card_import_batches_household_key_unique").on(table.householdId, table.idempotencyKey),
+  uniqueIndex("card_import_batches_active_card_unique").on(table.householdId, table.cardId).where(sql`${table.status} in ('pending','completed')`),
+  index("idx_card_import_batches_household_created").on(table.householdId, table.createdAt),
+  check("card_import_batches_identifiers_check", sql`length(trim(${table.id})) > 0 and length(trim(${table.householdId})) > 0 and length(trim(${table.cardId})) > 0 and length(trim(${table.createdByUserId})) > 0 and length(trim(${table.idempotencyKey})) > 0 and length(trim(${table.requestFingerprint})) > 0`),
+  check("card_import_batches_reference_month_check", sql`length(${table.initialReferenceMonth}) = 7 and ${table.initialReferenceMonth} glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]' and date(${table.initialReferenceMonth} || '-01', '+0 days') = ${table.initialReferenceMonth} || '-01'`),
+  check("card_import_batches_amounts_check", sql`typeof(${table.declaredInvoiceTotalCents}) = 'integer' and typeof(${table.openingBalanceCents}) = 'integer' and ${table.declaredInvoiceTotalCents} between 0 and 9007199254740991 and ${table.openingBalanceCents} between 0 and ${table.declaredInvoiceTotalCents}`),
+  check("card_import_batches_counts_check", sql`typeof(${table.importedPurchaseCount}) = 'integer' and ${table.importedPurchaseCount} between 0 and 50 and typeof(${table.importedInstallmentCount}) = 'integer' and ${table.importedInstallmentCount} between 0 and 120`),
+  check("card_import_batches_status_check", sql`${table.status} in ('pending','completed','voided')`),
+  check("card_import_batches_lifecycle_check", sql`(${table.status} = 'pending' and ${table.completedAt} is null and ${table.voidedAt} is null) or (${table.status} = 'completed' and ${table.completedAt} is not null and ${table.voidedAt} is null) or (${table.status} = 'voided' and ${table.completedAt} is not null and ${table.voidedAt} is not null)`),
+  foreignKey({ columns: [table.householdId, table.cardId], foreignColumns: [creditCards.householdId, creditCards.id], name: "card_import_batches_household_card_fk" }),
+  foreignKey({ columns: [table.householdId, table.createdByUserId], foreignColumns: [householdMembers.householdId, householdMembers.userId], name: "card_import_batches_household_creator_fk" }),
+]);
+
+export const cardPurchaseImportMetadata = sqliteTable("card_purchase_import_metadata", {
+  id: text("id").primaryKey(),
+  householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }),
+  purchaseId: text("purchase_id").notNull(),
+  importBatchId: text("import_batch_id").notNull(),
+  firstOriginalInstallmentNumber: integer("first_original_installment_number").notNull(),
+  originalInstallmentCount: integer("original_installment_count").notNull(),
+  originalTotalCents: integer("original_total_cents"),
+  originalPurchaseDate: text("original_purchase_date"),
+  importedAt: text("imported_at").notNull(),
+}, (table) => [
+  unique("card_purchase_import_metadata_household_id_unique").on(table.householdId, table.id),
+  unique("card_purchase_import_metadata_purchase_unique").on(table.householdId, table.purchaseId),
+  index("idx_card_purchase_import_metadata_batch").on(table.householdId, table.importBatchId),
+  check("card_purchase_import_metadata_numbers_check", sql`typeof(${table.firstOriginalInstallmentNumber}) = 'integer' and typeof(${table.originalInstallmentCount}) = 'integer' and ${table.firstOriginalInstallmentNumber} between 1 and ${table.originalInstallmentCount} and ${table.originalInstallmentCount} between 1 and 120`),
+  check("card_purchase_import_metadata_total_check", sql`${table.originalTotalCents} is null or (typeof(${table.originalTotalCents}) = 'integer' and ${table.originalTotalCents} between 1 and 9007199254740991)`),
+  check("card_purchase_import_metadata_date_check", sql`${table.originalPurchaseDate} is null or (length(${table.originalPurchaseDate}) = 10 and ${table.originalPurchaseDate} glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' and ${table.originalPurchaseDate} >= '0001-01-01' and date(${table.originalPurchaseDate}, '+0 days') = ${table.originalPurchaseDate})`),
+  foreignKey({ columns: [table.householdId, table.purchaseId], foreignColumns: [cardPurchases.householdId, cardPurchases.id], name: "card_purchase_import_metadata_household_purchase_fk" }),
+  foreignKey({ columns: [table.householdId, table.importBatchId], foreignColumns: [cardImportBatches.householdId, cardImportBatches.id], name: "card_purchase_import_metadata_household_batch_fk" }),
+]);
+
+export const cardInvoiceAdjustments = sqliteTable("card_invoice_adjustments", {
+  id: text("id").primaryKey(),
+  householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }),
+  invoiceId: text("invoice_id").notNull(),
+  importBatchId: text("import_batch_id").notNull(),
+  kind: text("kind", { enum: ["opening_balance"] }).notNull(),
+  amountCents: integer("amount_cents").notNull(),
+  status: text("status", { enum: ["active", "voided"] }).notNull().default("active"),
+  createdByUserId: text("created_by_user_id").notNull(),
+  createdAt: text("created_at").notNull(),
+  voidedAt: text("voided_at"),
+}, (table) => [
+  unique("card_invoice_adjustments_household_id_unique").on(table.householdId, table.id),
+  uniqueIndex("card_invoice_adjustments_active_opening_unique").on(table.householdId, table.invoiceId, table.kind).where(sql`${table.status} = 'active'`),
+  index("idx_card_invoice_adjustments_household_invoice").on(table.householdId, table.invoiceId, table.status),
+  index("idx_card_invoice_adjustments_batch").on(table.householdId, table.importBatchId),
+  check("card_invoice_adjustments_kind_check", sql`${table.kind} = 'opening_balance'`),
+  check("card_invoice_adjustments_amount_check", sql`typeof(${table.amountCents}) = 'integer' and ${table.amountCents} between 1 and 9007199254740991`),
+  check("card_invoice_adjustments_status_check", sql`${table.status} in ('active','voided')`),
+  check("card_invoice_adjustments_void_check", sql`(${table.status} = 'active' and ${table.voidedAt} is null) or (${table.status} = 'voided' and ${table.voidedAt} is not null)`),
+  foreignKey({ columns: [table.householdId, table.invoiceId], foreignColumns: [cardInvoices.householdId, cardInvoices.id], name: "card_invoice_adjustments_household_invoice_fk" }),
+  foreignKey({ columns: [table.householdId, table.importBatchId], foreignColumns: [cardImportBatches.householdId, cardImportBatches.id], name: "card_invoice_adjustments_household_batch_fk" }),
+  foreignKey({ columns: [table.householdId, table.createdByUserId], foreignColumns: [householdMembers.householdId, householdMembers.userId], name: "card_invoice_adjustments_household_creator_fk" }),
+]);
+
 // Unicode White_Space, Cc and Cf characters; char() chunks stay below 127 arguments.
 // NUL-only values also fail length(); do not put NUL in SQLite's trim character set.
 const invoiceLifecycleBlankCharacters = sql`char(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,173,1536,1537,1538,1539,1540,1541,1564,1757,1807,2192,2193,2274,5760,6158,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8203,8204,8205,8206) || char(8207,8232,8233,8234,8235,8236,8237,8238,8239,8287,8288,8289,8290,8291,8292,8294,8295,8296,8297,8298,8299,8300,8301,8302,8303,12288,65279,65529,65530,65531,69821,69837,78896,78897,78898,78899,78900,78901,78902,78903,78904,78905,78906,78907,78908,78909,78910,78911,113824,113825,113826,113827,119155,119156,119157,119158,119159,119160,119161,119162,917505,917536,917537,917538,917539,917540,917541,917542,917543,917544,917545,917546,917547,917548,917549,917550,917551,917552,917553,917554,917555,917556,917557,917558,917559,917560,917561,917562,917563,917564,917565,917566,917567,917568,917569,917570) || char(917571,917572,917573,917574,917575,917576,917577,917578,917579,917580,917581,917582,917583,917584,917585,917586,917587,917588,917589,917590,917591,917592,917593,917594,917595,917596,917597,917598,917599,917600,917601,917602,917603,917604,917605,917606,917607,917608,917609,917610,917611,917612,917613,917614,917615,917616,917617,917618,917619,917620,917621,917622,917623,917624,917625,917626,917627,917628,917629,917630,917631)`;
