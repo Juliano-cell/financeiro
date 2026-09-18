@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cycleStatusLabel, paymentStatusLabel } from "@/lib/invoice-ui-rules.mjs";
-import type { InvoiceDetailItem, InvoiceDetailPage, InvoiceDetailResponse } from "@/lib/invoice-detail-types";
+import type { InvoiceDetailAdjustment, InvoiceDetailItem, InvoiceDetailPage, InvoiceDetailResponse } from "@/lib/invoice-detail-types";
 
 const PAGE_SIZE = 10;
 const money = (value: number) => Number.isSafeInteger(value) ? new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value / 100) : "Valor indisponível";
@@ -52,8 +52,15 @@ function validPage(value: unknown, cancelled: boolean): value is InvoiceDetailPa
     && value.items.every((item) => validItem(item, cancelled));
 }
 
+function validAdjustment(value: unknown): value is InvoiceDetailAdjustment {
+  return record(value) && text(value.adjustmentId) && value.itemType === "opening_balance"
+    && value.description === "Saldo anterior à implantação" && safeInteger(value.amountCents, 1)
+    && value.status === "active" && value.includedInTotal === true;
+}
+
 export function parseInvoiceDetailPayload(value: unknown): InvoiceDetailResponse | null {
-  if (!record(value) || !record(value.invoice) || !validPage(value.active, false) || !validPage(value.cancelled, true)) return null;
+  if (!record(value) || !record(value.invoice) || !Array.isArray(value.adjustments)
+    || !value.adjustments.every(validAdjustment) || !validPage(value.active, false) || !validPage(value.cancelled, true)) return null;
   const invoice = value.invoice;
   if (!text(invoice.id) || !text(invoice.cardId) || !text(invoice.cardName) || !referenceMonth(invoice.referenceMonth)
     || !civilDate(invoice.dueDate) || !(invoice.closesOn === null || civilDate(invoice.closesOn))

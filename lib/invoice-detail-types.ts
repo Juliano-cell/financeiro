@@ -29,6 +29,15 @@ export type InvoiceDetailPage = {
   hasNextPage: boolean;
 };
 
+export type InvoiceDetailAdjustment = {
+  adjustmentId: string;
+  itemType: "opening_balance";
+  description: "Saldo anterior à implantação";
+  amountCents: number;
+  status: "active";
+  includedInTotal: true;
+};
+
 export type InvoiceDetailResponse = {
   invoice: {
     id: string;
@@ -43,6 +52,7 @@ export type InvoiceDetailResponse = {
     cycleStatus: "open" | "closed" | "unknown";
     paymentStatus: "unpaid" | "partial" | "settled";
   };
+  adjustments: InvoiceDetailAdjustment[];
   active: InvoiceDetailPage;
   cancelled: InvoiceDetailPage;
 };

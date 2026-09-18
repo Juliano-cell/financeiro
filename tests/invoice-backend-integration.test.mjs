@@ -270,6 +270,7 @@ test("detalhe lazy da invoice 1x retorna contrato tipado sem qualquer escrita", 
   const response = await detail({ invoiceId: f.invoiceId });
   assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "private, no-store");
   assert.deepEqual(response.body.invoice, { id: f.invoiceId, cardId: "carda", cardName: "Fixture", referenceMonth: "2026-09", dueDate: "2026-09-25", closesOn: "2026-09-17", invoiceTotalCents: 50000, paidCents: 0, remainingCents: 50000, cycleStatus: "closed", paymentStatus: "unpaid" });
+  assert.deepEqual(response.body.adjustments, []);
   assert.deepEqual(response.body.active.items.map(item => ({ number: item.installmentNumber, count: item.installmentCount, amount: item.installmentAmountCents, total: item.purchaseTotalCents, category: item.categoryName, subcategory: item.subcategoryName, status: item.status, included: item.includedInTotal })), [{ number: 1, count: 1, amount: 50000, total: 50000, category: "Fixture", subcategory: null, status: "pending", included: true }]);
   assert.equal(response.body.cancelled.totalItems, 0);
   const after = ["card_purchases", "card_invoices", "card_installments", "invoice_payments", "invoice_payment_operations", "transactions", "audit_logs"].map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());

@@ -66,7 +66,7 @@ test("componente real mostra total500/pago500/restante0, quitada e ciclo aberto"
 test("detalhamento mostra valor da parcela, numeração, classificação e cancelados separados", () => {
   const basePage = { page: 1, pageSize: 10, totalItems: 2, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
   const item = { installmentId: "i1", purchaseId: "p1", purchaseDate: "2026-09-18", description: "Internet", categoryId: "cat", categoryName: "Casa", subcategoryId: "sub", subcategoryName: "Internet", installmentAmountCents: 11200, installmentNumber: 1, installmentCount: 1, purchaseTotalCents: 11200, origin: "web", status: "pending", includedInTotal: true };
-  const detail = { invoice, active: { ...basePage, items: [item, { ...item, installmentId: "i2", description: "Celular", installmentAmountCents: 18000, installmentNumber: 2, installmentCount: 10, purchaseTotalCents: 180000, origin: "telegram" }] }, cancelled: { ...basePage, totalItems: 1, items: [{ ...item, installmentId: "cancelled", description: "Cancelada", status: "cancelled", includedInTotal: false }] } };
+  const detail = { invoice, adjustments: [], active: { ...basePage, items: [item, { ...item, installmentId: "i2", description: "Celular", installmentAmountCents: 18000, installmentNumber: 2, installmentCount: 10, purchaseTotalCents: 180000, origin: "telegram" }] }, cancelled: { ...basePage, totalItems: 1, items: [{ ...item, installmentId: "cancelled", description: "Cancelada", status: "cancelled", includedInTotal: false }] } };
   const html = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail, onActivePage() {}, onCancelledPage() {} }));
   for (const expected of ["Internet", "Casa / Internet", "Parcela 1/1", "R$ 112,00", "Celular", "Parcela 2/10", "R$ 180,00", "Valor original da compra: R$ 1.800,00", "Origem: Telegram", "Itens cancelados", "Cancelada", "Não incluído no total da fatura"]) assert.ok(html.includes(expected), expected);
   assert.equal((html.match(/R\$ 1\.800,00/gu) ?? []).length, 1);
@@ -83,7 +83,7 @@ test("detalhamento possui paginação responsiva sem householdId no cliente", ()
 
 const detailItem = { installmentId: "i1", purchaseId: "p1", purchaseDate: "2026-09-18", description: "Internet", categoryId: "cat", categoryName: "Casa", subcategoryId: null, subcategoryName: null, installmentAmountCents: 11200, installmentNumber: 1, installmentCount: 1, purchaseTotalCents: 11200, origin: "web", status: "pending", includedInTotal: true };
 const detailPage = { items: [detailItem], page: 1, pageSize: 10, totalItems: 1, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
-const validDetail = { invoice: { ...invoice, cardName: "Cartão de teste" }, active: detailPage, cancelled: { items: [], page: 1, pageSize: 10, totalItems: 0, totalPages: 1, hasPreviousPage: false, hasNextPage: false } };
+const validDetail = { invoice: { ...invoice, cardName: "Cartão de teste" }, adjustments: [], active: detailPage, cancelled: { items: [], page: 1, pageSize: 10, totalItems: 0, totalPages: 1, hasPreviousPage: false, hasNextPage: false } };
 
 test("validação runtime aceita contrato válido e rejeita estruturas financeiras incompletas", async () => {
   assert.deepEqual(parseInvoiceDetailPayload(validDetail), validDetail);
@@ -97,7 +97,9 @@ test("validação runtime aceita contrato válido e rejeita estruturas financeir
   const invalidPage = structuredClone(validDetail); invalidPage.active.page = 2;
   const invalidInstallment = structuredClone(validDetail); invalidInstallment.active.items[0].installmentNumber = 2;
   const invalidNull = structuredClone(validDetail); invalidNull.invoice.dueDate = null;
-  const invalidPayloads = [{}, withoutInvoice, withoutTotal, stringTotal, unsafeTotal, withoutItems, incompleteItem, unknownStatus, invalidPage, invalidInstallment, invalidNull];
+  const withoutAdjustments = structuredClone(validDetail); delete withoutAdjustments.adjustments;
+  const invalidAdjustment = structuredClone(validDetail); invalidAdjustment.adjustments = [{ adjustmentId: "a", itemType: "purchase", description: "Saldo anterior à implantação", amountCents: 100, status: "active", includedInTotal: true }];
+  const invalidPayloads = [{}, withoutInvoice, withoutTotal, stringTotal, unsafeTotal, withoutItems, incompleteItem, unknownStatus, invalidPage, invalidInstallment, invalidNull, withoutAdjustments, invalidAdjustment];
   const originalFetch = globalThis.fetch;
   try {
     for (const payload of invalidPayloads) {
@@ -423,6 +425,7 @@ test("histórico real recarregado não oferece reversal de pagamento já reverti
 function detailResponse(summary, description) {
   return {
     invoice: { id: summary.id, cardId: summary.cardId, cardName: "Cartão de teste", referenceMonth: summary.referenceMonth, dueDate: summary.dueDate, closesOn: summary.closesOn, invoiceTotalCents: summary.invoiceTotalCents, paidCents: summary.paidCents, remainingCents: summary.remainingCents, cycleStatus: summary.cycleStatus, paymentStatus: summary.paymentStatus },
+    adjustments: [],
     active: { items: [{ ...detailItem, installmentId: `item-${summary.id}`, purchaseId: `purchase-${summary.id}`, description }], page: 1, pageSize: 10, totalItems: 1, totalPages: 1, hasPreviousPage: false, hasNextPage: false },
     cancelled: { items: [], page: 1, pageSize: 10, totalItems: 0, totalPages: 1, hasPreviousPage: false, hasNextPage: false },
   };

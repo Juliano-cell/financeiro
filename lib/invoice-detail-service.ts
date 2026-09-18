@@ -1,5 +1,5 @@
 import { getInvoiceState, InvoiceServiceError, type InvoiceContext } from "./invoice-service";
-import type { InvoiceDetailItem, InvoiceDetailPage, InvoiceDetailResponse } from "./invoice-detail-types";
+import type { InvoiceDetailAdjustment, InvoiceDetailItem, InvoiceDetailPage, InvoiceDetailResponse } from "./invoice-detail-types";
 
 export const INVOICE_DETAIL_DEFAULT_PAGE_SIZE = 20;
 export const INVOICE_DETAIL_MAX_PAGE_SIZE = 50;
@@ -27,6 +27,13 @@ type DetailRow = {
   purchase_total_cents: number;
   origin: "web" | "telegram" | "system";
   status: "pending" | "paid" | "cancelled";
+};
+
+type AdjustmentRow = {
+  adjustment_id: string;
+  kind: "opening_balance";
+  amount_cents: number;
+  status: "active";
 };
 
 function validIdentifier(value: unknown): value is string {
@@ -65,6 +72,21 @@ function item(row: DetailRow): InvoiceDetailItem {
     origin: row.origin,
     status: row.status,
     includedInTotal,
+  };
+}
+
+function adjustment(row: AdjustmentRow): InvoiceDetailAdjustment {
+  if (!validIdentifier(row.adjustment_id) || row.kind !== "opening_balance" || row.status !== "active"
+    || !Number.isSafeInteger(row.amount_cents) || row.amount_cents <= 0) {
+    throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
+  }
+  return {
+    adjustmentId: row.adjustment_id,
+    itemType: "opening_balance",
+    description: "Saldo anterior à implantação",
+    amountCents: row.amount_cents,
+    status: "active",
+    includedInTotal: true,
   };
 }
 
@@ -132,13 +154,14 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
   const counts = await context.d1.prepare(`SELECT
       SUM(CASE WHEN status <> 'cancelled' THEN 1 ELSE 0 END) AS active_count,
       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+      SUM(CASE WHEN status <> 'cancelled' THEN amount_cents ELSE 0 END) AS active_total_cents,
       SUM(CASE WHEN EXISTS (
         SELECT 1 FROM card_purchases p INNER JOIN card_invoices i
           ON i.household_id = card_installments.household_id AND i.id = card_installments.invoice_id
         WHERE p.household_id = card_installments.household_id AND p.id = card_installments.purchase_id
           AND p.card_id = i.card_id
       ) THEN 0 ELSE 1 END) AS invalid_relation_count
-    FROM card_installments WHERE household_id = ? AND invoice_id = ?`).bind(context.householdId, parsed.invoiceId).first<{ active_count: number | null; cancelled_count: number | null; invalid_relation_count: number | null }>();
+    FROM card_installments WHERE household_id = ? AND invoice_id = ?`).bind(context.householdId, parsed.invoiceId).first<{ active_count: number | null; cancelled_count: number | null; active_total_cents: number | null; invalid_relation_count: number | null }>();
   if ((counts?.invalid_relation_count ?? 0) > 0) {
     throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
   }
@@ -149,12 +172,22 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
   const activeOffset = (parsed.activePage - 1) * parsed.pageSize;
   const cancelledOffset = (parsed.cancelledPage - 1) * parsed.pageSize;
 
-  const [activeRows, cancelledRows] = await Promise.all([
+  const [activeRows, cancelledRows, adjustmentRows] = await Promise.all([
     context.d1.prepare(`${ITEM_SELECT} AND s.status <> 'cancelled'${ITEM_ORDER}`).bind(context.householdId, parsed.invoiceId, parsed.pageSize, activeOffset).all<DetailRow>(),
     context.d1.prepare(`${ITEM_SELECT} AND s.status = 'cancelled'${ITEM_ORDER}`).bind(context.householdId, parsed.invoiceId, parsed.pageSize, cancelledOffset).all<DetailRow>(),
+    context.d1.prepare(`SELECT id AS adjustment_id, kind, amount_cents, status
+      FROM card_invoice_adjustments
+      WHERE household_id = ? AND invoice_id = ? AND status = 'active'
+      ORDER BY created_at, id`).bind(context.householdId, parsed.invoiceId).all<AdjustmentRow>(),
   ]);
   if (activeRows.results.length !== expectedPageItems(parsed.activePage, parsed.pageSize, activeCount)
     || cancelledRows.results.length !== expectedPageItems(parsed.cancelledPage, parsed.pageSize, cancelledCount)) {
+    throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
+  }
+  const adjustments = adjustmentRows.results.map(adjustment);
+  const componentTotalCents = (counts?.active_total_cents ?? 0)
+    + adjustments.reduce((sum, row) => sum + row.amountCents, 0);
+  if (!Number.isSafeInteger(componentTotalCents) || componentTotalCents !== state.invoiceTotalCents) {
     throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
   }
 
@@ -172,6 +205,7 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
       cycleStatus: state.cycleStatus,
       paymentStatus: state.paymentStatus,
     },
+    adjustments,
     active: page(activeRows.results, parsed.activePage, parsed.pageSize, activeCount),
     cancelled: page(cancelledRows.results, parsed.cancelledPage, parsed.pageSize, cancelledCount),
   };

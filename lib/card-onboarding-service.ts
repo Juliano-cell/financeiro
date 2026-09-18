@@ -471,7 +471,7 @@ export async function configureCardCurrentState(input: ConfigureCardCurrentState
       return resultFromReceipt(raced, context, true);
     }
     const message = error instanceof Error ? error.message : String(error);
-    if (/card_import_batches_active_card_unique|UNIQUE constraint failed: card_import_batches\.household_id, card_import_batches\.card_id/iu.test(message)) {
+    if (/card import batch financial identity cannot be replaced|card_import_batches_active_card_unique|UNIQUE constraint failed: card_import_batches\.household_id, card_import_batches\.card_id/iu.test(message)) {
       throw new CardOnboardingError("Este cartão já possui uma importação inicial.", 409, "CARD_ONBOARDING_ALREADY_IMPORTED");
     }
     if (/FOREIGN KEY constraint failed|card import|card installment purchase and invoice|NOT NULL constraint failed: card_import_batches\.status/iu.test(message)) {

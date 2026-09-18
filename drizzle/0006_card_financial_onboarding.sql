@@ -153,6 +153,88 @@ CREATE INDEX `idx_card_invoice_adjustments_batch`
   ON `card_invoice_adjustments` (`household_id`,`import_batch_id`);
 --> statement-breakpoint
 
+-- SQLite implements INSERT OR REPLACE as a conflicting-row deletion followed by
+-- an insert. Guard existing financial identities before that implicit deletion,
+-- because UPDATE/DELETE triggers alone do not make REPLACE immutable.
+CREATE TRIGGER `card_purchases_financial_identity_insert`
+BEFORE INSERT ON `card_purchases`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM `card_purchases` current WHERE current.`id` = NEW.`id`
+) BEGIN SELECT RAISE(ABORT, 'card purchase financial identity cannot be replaced'); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_invoices_financial_identity_insert`
+BEFORE INSERT ON `card_invoices`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM `card_invoices` current WHERE current.`id` = NEW.`id`
+) BEGIN SELECT RAISE(ABORT, 'card invoice financial identity cannot be replaced'); END;
+--> statement-breakpoint
+-- Preserve the existing createCardPurchase ON CONFLICT reuse semantics while
+-- preventing REPLACE with a new id from deleting an invoice for the same cycle.
+CREATE TRIGGER `card_invoices_cycle_collision_insert`
+BEFORE INSERT ON `card_invoices`
+FOR EACH ROW WHEN
+  NOT EXISTS (SELECT 1 FROM `card_invoices` current WHERE current.`id` = NEW.`id`)
+  AND EXISTS (
+    SELECT 1 FROM `card_invoices` current
+    WHERE current.`household_id` = NEW.`household_id`
+      AND current.`card_id` = NEW.`card_id`
+      AND current.`reference_month` = NEW.`reference_month`
+  )
+BEGIN SELECT RAISE(IGNORE); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_installments_financial_identity_insert`
+BEFORE INSERT ON `card_installments`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM `card_installments` current
+  WHERE current.`id` = NEW.`id`
+    OR (current.`purchase_id` = NEW.`purchase_id`
+      AND current.`installment_number` = NEW.`installment_number`)
+) BEGIN SELECT RAISE(ABORT, 'card installment financial identity cannot be replaced'); END;
+--> statement-breakpoint
+
+CREATE TRIGGER `card_import_batches_financial_identity_insert`
+BEFORE INSERT ON `card_import_batches`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM `card_import_batches` current
+  WHERE current.`id` = NEW.`id`
+    OR (current.`household_id` = NEW.`household_id`
+      AND current.`idempotency_key` = NEW.`idempotency_key`)
+    OR (NEW.`status` IN ('pending','completed')
+      AND current.`household_id` = NEW.`household_id`
+      AND current.`card_id` = NEW.`card_id`
+      AND current.`status` IN ('pending','completed'))
+) BEGIN SELECT RAISE(ABORT, 'card import batch financial identity cannot be replaced'); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_import_batches_pending_insert`
+BEFORE INSERT ON `card_import_batches`
+FOR EACH ROW WHEN NEW.`status` <> 'pending' OR NEW.`completed_at` IS NOT NULL OR NEW.`voided_at` IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'card import batch must start pending'); END;
+--> statement-breakpoint
+
+CREATE TRIGGER `card_purchase_import_metadata_financial_identity_insert`
+BEFORE INSERT ON `card_purchase_import_metadata`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM `card_purchase_import_metadata` current
+  WHERE current.`id` = NEW.`id`
+    OR (current.`household_id` = NEW.`household_id`
+      AND current.`purchase_id` = NEW.`purchase_id`)
+) BEGIN SELECT RAISE(ABORT, 'card import metadata financial identity cannot be replaced'); END;
+--> statement-breakpoint
+
+CREATE TRIGGER `card_invoice_adjustments_financial_identity_insert`
+BEFORE INSERT ON `card_invoice_adjustments`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM `card_invoice_adjustments` current
+  WHERE current.`id` = NEW.`id`
+    OR (current.`household_id` = NEW.`household_id`
+      AND current.`invoice_id` = NEW.`invoice_id`
+      AND current.`kind` = NEW.`kind`)
+    OR (current.`household_id` = NEW.`household_id`
+      AND current.`import_batch_id` = NEW.`import_batch_id`
+      AND current.`kind` = NEW.`kind`)
+) BEGIN SELECT RAISE(ABORT, 'card invoice adjustment financial identity cannot be replaced'); END;
+--> statement-breakpoint
+
 CREATE TRIGGER `card_purchase_import_metadata_relations_insert`
 BEFORE INSERT ON `card_purchase_import_metadata`
 FOR EACH ROW WHEN NOT EXISTS (
@@ -164,7 +246,7 @@ FOR EACH ROW WHEN NOT EXISTS (
     AND p.`card_id` = b.`card_id` AND p.`origin` = 'system'
     AND p.`created_by_user_id` = b.`created_by_user_id`
     AND p.`installment_count` = NEW.`original_installment_count` - NEW.`first_original_installment_number` + 1
-    AND b.`status` IN ('pending','completed')
+    AND b.`status` = 'pending'
 ) BEGIN SELECT RAISE(ABORT, 'card import metadata does not match purchase and batch'); END;
 --> statement-breakpoint
 CREATE TRIGGER `card_purchase_import_metadata_immutable_update`
@@ -186,7 +268,9 @@ FOR EACH ROW WHEN NOT EXISTS (
   WHERE i.`household_id` = NEW.`household_id` AND i.`id` = NEW.`invoice_id`
     AND i.`card_id` = b.`card_id` AND i.`reference_month` = b.`initial_reference_month`
     AND NEW.`created_by_user_id` = b.`created_by_user_id`
-    AND b.`status` IN ('pending','completed')
+    AND NEW.`amount_cents` = b.`opening_balance_cents`
+    AND NEW.`status` = 'active' AND NEW.`voided_at` IS NULL
+    AND b.`status` = 'pending'
 ) BEGIN SELECT RAISE(ABORT, 'card invoice adjustment does not match invoice and batch'); END;
 --> statement-breakpoint
 CREATE TRIGGER `card_invoice_adjustments_identity_update`
@@ -223,6 +307,12 @@ FOR EACH ROW WHEN OLD.`status` = 'active' AND NEW.`status` = 'voided' AND (
     AND a.`status` = 'active' AND a.`id` <> OLD.`id`
 ) BEGIN SELECT RAISE(ABORT, 'card invoice adjustment cannot be voided below active payments'); END;
 --> statement-breakpoint
+CREATE TRIGGER `card_invoice_adjustments_voided_immutable_update`
+BEFORE UPDATE OF `status`,`voided_at` ON `card_invoice_adjustments`
+FOR EACH ROW WHEN OLD.`status` = 'voided' AND (
+  NEW.`status` IS NOT OLD.`status` OR NEW.`voided_at` IS NOT OLD.`voided_at`
+) BEGIN SELECT RAISE(ABORT, 'voided card invoice adjustment cannot be changed'); END;
+--> statement-breakpoint
 CREATE TRIGGER `card_invoice_adjustments_delete`
 BEFORE DELETE ON `card_invoice_adjustments`
 FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'card invoice adjustment cannot be deleted'); END;
@@ -244,6 +334,52 @@ FOR EACH ROW WHEN
   OR NEW.`imported_installment_count` IS NOT OLD.`imported_installment_count`
   OR NEW.`created_at` IS NOT OLD.`created_at`
 BEGIN SELECT RAISE(ABORT, 'card import batch financial identity is immutable'); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_import_batches_completion_update`
+BEFORE UPDATE OF `status`,`completed_at`,`voided_at` ON `card_import_batches`
+FOR EACH ROW WHEN OLD.`status` = 'pending' AND NEW.`status` = 'completed' AND (
+  NOT EXISTS (
+    SELECT 1 FROM `household_members` m
+    WHERE m.`household_id` = NEW.`household_id`
+      AND m.`user_id` = NEW.`created_by_user_id` AND m.`status` = 'active'
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM `credit_cards` c
+    WHERE c.`household_id` = NEW.`household_id`
+      AND c.`id` = NEW.`card_id` AND c.`is_active` = 1
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM `card_invoices` i
+    WHERE i.`household_id` = NEW.`household_id` AND i.`card_id` = NEW.`card_id`
+      AND i.`reference_month` = NEW.`initial_reference_month`
+  )
+  OR (SELECT COUNT(*) FROM `card_purchase_import_metadata` m
+    WHERE m.`household_id` = NEW.`household_id` AND m.`import_batch_id` = NEW.`id`)
+      <> NEW.`imported_purchase_count`
+  OR (SELECT COUNT(*) FROM `card_installments` s
+    INNER JOIN `card_purchases` p
+      ON p.`household_id` = s.`household_id` AND p.`id` = s.`purchase_id`
+    INNER JOIN `card_purchase_import_metadata` m
+      ON m.`household_id` = p.`household_id` AND m.`purchase_id` = p.`id`
+      AND m.`import_batch_id` = NEW.`id`
+    WHERE s.`household_id` = NEW.`household_id`) <> NEW.`imported_installment_count`
+  OR COALESCE((
+    SELECT SUM(a.`amount_cents`) FROM `card_invoice_adjustments` a
+    WHERE a.`household_id` = NEW.`household_id` AND a.`import_batch_id` = NEW.`id`
+      AND a.`kind` = 'opening_balance' AND a.`status` = 'active'
+  ), 0) <> NEW.`opening_balance_cents`
+  OR NOT EXISTS (
+    SELECT 1 FROM `card_invoices` i
+    WHERE i.`household_id` = NEW.`household_id` AND i.`card_id` = NEW.`card_id`
+      AND i.`reference_month` = NEW.`initial_reference_month`
+      AND COALESCE((SELECT SUM(s.`amount_cents`) FROM `card_installments` s
+        WHERE s.`household_id` = i.`household_id` AND s.`invoice_id` = i.`id`
+          AND s.`status` <> 'cancelled'), 0)
+        + COALESCE((SELECT SUM(a.`amount_cents`) FROM `card_invoice_adjustments` a
+          WHERE a.`household_id` = i.`household_id` AND a.`invoice_id` = i.`id`
+            AND a.`status` = 'active'), 0) = NEW.`declared_invoice_total_cents`
+  )
+) BEGIN SELECT RAISE(ABORT, 'card import batch cannot complete with inconsistent financial facts'); END;
 --> statement-breakpoint
 CREATE TRIGGER `card_import_batches_completed_status_update`
 BEFORE UPDATE OF `status`,`completed_at`,`voided_at` ON `card_import_batches`

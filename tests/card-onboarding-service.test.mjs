@@ -48,13 +48,17 @@ class LocalStatement {
 }
 
 class LocalD1 {
-  constructor(db) { this.db = db; this.beforeBatch = null; }
+  constructor(db) { this.db = db; this.beforeBatch = null; this.beforeStatement = null; }
   prepare(sql) { return new LocalStatement(this.db, sql); }
   async batch(statements) {
     if (this.beforeBatch) { const hook = this.beforeBatch; this.beforeBatch = null; await hook(); }
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const result = statements.map((statement) => statement.runSync());
+      const result = [];
+      for (let index = 0; index < statements.length; index += 1) {
+        if (this.beforeStatement) this.beforeStatement(statements[index], index);
+        result.push(statements[index].runSync());
+      }
       this.db.exec("COMMIT");
       return result;
     } catch (error) {
@@ -163,6 +167,19 @@ test("R$ 1.400 com parcela atual de R$ 100 cria opening de R$ 1.300, nunca R$ 1.
   assert.equal((await getInvoiceState(result.invoiceId, f.context)).invoiceTotalCents, 140000);
   assert.equal(f.db.prepare("SELECT SUM(amount_cents) n FROM card_invoice_adjustments").get().n, 130000);
   assert.equal(f.db.prepare("SELECT SUM(amount_cents) n FROM card_installments WHERE invoice_id=?").get(result.invoiceId).n, 10000);
+});
+
+test("R$ 1.400 com parcelas atuais de R$ 100 e R$ 200 cria opening de R$ 1.100", async (t) => {
+  const f = setup(t);
+  const commitments = [
+    { ...importedCommitment, description: "Parcela 100", firstOriginalInstallmentNumber: 10, installmentAmountCents: 10000 },
+    { ...importedCommitment, description: "Parcela 200", firstOriginalInstallmentNumber: 10, installmentAmountCents: 20000, originalTotalCents: 200000 },
+  ];
+  const result = await configureCardCurrentState({ ...openingOnly, idempotencyKey: "two-current-parts", commitments }, f.context);
+  assert.equal(result.openingBalanceCents, 110000);
+  assert.equal((await getInvoiceState(result.invoiceId, f.context)).invoiceTotalCents, 140000);
+  assert.equal(f.db.prepare("SELECT SUM(amount_cents) n FROM card_installments WHERE invoice_id=?").get(result.invoiceId).n, 30000);
+  assert.equal(f.db.prepare("SELECT SUM(amount_cents) n FROM card_invoice_adjustments").get().n, 110000);
 });
 
 test("opening zero não cria adjustment e total permanece canônico", async (t) => {
@@ -327,6 +344,29 @@ test("falha tardia de auditoria e invoice concorrente revertem integralmente", a
   assert.equal(third.db.prepare("SELECT COUNT(*) n FROM card_purchases WHERE origin='system'").get().n, 0);
 });
 
+for (const failure of [
+  { name: "segunda installment", needle: "INSERT INTO card_installments", occurrence: 2 },
+  { name: "metadata", needle: "INSERT INTO card_purchase_import_metadata", occurrence: 1 },
+  { name: "adjustment", needle: "INSERT INTO card_invoice_adjustments", occurrence: 1 },
+  { name: "auditoria final", needle: "INSERT INTO audit_logs", occurrence: 1 },
+]) test(`falha intermediária na ${failure.name} reverte integralmente o onboarding`, async (t) => {
+  const f = setup(t);
+  const before = counts(f.db);
+  let seen = 0;
+  f.d1.beforeStatement = (statement) => {
+    if (statement.sql.includes(failure.needle)) {
+      seen += 1;
+      if (seen === failure.occurrence) throw new Error(`forced ${failure.name} failure`);
+    }
+  };
+  await assert.rejects(
+    configureCardCurrentState({ ...openingOnly, idempotencyKey: `atomic-${failure.needle.length}-${failure.occurrence}`, commitments: [importedCommitment] }, f.context),
+    new RegExp(`forced ${failure.name} failure`, "u"),
+  );
+  assert.equal(seen, failure.occurrence);
+  assert.deepEqual(counts(f.db), before);
+});
+
 test("detalhe read-only e invoices legadas sem adjustment permanecem coerentes", async (t) => {
   const f = setup(t);
   const imported = await configureCardCurrentState({ ...openingOnly, idempotencyKey: "detail", commitments: [importedCommitment] }, f.context);
@@ -334,6 +374,8 @@ test("detalhe read-only e invoices legadas sem adjustment permanecem coerentes",
   assert.equal(detail.invoice.invoiceTotalCents, 140000);
   assert.equal(detail.active.items.length, 1);
   assert.equal(detail.active.items[0].installmentAmountCents, 10000);
+  assert.deepEqual(detail.adjustments, [{ adjustmentId: detail.adjustments[0].adjustmentId, itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 130000, status: "active", includedInTotal: true }]);
+  assert.equal(detail.active.items.reduce((sum, item) => sum + item.installmentAmountCents, 0) + detail.adjustments.reduce((sum, item) => sum + item.amountCents, 0), detail.invoice.invoiceTotalCents);
 
   seedHousehold(f.db, "legacy");
   f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?)").run("legacy-invoice", "hlegacy", "card-legacy", "2026-10", "2026-10-12", "2026-10-05", "open", AT, AT);
@@ -341,6 +383,7 @@ test("detalhe read-only e invoices legadas sem adjustment permanecem coerentes",
   f.db.prepare("INSERT INTO card_installments(id,household_id,purchase_id,invoice_id,installment_number,installment_count,amount_cents,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run("legacy-part", "hlegacy", "legacy-purchase", "legacy-invoice", 1, 1, 50000, "pending", AT, AT);
   const legacyContext = { d1: f.d1, householdId: "hlegacy", userId: "ulegacy", timestamp: AT };
   assert.equal((await getInvoiceState("legacy-invoice", legacyContext)).invoiceTotalCents, 50000);
+  assert.deepEqual((await getInvoiceDetail({ invoiceId: "legacy-invoice" }, legacyContext)).adjustments, []);
 });
 
 test("pagamento parcial, quitação posterior e reversão preservam lifecycle", async (t) => {
