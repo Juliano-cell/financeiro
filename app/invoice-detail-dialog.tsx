@@ -101,6 +101,18 @@ function Item({ item }: { item: InvoiceDetailItem }) {
   </li>;
 }
 
+function Adjustment({ adjustment }: { adjustment: InvoiceDetailAdjustment }) {
+  return <li className="min-w-0 rounded-xl border border-[#d8e5e1] bg-[#f6faf8] p-3">
+    <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+      <div className="min-w-0">
+        <p className="break-words font-medium">{adjustment.description}</p>
+        <p className="mt-1 text-xs text-[#52645f]">Saldo inicial da fatura</p>
+      </div>
+      <strong className="shrink-0 text-base">{money(adjustment.amountCents)}</strong>
+    </div>
+  </li>;
+}
+
 function PageControls({ value, onChange }: { value: InvoiceDetailPage; onChange: (page: number) => void }) {
   if (value.totalPages <= 1) return null;
   return <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm">
@@ -110,9 +122,11 @@ function PageControls({ value, onChange }: { value: InvoiceDetailPage; onChange:
 }
 
 export function InvoiceDetailItems({ detail, onActivePage, onCancelledPage }: { detail: InvoiceDetailResponse; onActivePage: (page: number) => void; onCancelledPage: (page: number) => void }) {
+  const activeComponentCount = detail.active.totalItems + detail.adjustments.length;
   return <div className="grid gap-5">
-    <section aria-labelledby="active-invoice-items"><div className="flex flex-wrap items-center justify-between gap-2"><h3 id="active-invoice-items" className="font-semibold">Itens da fatura</h3><span className="text-sm text-[#71837e]">{detail.active.totalItems} item(ns)</span></div>
-      {detail.active.items.length ? <ul className="mt-3 grid gap-3">{detail.active.items.map((item) => <Item key={item.installmentId} item={item} />)}</ul> : <p className="mt-3 rounded-xl bg-[#f6f8f7] p-4 text-sm text-[#71837e]">Nenhum item ativo nesta fatura.</p>}
+    <section aria-labelledby="active-invoice-items"><div className="flex flex-wrap items-center justify-between gap-2"><h3 id="active-invoice-items" className="font-semibold">Itens da fatura</h3><span className="text-sm text-[#71837e]">{activeComponentCount} item(ns)</span></div>
+      {detail.adjustments.length > 0 && <ul className="mt-3 grid gap-3">{detail.adjustments.map((adjustment) => <Adjustment key={adjustment.adjustmentId} adjustment={adjustment} />)}</ul>}
+      {detail.active.items.length ? <ul className="mt-3 grid gap-3">{detail.active.items.map((item) => <Item key={item.installmentId} item={item} />)}</ul> : detail.adjustments.length === 0 ? <p className="mt-3 rounded-xl bg-[#f6f8f7] p-4 text-sm text-[#71837e]">Nenhum item ativo nesta fatura.</p> : null}
       <PageControls value={detail.active} onChange={onActivePage} />
     </section>
     {detail.cancelled.totalItems > 0 && <section aria-labelledby="cancelled-invoice-items" className="border-t pt-5"><div className="flex flex-wrap items-center justify-between gap-2"><h3 id="cancelled-invoice-items" className="font-semibold">Itens cancelados</h3><Badge variant="outline">Fora do total</Badge></div>

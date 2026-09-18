@@ -286,6 +286,16 @@ FOR EACH ROW WHEN
   OR NEW.`created_at` IS NOT OLD.`created_at`
 BEGIN SELECT RAISE(ABORT, 'card invoice adjustment financial identity is immutable'); END;
 --> statement-breakpoint
+CREATE TRIGGER `card_invoice_adjustments_completed_batch_update`
+BEFORE UPDATE ON `card_invoice_adjustments`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1 FROM `card_import_batches` b
+  WHERE b.`household_id` = OLD.`household_id`
+    AND b.`id` = OLD.`import_batch_id`
+    AND b.`status` = 'completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed card import adjustment cannot be changed'); END;
+--> statement-breakpoint
 CREATE TRIGGER `card_invoice_adjustments_safe_void_update`
 BEFORE UPDATE OF `status`,`voided_at` ON `card_invoice_adjustments`
 FOR EACH ROW WHEN OLD.`status` = 'active' AND NEW.`status` = 'voided' AND (
@@ -363,6 +373,27 @@ FOR EACH ROW WHEN OLD.`status` = 'pending' AND NEW.`status` = 'completed' AND (
       ON m.`household_id` = p.`household_id` AND m.`purchase_id` = p.`id`
       AND m.`import_batch_id` = NEW.`id`
     WHERE s.`household_id` = NEW.`household_id`) <> NEW.`imported_installment_count`
+  OR EXISTS (
+    SELECT 1
+    FROM `card_purchase_import_metadata` m
+    INNER JOIN `card_purchases` p
+      ON p.`household_id` = m.`household_id` AND p.`id` = m.`purchase_id`
+    WHERE m.`household_id` = NEW.`household_id` AND m.`import_batch_id` = NEW.`id`
+      AND (p.`card_id` IS NOT NEW.`card_id`
+        OR p.`created_by_user_id` IS NOT NEW.`created_by_user_id`
+        OR p.`origin` <> 'system'
+        OR p.`installment_count` <> m.`original_installment_count` - m.`first_original_installment_number` + 1)
+  )
+  OR (NEW.`opening_balance_cents` > 0 AND (
+    SELECT COUNT(*) FROM `card_invoice_adjustments` a
+    WHERE a.`household_id` = NEW.`household_id` AND a.`import_batch_id` = NEW.`id`
+      AND a.`kind` = 'opening_balance' AND a.`status` = 'active'
+      AND a.`amount_cents` = NEW.`opening_balance_cents`
+  ) <> 1)
+  OR (NEW.`opening_balance_cents` = 0 AND EXISTS (
+    SELECT 1 FROM `card_invoice_adjustments` a
+    WHERE a.`household_id` = NEW.`household_id` AND a.`import_batch_id` = NEW.`id`
+  ))
   OR COALESCE((
     SELECT SUM(a.`amount_cents`) FROM `card_invoice_adjustments` a
     WHERE a.`household_id` = NEW.`household_id` AND a.`import_batch_id` = NEW.`id`
@@ -392,6 +423,70 @@ FOR EACH ROW WHEN OLD.`status` = 'completed' AND (
 CREATE TRIGGER `card_import_batches_delete`
 BEFORE DELETE ON `card_import_batches`
 FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'card import batch cannot be deleted'); END;
+--> statement-breakpoint
+
+-- Facts imported by a completed onboarding are historical snapshots. They may
+-- be assembled while the batch is pending, but become immutable at completion.
+CREATE TRIGGER `card_purchases_completed_import_update`
+BEFORE UPDATE ON `card_purchases`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1
+  FROM `card_purchase_import_metadata` m
+  INNER JOIN `card_import_batches` b
+    ON b.`household_id` = m.`household_id` AND b.`id` = m.`import_batch_id`
+  WHERE m.`household_id` = OLD.`household_id` AND m.`purchase_id` = OLD.`id`
+    AND b.`status` = 'completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed imported card purchase cannot be changed'); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_purchases_completed_import_delete`
+BEFORE DELETE ON `card_purchases`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1
+  FROM `card_purchase_import_metadata` m
+  INNER JOIN `card_import_batches` b
+    ON b.`household_id` = m.`household_id` AND b.`id` = m.`import_batch_id`
+  WHERE m.`household_id` = OLD.`household_id` AND m.`purchase_id` = OLD.`id`
+    AND b.`status` = 'completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed imported card purchase cannot be deleted'); END;
+--> statement-breakpoint
+
+CREATE TRIGGER `card_installments_completed_import_insert`
+BEFORE INSERT ON `card_installments`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1
+  FROM `card_purchase_import_metadata` m
+  INNER JOIN `card_import_batches` b
+    ON b.`household_id` = m.`household_id` AND b.`id` = m.`import_batch_id`
+  WHERE m.`household_id` = NEW.`household_id` AND m.`purchase_id` = NEW.`purchase_id`
+    AND b.`status` = 'completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed imported card installment cannot be added'); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_installments_completed_import_update`
+BEFORE UPDATE ON `card_installments`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1
+  FROM `card_purchase_import_metadata` m
+  INNER JOIN `card_import_batches` b
+    ON b.`household_id` = m.`household_id` AND b.`id` = m.`import_batch_id`
+  WHERE m.`household_id` = OLD.`household_id` AND m.`purchase_id` = OLD.`purchase_id`
+    AND b.`status` = 'completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed imported card installment cannot be changed'); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_installments_completed_import_delete`
+BEFORE DELETE ON `card_installments`
+FOR EACH ROW WHEN EXISTS (
+  SELECT 1
+  FROM `card_purchase_import_metadata` m
+  INNER JOIN `card_import_batches` b
+    ON b.`household_id` = m.`household_id` AND b.`id` = m.`import_batch_id`
+  WHERE m.`household_id` = OLD.`household_id` AND m.`purchase_id` = OLD.`purchase_id`
+    AND b.`status` = 'completed'
+)
+BEGIN SELECT RAISE(ABORT, 'completed imported card installment cannot be deleted'); END;
 --> statement-breakpoint
 
 CREATE TRIGGER `card_installments_card_match_insert`
@@ -437,5 +532,35 @@ FOR EACH ROW WHEN EXISTS (
   WHERE s.`household_id` = OLD.`household_id` AND s.`invoice_id` = OLD.`id`
     AND (p.`household_id` IS NOT NEW.`household_id` OR p.`card_id` IS NOT NEW.`card_id`)
 ) BEGIN SELECT RAISE(ABORT, 'card invoice cannot move away from installment purchases'); END;
+--> statement-breakpoint
+CREATE TRIGGER `card_invoices_completed_import_cycle_update`
+BEFORE UPDATE OF `id`,`household_id`,`card_id`,`reference_month`,`due_date` ON `card_invoices`
+FOR EACH ROW WHEN (
+  NEW.`id` IS NOT OLD.`id`
+  OR NEW.`household_id` IS NOT OLD.`household_id`
+  OR NEW.`card_id` IS NOT OLD.`card_id`
+  OR NEW.`reference_month` IS NOT OLD.`reference_month`
+  OR NEW.`due_date` IS NOT OLD.`due_date`
+) AND (
+  EXISTS (
+    SELECT 1
+    FROM `card_installments` s
+    INNER JOIN `card_purchase_import_metadata` m
+      ON m.`household_id` = s.`household_id` AND m.`purchase_id` = s.`purchase_id`
+    INNER JOIN `card_import_batches` b
+      ON b.`household_id` = m.`household_id` AND b.`id` = m.`import_batch_id`
+    WHERE s.`household_id` = OLD.`household_id` AND s.`invoice_id` = OLD.`id`
+      AND b.`status` = 'completed'
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM `card_invoice_adjustments` a
+    INNER JOIN `card_import_batches` b
+      ON b.`household_id` = a.`household_id` AND b.`id` = a.`import_batch_id`
+    WHERE a.`household_id` = OLD.`household_id` AND a.`invoice_id` = OLD.`id`
+      AND b.`status` = 'completed'
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'completed imported card invoice cycle cannot be changed'); END;
 --> statement-breakpoint
 PRAGMA optimize;

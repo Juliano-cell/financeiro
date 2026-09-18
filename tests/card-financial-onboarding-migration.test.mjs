@@ -87,6 +87,25 @@ function insertMetadata(db, changes = {}) {
     .run(row.id, row.household, row.purchase, row.batch, row.first, row.count, row.total, row.date, row.importedAt);
 }
 
+function completeOpeningOnly(db) {
+  seed(db);
+  insertBatch(db, { purchases: 0, installments: 0, opening: 140000, declared: 140000 });
+  insertInvoice(db);
+  insertAdjustment(db);
+  db.prepare("UPDATE card_import_batches SET status='completed',completed_at=? WHERE id='batch'").run(AT);
+}
+
+function completeImportedPurchase(db) {
+  seed(db);
+  insertBatch(db, { purchases: 1, installments: 1, opening: 130000, declared: 140000 });
+  insertInvoice(db);
+  insertPurchase(db);
+  insertInstallment(db);
+  insertMetadata(db, { first: 1, count: 1, total: 10000 });
+  insertAdjustment(db, { amount: 130000 });
+  db.prepare("UPDATE card_import_batches SET status='completed',completed_at=? WHERE id='batch'").run(AT);
+}
+
 test("0006 aplica em banco vazio após 0000–0005 e mantém integridade", (t) => {
   const db = database(t);
   const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
@@ -339,6 +358,99 @@ test("batch concluído não pode ser substituído nem reescrever fatos financeir
   assert.throws(() => db.prepare("DELETE FROM card_import_batches WHERE id='batch'").run(), /cannot be deleted/iu);
   insertPurchase(db, "late-purchase");
   assert.throws(() => insertMetadata(db, { id: "late", purchase: "late-purchase", first: 1, count: 1 }), /does not match/iu);
+  healthy(db);
+});
+
+test("batch concluído congela opening balance com ou sem pagamentos", (t) => {
+  for (const paid of [0, 100000]) {
+    const db = database(t);
+    completeOpeningOnly(db);
+    if (paid > 0) {
+      db.prepare("INSERT INTO invoice_payment_operations(id,household_id,idempotency_key,kind,invoice_id,account_id,created_by_user_id,amount_cents,occurred_on,reversed_payment_id,request_fingerprint,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+        .run("operation", "ha", "payment", "payment", "invoice", "aa", "ua", paid, "2026-09-18", null, "fixture", AT);
+      db.prepare("INSERT INTO invoice_payments(id,household_id,invoice_id,account_id,amount_cents,paid_at,created_by_user_id,created_at,operation_id) VALUES(?,?,?,?,?,?,?,?,?)")
+        .run("payment", "ha", "invoice", "aa", paid, "2026-09-18", "ua", AT, "operation");
+    }
+    const attempts = [
+      "UPDATE card_invoice_adjustments SET status='voided',voided_at='2026-09-19T00:00:00.000Z' WHERE id='opening'",
+      "UPDATE card_invoice_adjustments SET voided_at='2026-09-19T00:00:00.000Z' WHERE id='opening'",
+      "UPDATE card_invoice_adjustments SET amount_cents=1 WHERE id='opening'",
+      "UPDATE OR REPLACE card_invoice_adjustments SET amount_cents=1 WHERE id='opening'",
+    ];
+    for (const sql of attempts) assert.throws(() => db.prepare(sql).run(), /completed|immutable|cannot be voided/iu, sql);
+    assert.throws(() => db.prepare(`INSERT OR REPLACE INTO card_invoice_adjustments
+      (id,household_id,invoice_id,import_batch_id,kind,amount_cents,status,created_by_user_id,created_at,voided_at)
+      VALUES('opening','ha','invoice','batch','opening_balance',1,'active','ua',?,NULL)`).run(AT), /cannot be replaced|does not match/iu);
+    assert.throws(() => db.prepare("DELETE FROM card_invoice_adjustments WHERE id='opening'").run(), /cannot be deleted/iu);
+    assert.deepEqual(
+      { ...db.prepare("SELECT amount_cents,status,voided_at FROM card_invoice_adjustments WHERE id='opening'").get() },
+      { amount_cents: 140000, status: "active", voided_at: null },
+    );
+    assert.equal(db.prepare("SELECT opening_balance_cents FROM card_import_batches WHERE id='batch'").get().opening_balance_cents, 140000);
+    healthy(db);
+  }
+});
+
+test("opening zero conclui sem adjustment fictício", (t) => {
+  const db = database(t);
+  seed(db);
+  insertBatch(db, { declared: 0, opening: 0, purchases: 0, installments: 0 });
+  insertInvoice(db);
+  db.prepare("UPDATE card_import_batches SET status='completed',completed_at=? WHERE id='batch'").run(AT);
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM card_invoice_adjustments").get().n, 0);
+  assert.equal(db.prepare("SELECT status FROM card_import_batches WHERE id='batch'").get().status, "completed");
+  healthy(db);
+});
+
+test("batch concluído congela installments, purchase e competência importadas", (t) => {
+  const db = database(t);
+  completeImportedPurchase(db);
+  insertPurchase(db, "normal-purchase");
+  insertInstallment(db, "normal-part", "normal-purchase", "invoice", 1, 1);
+
+  const installmentAttempts = [
+    "UPDATE card_installments SET amount_cents=1 WHERE id='part'",
+    "UPDATE OR REPLACE card_installments SET amount_cents=1 WHERE id='part'",
+    "UPDATE card_installments SET installment_number=2,installment_count=2 WHERE id='part'",
+    "UPDATE card_installments SET invoice_id='missing' WHERE id='part'",
+    "UPDATE card_installments SET purchase_id='normal-purchase' WHERE id='part'",
+    "UPDATE card_installments SET household_id='other' WHERE id='part'",
+    "UPDATE card_installments SET status='cancelled' WHERE id='part'",
+  ];
+  for (const sql of installmentAttempts) assert.throws(() => db.prepare(sql).run(), /completed imported card installment|same card|FOREIGN KEY/iu, sql);
+  assert.throws(() => db.prepare("DELETE FROM card_installments WHERE id='part'").run(), /completed imported card installment/iu);
+  assert.throws(() => db.prepare(`INSERT OR REPLACE INTO card_installments
+    (id,household_id,purchase_id,invoice_id,installment_number,installment_count,amount_cents,status,created_at,updated_at)
+    VALUES('part','ha','purchase','invoice',1,1,1,'pending',?,?)`).run(AT, AT), /cannot be replaced|completed imported/iu);
+  assert.throws(() => db.prepare(`INSERT INTO card_installments
+    (id,household_id,purchase_id,invoice_id,installment_number,installment_count,amount_cents,status,created_at,updated_at)
+    VALUES('extra','ha','purchase','invoice',2,2,1,'pending',?,?)`).run(AT, AT), /completed imported card installment/iu);
+
+  for (const sql of [
+    "UPDATE card_purchases SET description='Changed' WHERE id='purchase'",
+    "UPDATE OR REPLACE card_purchases SET total_cents=1 WHERE id='purchase'",
+    "UPDATE card_purchases SET status='cancelled' WHERE id='purchase'",
+  ]) assert.throws(() => db.prepare(sql).run(), /completed imported card purchase/iu, sql);
+  assert.throws(() => db.prepare("DELETE FROM card_purchases WHERE id='purchase'").run(), /completed imported card purchase|FOREIGN KEY/iu);
+  assert.throws(() => db.prepare(`INSERT OR REPLACE INTO card_purchases
+    (id,household_id,card_id,description,total_cents,purchase_date,installment_count,status,created_by_user_id,origin,created_at,updated_at)
+    VALUES('purchase','ha','carda','Changed',1,'2026-09-02',1,'active','ua','system',?,?)`).run(AT, AT), /cannot be replaced|completed imported/iu);
+
+  assert.throws(() => db.prepare("UPDATE card_invoices SET reference_month='2026-11' WHERE id='invoice'").run(), /completed imported card invoice cycle/iu);
+  assert.throws(() => db.prepare("UPDATE card_invoices SET due_date='2026-11-12' WHERE id='invoice'").run(), /completed imported card invoice cycle/iu);
+
+  db.prepare("UPDATE card_installments SET amount_cents=9000 WHERE id='normal-part'").run();
+  db.prepare("UPDATE card_purchases SET description='Normal changed' WHERE id='normal-purchase'").run();
+  assert.equal(db.prepare("SELECT amount_cents FROM card_installments WHERE id='normal-part'").get().amount_cents, 9000);
+  assert.equal(db.prepare("SELECT description FROM card_purchases WHERE id='normal-purchase'").get().description, "Normal changed");
+  assert.deepEqual(
+    { ...db.prepare("SELECT amount_cents,installment_number,installment_count,status FROM card_installments WHERE id='part'").get() },
+    { amount_cents: 10000, installment_number: 1, installment_count: 1, status: "pending" },
+  );
+  assert.deepEqual(
+    { ...db.prepare("SELECT imported_purchase_count,imported_installment_count,opening_balance_cents,declared_invoice_total_cents FROM card_import_batches WHERE id='batch'").get() },
+    { imported_purchase_count: 1, imported_installment_count: 1, opening_balance_cents: 130000, declared_invoice_total_cents: 140000 },
+  );
   healthy(db);
 });
 
