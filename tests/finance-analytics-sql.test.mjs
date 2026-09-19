@@ -125,6 +125,17 @@ test("analytics preserva compra de cartão legada sem subcategoria", () => {
   assert.equal(legacy?.amount_cents, 500);
 });
 
+test("analytics apresenta a numeração original de parcelamento importado", () => {
+  const { db, a } = seedAnalyticsScenario();
+  db.prepare("UPDATE card_purchases SET origin = 'system' WHERE household_id = ? AND id = 'purchase_active'").run(a.household);
+  db.prepare("INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run("batch_imported", a.household, "card_a", a.user, "analytics-import", "fingerprint", "2026-09", 30_000, 0, 1, 3, "pending", AT);
+  db.prepare("INSERT INTO card_purchase_import_metadata(id,household_id,purchase_id,import_batch_id,first_original_installment_number,original_installment_count,original_total_cents,original_purchase_date,imported_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("metadata_imported", a.household, "purchase_active", "batch_imported", 5, 7, 30_000, "2026-05-01", AT);
+  const rows = events(db, a.household, "WHERE e.entity_type = 'card_installment' ORDER BY e.installment_number");
+  assert.deepEqual(rows.map((row) => [row.installment_number, row.installment_count]), [[5, 7], [6, 7], [7, 7]]);
+});
+
 test("saldo usa todo o histórico, ignora futuro e mantém contas inativas separadas", () => {
   const { db, a } = seedAnalyticsScenario();
   const balances = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-12", a.household, "2026-09-12", a.household);

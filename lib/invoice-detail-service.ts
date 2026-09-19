@@ -1,5 +1,6 @@
 import { getInvoiceState, InvoiceServiceError, type InvoiceContext } from "./invoice-service";
 import type { InvoiceDetailAdjustment, InvoiceDetailItem, InvoiceDetailPage, InvoiceDetailResponse } from "./invoice-detail-types";
+import { resolveInstallmentDisplay } from "./card-onboarding-ui-rules.mjs";
 
 export const INVOICE_DETAIL_DEFAULT_PAGE_SIZE = 20;
 export const INVOICE_DETAIL_MAX_PAGE_SIZE = 50;
@@ -24,6 +25,8 @@ type DetailRow = {
   installment_amount_cents: number;
   installment_number: number;
   installment_count: number;
+  first_original_installment_number: number | null;
+  original_installment_count: number | null;
   purchase_total_cents: number;
   origin: "web" | "telegram" | "system";
   status: "pending" | "paid" | "cancelled";
@@ -56,6 +59,13 @@ function parseInput(input: InvoiceDetailInput) {
 
 function item(row: DetailRow): InvoiceDetailItem {
   const includedInTotal = row.status !== "cancelled";
+  const display = resolveInstallmentDisplay({
+    physicalNumber: row.installment_number,
+    physicalCount: row.installment_count,
+    firstOriginalNumber: row.first_original_installment_number,
+    originalCount: row.original_installment_count,
+  });
+  if (!display) throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
   return {
     installmentId: row.installment_id,
     purchaseId: row.purchase_id,
@@ -66,8 +76,8 @@ function item(row: DetailRow): InvoiceDetailItem {
     subcategoryId: row.subcategory_id,
     subcategoryName: row.subcategory_name,
     installmentAmountCents: row.installment_amount_cents,
-    installmentNumber: row.installment_number,
-    installmentCount: row.installment_count,
+    installmentNumber: display.installmentNumber,
+    installmentCount: display.installmentCount,
     purchaseTotalCents: row.purchase_total_cents,
     origin: row.origin,
     status: row.status,
@@ -124,6 +134,8 @@ const ITEM_SELECT = `SELECT
   s.amount_cents AS installment_amount_cents,
   s.installment_number,
   s.installment_count,
+  m.first_original_installment_number,
+  m.original_installment_count,
   p.total_cents AS purchase_total_cents,
   p.origin,
   s.status
@@ -138,6 +150,8 @@ LEFT JOIN categories c
   ON c.household_id = p.household_id AND c.id = p.category_id
 LEFT JOIN subcategories sc
   ON sc.household_id = p.household_id AND sc.id = p.subcategory_id
+LEFT JOIN card_purchase_import_metadata m
+  ON m.household_id = p.household_id AND m.purchase_id = p.id
 WHERE s.household_id = ? AND s.invoice_id = ?`;
 
 const ITEM_ORDER = " ORDER BY p.purchase_date, p.created_at, s.installment_number, s.id LIMIT ? OFFSET ?";

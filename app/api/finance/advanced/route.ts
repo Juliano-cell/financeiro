@@ -4,12 +4,13 @@ import { and, asc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { bills, cardInstallments, cardInvoices, cardPurchases, creditCards, householdMembers, notificationPreferences, transactions } from "@/db/schema";
+import { bills, cardInstallments, cardInvoices, cardPurchaseImportMetadata, cardPurchases, creditCards, householdMembers, notificationPreferences, transactions } from "@/db/schema";
 import { BillServiceError, cancelBillOccurrence, cancelRecurringBillSeries, createBill, payBill, undoBillPayment, updateBillOccurrence, updateRecurringBillSeries } from "@/lib/bill-service";
 import { addMonths, buildInstallmentPlan, simulatePurchase } from "@/lib/finance-rules.mjs";
 import { createCardPurchase, FinanceValidationError } from "@/lib/finance-service";
 import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
 import { cancelCardPurchase, getHouseholdInvoiceStates, getInvoicePaymentHistory, invoiceCivilDate, InvoiceServiceError, payInvoiceResidual, reverseInvoicePayment } from "@/lib/invoice-service";
+import { resolveInstallmentDisplay } from "@/lib/card-onboarding-ui-rules.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -61,11 +62,12 @@ export async function GET(request: Request) {
   const selectedMonth = new URL(request.url).searchParams.get("month") ?? today.slice(0, 7);
   if (!monthSchema.safeParse(selectedMonth).success) return NextResponse.json({ error: "Mês inválido." }, { status: 400 });
   const { db, d1, householdId } = current;
-  const [cardRows, purchaseRows, invoiceRows, installmentRows, billRows, transactionRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
+  const [cardRows, purchaseRows, invoiceRows, installmentRows, importMetadataRows, billRows, transactionRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
     db.select().from(creditCards).where(eq(creditCards.householdId, householdId)).orderBy(asc(creditCards.name)),
     db.select().from(cardPurchases).where(eq(cardPurchases.householdId, householdId)),
     db.select().from(cardInvoices).where(eq(cardInvoices.householdId, householdId)),
     db.select().from(cardInstallments).where(eq(cardInstallments.householdId, householdId)),
+    db.select().from(cardPurchaseImportMetadata).where(eq(cardPurchaseImportMetadata.householdId, householdId)),
     db.select().from(bills).where(eq(bills.householdId, householdId)).orderBy(asc(bills.dueDate)),
     db.select().from(transactions).where(eq(transactions.householdId, householdId)),
     db.select().from(notificationPreferences).where(eq(notificationPreferences.householdId, householdId)),
@@ -76,7 +78,15 @@ export async function GET(request: Request) {
   if (invoiceRows.some((invoice) => !stateById.has(invoice.id))) return NextResponse.json({ error: "As faturas foram atualizadas durante a consulta. Tente novamente." }, { status: 409, headers: privateHeaders });
   const purchaseById = new Map(purchaseRows.map((item) => [item.id, item]));
   const invoiceById = new Map(invoiceRows.map((item) => [item.id, item]));
-  const installments = installmentRows.map((item) => ({ ...item, purchase: purchaseById.get(item.purchaseId), invoice: invoiceById.get(item.invoiceId), card: cardRows.find((card) => card.id === purchaseById.get(item.purchaseId)?.cardId) }));
+  const metadataByPurchaseId = new Map(importMetadataRows.map((item) => [item.purchaseId, item]));
+  let inconsistentInstallmentDisplay = false;
+  const installments = installmentRows.map((item) => {
+    const metadata = metadataByPurchaseId.get(item.purchaseId);
+    const display = resolveInstallmentDisplay({ physicalNumber: item.installmentNumber, physicalCount: item.installmentCount, firstOriginalNumber: metadata?.firstOriginalInstallmentNumber ?? null, originalCount: metadata?.originalInstallmentCount ?? null });
+    if (!display) inconsistentInstallmentDisplay = true;
+    return { ...item, installmentNumber: display?.installmentNumber ?? item.installmentNumber, installmentCount: display?.installmentCount ?? item.installmentCount, purchase: purchaseById.get(item.purchaseId), invoice: invoiceById.get(item.invoiceId), card: cardRows.find((card) => card.id === purchaseById.get(item.purchaseId)?.cardId) };
+  });
+  if (inconsistentInstallmentDisplay) return NextResponse.json({ error: "Não foi possível exibir as parcelas porque os dados estão inconsistentes." }, { status: 409, headers: privateHeaders });
   const invoices = invoiceRows.map((invoice) => {
     const parts = installments.filter((item) => item.invoiceId === invoice.id && item.status !== "cancelled");
     const state = stateById.get(invoice.id)!;

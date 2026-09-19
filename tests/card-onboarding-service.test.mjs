@@ -374,6 +374,13 @@ test("detalhe read-only e invoices legadas sem adjustment permanecem coerentes",
   assert.equal(detail.invoice.invoiceTotalCents, 140000);
   assert.equal(detail.active.items.length, 1);
   assert.equal(detail.active.items[0].installmentAmountCents, 10000);
+  assert.equal(detail.active.items[0].installmentNumber, 5);
+  assert.equal(detail.active.items[0].installmentCount, 10);
+  const importedInvoices = f.db.prepare("SELECT id, reference_month FROM card_invoices WHERE household_id='ha' ORDER BY reference_month").all();
+  const nextDetail = await getInvoiceDetail({ invoiceId: importedInvoices.find((item) => item.reference_month === "2026-11").id }, f.context);
+  const lastDetail = await getInvoiceDetail({ invoiceId: importedInvoices.find((item) => item.reference_month === "2027-03").id }, f.context);
+  assert.deepEqual([nextDetail.active.items[0].installmentNumber, nextDetail.active.items[0].installmentCount], [6, 10]);
+  assert.deepEqual([lastDetail.active.items[0].installmentNumber, lastDetail.active.items[0].installmentCount], [10, 10]);
   assert.deepEqual(detail.adjustments, [{ adjustmentId: detail.adjustments[0].adjustmentId, itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 130000, status: "active", includedInTotal: true }]);
   assert.equal(detail.active.items.reduce((sum, item) => sum + item.installmentAmountCents, 0) + detail.adjustments.reduce((sum, item) => sum + item.amountCents, 0), detail.invoice.invoiceTotalCents);
 
@@ -384,6 +391,17 @@ test("detalhe read-only e invoices legadas sem adjustment permanecem coerentes",
   const legacyContext = { d1: f.d1, householdId: "hlegacy", userId: "ulegacy", timestamp: AT };
   assert.equal((await getInvoiceState("legacy-invoice", legacyContext)).invoiceTotalCents, 50000);
   assert.deepEqual((await getInvoiceDetail({ invoiceId: "legacy-invoice" }, legacyContext)).adjustments, []);
+});
+
+test("detalhe falha de forma controlada quando metadata importada não reconcilia", async (t) => {
+  const f = setup(t);
+  const imported = await configureCardCurrentState({ ...openingOnly, idempotencyKey: "inconsistent-detail", commitments: [importedCommitment] }, f.context);
+  f.db.exec("DROP TRIGGER card_installments_completed_import_update");
+  f.db.prepare("UPDATE card_installments SET installment_count = 5 WHERE invoice_id = ?").run(imported.invoiceId);
+  await assert.rejects(
+    getInvoiceDetail({ invoiceId: imported.invoiceId }, f.context),
+    (error) => error instanceof CardOnboardingError === false && error?.status === 409 && error?.code === "INVOICE_DETAIL_INCONSISTENT",
+  );
 });
 
 test("pagamento parcial, quitação posterior e reversão preservam lifecycle", async (t) => {

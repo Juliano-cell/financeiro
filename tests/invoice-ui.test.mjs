@@ -32,7 +32,7 @@ const detailUrl = `data:text/javascript,${encodeURIComponent(compiledDetail)}`;
 const { InvoiceDetailItems, loadInvoiceDetail, parseInvoiceDetailPayload } = await import(detailUrl);
 let compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiled = compiled.replace(/from "([^"]+)"/gu, (_, specifier) => {
-  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/app/advanced-finance" ? apiUrl : specifier === "@/app/invoice-detail-dialog" ? detailUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
+  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/app/advanced-finance" ? apiUrl : specifier === "@/app/card-onboarding-dialog" ? "data:text/javascript,export function CardOnboardingAction(){return null}" : specifier === "@/app/invoice-detail-dialog" ? detailUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
   return `from ${JSON.stringify(url)}`;
 });
 const { InvoiceLifecycle, InvoiceOperationDialog } = await import(`data:text/javascript,${encodeURIComponent(compiled)}`);
@@ -40,7 +40,7 @@ const lifecycleUrl = `data:text/javascript,${encodeURIComponent(compiled)}`;
 const extraPrimitives = `${primitives}\n${["Checkbox", "Select", "SelectContent", "SelectItem", "SelectTrigger", "SelectValue"].map((name) => `export function ${name}({children}) { return createElement("div", null, children); }`).join("\n")}`;
 let compiledAdvanced = ts.transpileModule(advanced, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiledAdvanced = compiledAdvanced.replace(/from "([^"]+)"/gu, (_, specifier) => {
-  const url = specifier.startsWith("@/components/") ? `data:text/javascript,${encodeURIComponent(extraPrimitives)}` : specifier === "@/app/invoice-lifecycle" ? lifecycleUrl : specifier.startsWith("@/lib/") ? new URL(`../lib/${specifier.slice(6)}`, import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
+  const url = specifier.startsWith("@/components/") ? `data:text/javascript,${encodeURIComponent(extraPrimitives)}` : specifier === "@/app/invoice-lifecycle" ? lifecycleUrl : specifier === "@/app/card-onboarding-dialog" ? "data:text/javascript,export function CardOnboardingAction(){return null}" : specifier.startsWith("@/lib/") ? new URL(`../lib/${specifier.slice(6)}`, import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
   return `from ${JSON.stringify(url)}`;
 });
 const { AdvancedFinanceView, advancedApi: realAdvancedApi } = await import(`data:text/javascript,${encodeURIComponent(compiledAdvanced)}`);
