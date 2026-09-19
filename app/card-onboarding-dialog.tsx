@@ -53,7 +53,7 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
       })
       .catch((caught) => { if (caught?.name !== "AbortError") setEligibility("error"); });
     return () => controller.abort();
-  }, [card.id, eligibilityVersion]);
+  }, [attempt, card.id, eligibilityVersion]);
 
   const reset = () => {
     setStep("invoice"); setReferenceMonth(months[0]?.value ?? ""); setInvoiceTotal(""); setHasInstallments(null); setInstallments([]); setError(""); setSuccess(null); setSubmitting(false); submittingRef.current = false; attempt.clearPrepared();
