@@ -6,6 +6,7 @@ import {
   buildOnboardingPayload,
   canAddOnboardingCommitment,
   createOnboardingAttemptManager,
+  createOnboardingAttemptRegistry,
   friendlyOnboardingError,
   MAX_ONBOARDING_COMMITMENTS,
   nextOriginalInstallments,
@@ -33,7 +34,7 @@ test("botão de configuração está conectado à tela real de cartões", () => 
 test("elegibilidade é consultada no endpoint aprovado", () => assert.match(component, /\/api\/finance\/card-onboarding\?cardId=/u));
 test("cartão inelegível não renderiza ação de onboarding", () => assert.match(component, /eligibility !== "eligible" && !open\) return null/u));
 test("fluxo abre em dialog identificado e acessível", () => assert.match(component, /Configurar situação atual · \{card\.name\}/u));
-test("cancelar fecha e limpa a tentativa sem POST", () => { assert.match(component, /const close = \(\) => \{ setOpen\(false\); reset\(\); \}/u); assert.match(component, /attempt\.current\.clear\(\)/u); });
+test("cancelar fecha e limpa somente tentativa ainda não enviada", () => { assert.match(component, /const close = \(\) => \{ setOpen\(false\); reset\(\); \}/u); assert.match(component, /attempt\.clearPrepared\(\)/u); });
 
 test("competências mostram somente mês atual e seguinte em São Paulo", () => {
   const options = referenceMonthOptions(new Date("2026-10-31T23:30:00-03:00"));
@@ -75,8 +76,15 @@ test("nenhuma escrita ocorre ao avançar pelas etapas", () => { assert.equal((co
 test("loading desabilita ações e possui texto compreensível", () => { assert.match(component, /submitting \? "Configurando…"/u); assert.match(component, /disabled=\{submitting/u); });
 test("duplo clique é bloqueado sincronamente", () => { assert.match(component, /if \(submittingRef\.current\) return/u); assert.match(component, /submittingRef\.current = true/u); });
 
-test("retry do mesmo payload mantém a idempotency key", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { value: 1 }; assert.equal(manager.keyFor(payload), "key-1"); assert.equal(manager.keyFor({ value: 1 }), "key-1"); });
-test("alteração financeira gera nova tentativa lógica", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); assert.equal(manager.keyFor({ value: 1 }), "key-1"); assert.equal(manager.keyFor({ value: 2 }), "key-2"); });
+test("timeout permite retry sem fechar com a mesma idempotency key", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { value: 1 }; const first = manager.keyFor(payload); manager.markAmbiguous(payload, first); assert.equal(manager.keyFor({ value: 1 }), first); });
+test("timeout sobrevive a fechar e reabrir com a mesma key", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { value: 1 }; const first = manager.keyFor(payload); manager.markAmbiguous(payload, first); manager.clearPrepared(); assert.equal(manager.keyFor({ value: 1 }), first); });
+test("network failure sobrevive a fechar e reabrir com a mesma key", () => { const manager = createOnboardingAttemptManager(() => "network-key"); const payload = { cardId: "card-a" }; manager.markAmbiguous(payload, manager.keyFor(payload)); manager.clearPrepared(); assert.equal(manager.keyFor(payload), "network-key"); });
+test("2xx malformado sobrevive a fechar e reabrir com a mesma key", () => { const manager = createOnboardingAttemptManager(() => "malformed-key"); const payload = { cardId: "card-a" }; const key = manager.keyFor(payload); assert.equal(parseOnboardingSuccessResponse({}, "card-a"), null); manager.markAmbiguous(payload, key); manager.clearPrepared(); assert.equal(manager.keyFor(payload), key); });
+test("payload alterado após ambiguidade exige revalidação e não reutiliza key", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const original = { value: 1 }; const key = manager.keyFor(original); manager.markAmbiguous(original, key); assert.deepEqual(manager.prepare({ value: 2 }), { kind: "requires_revalidation" }); assert.equal(sequence, 1); });
+test("cartões diferentes isolam keys e voltar ao cartão A preserva a proteção", () => { let sequence = 0; const registry = createOnboardingAttemptRegistry(() => `key-${++sequence}`); const a = registry.forCard("card-a"); const payloadA = { cardId: "card-a" }; const keyA = a.keyFor(payloadA); a.markAmbiguous(payloadA, keyA); a.clearPrepared(); const keyB = registry.forCard("card-b").keyFor({ cardId: "card-b" }); assert.notEqual(keyB, keyA); assert.equal(registry.forCard("card-a").keyFor(payloadA), keyA); assert.match(component, /const onboardingAttempts = createOnboardingAttemptRegistry\(\)/u); });
+test("eligibility posterior inelegível resolve tentativa sem segundo POST", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { cardId: "card-a" }; manager.markAmbiguous(payload, manager.keyFor(payload)); manager.resolve(); assert.equal(manager.keyFor(payload), "key-2"); assert.match(component, /if \(!eligible\) attempt\.resolve\(\)/u); });
+test("sucesso canônico encerra tentativa", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { value: 1 }; manager.keyFor(payload); manager.resolve(); assert.equal(manager.keyFor(payload), "key-2"); });
+test("cancelar antes do POST descarta tentativa preparada", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { value: 1 }; manager.keyFor(payload); manager.clearPrepared(); assert.equal(manager.keyFor(payload), "key-2"); });
 test("sucesso encerra tentativa e mostra resumo", () => { assert.match(component, /Situação atual configurada com sucesso/u); assert.match(component, /Compras importadas/u); assert.match(component, /Parcelas importadas/u); });
 
 const validSuccessResponse = {
@@ -93,6 +101,15 @@ const validSuccessResponse = {
 };
 
 test("resposta 2xx canônica é aceita sem coerção", () => assert.deepEqual(parseOnboardingSuccessResponse(validSuccessResponse, "card-a"), validSuccessResponse));
+for (const identifier of ["card_123", "card:123", "card/123.with spaces", "x"]) {
+  test(`ID legítimo aceito conforme contrato da API: ${identifier}`, () => {
+    const response = { ...validSuccessResponse, cardId: identifier, batchId: identifier, invoiceId: identifier };
+    assert.deepEqual(parseOnboardingSuccessResponse(response, identifier), response);
+  });
+}
+for (const identifier of ["", null, 123, {}, "x".repeat(101)]) {
+  test(`ID fora do contrato da API é rejeitado: ${String(identifier)}`, () => assert.equal(parseOnboardingSuccessResponse({ ...validSuccessResponse, batchId: identifier }, "card-a"), null));
+}
 for (const [label, response] of [
   ["null", null], ["objeto vazio", {}], ["array", []], ["string", "ok"], ["true", true], ["false", false], ["zero", 0],
   ["cardId ausente", { ...validSuccessResponse, cardId: undefined }],
@@ -113,7 +130,8 @@ for (const [label, response] of [
 ]) test(`resposta 2xx malformada não declara sucesso: ${label}`, () => assert.equal(parseOnboardingSuccessResponse(response, "card-a"), null));
 
 test("JSON inválido em 2xx segue para validação estrita e não declara sucesso", () => { assert.match(component, /catch \{ \/\* resposta inválida é tratada abaixo \*\//u); assert.match(component, /parseOnboardingSuccessResponse\(body, card\.id\)/u); assert.equal(parseOnboardingSuccessResponse({}, "card-a"), null); });
-test("resposta 2xx ambígua preserva a mesma tentativa idempotente", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { cardId: "card-a" }; const first = manager.keyFor(payload); assert.equal(parseOnboardingSuccessResponse({}, "card-a"), null); assert.equal(manager.keyFor(payload), first); assert.match(component, /if \(!outcome\) throw[\s\S]+attempt\.current\.clear\(\); setSuccess/u); });
+test("resposta 2xx ambígua preserva a mesma tentativa idempotente", () => { let sequence = 0; const manager = createOnboardingAttemptManager(() => `key-${++sequence}`); const payload = { cardId: "card-a" }; const first = manager.keyFor(payload); assert.equal(parseOnboardingSuccessResponse({}, "card-a"), null); manager.markAmbiguous(payload, first); assert.equal(manager.keyFor(payload), first); assert.match(component, /if \(!outcome\) throw[\s\S]+attempt\.resolve\(\); setSuccess/u); });
+test("payload diferente após ambiguidade revalida elegibilidade antes de qualquer POST", () => { assert.match(component, /prepared\.kind === "requires_revalidation"[\s\S]+onboardingRequest\(`\/api\/finance\/card-onboarding\?cardId=/u); assert.match(component, /repita os mesmos dados enviados anteriormente/iu); });
 
 for (const [status, text] of [[400, /dados/iu], [401, /sessão/iu], [403, /permissão/iu], [404, /disponível/iu], [409, /cartão/iu], [500, /tente novamente/iu]]) {
   test(`erro HTTP ${status} possui mensagem amigável`, () => assert.match(friendlyOnboardingError(status, ""), text));
@@ -128,11 +146,15 @@ test("wizard fechado não preserva formulário anterior", () => { assert.match(c
 test("estrutura é mobile-first e dialog possui scroll limitado", () => { assert.match(component, /max-h-\[90vh\] overflow-y-auto sm:max-w-2xl/u); assert.match(component, /w-full sm:w-auto/u); });
 test("campos possuem labels e erros acessíveis", () => { assert.match(component, /aria-invalid=\{Boolean\(error\)\}/u); assert.match(component, /role="alert"/u); });
 
-test("read model converte físico 1/6 em 5/10", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 1, physicalCount: 6, firstOriginalNumber: 5, originalCount: 10 }), { installmentNumber: 5, installmentCount: 10 }));
-test("read model converte próxima fatura física 2/6 em 6/10", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 2, physicalCount: 6, firstOriginalNumber: 5, originalCount: 10 }), { installmentNumber: 6, installmentCount: 10 }));
-test("read model converte última física 6/6 em 10/10", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 6, physicalCount: 6, firstOriginalNumber: 5, originalCount: 10 }), { installmentNumber: 10, installmentCount: 10 }));
-test("compra normal sem metadata preserva numeração", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 2, physicalCount: 10 }), { installmentNumber: 2, installmentCount: 10 }));
-test("metadata inconsistente falha fechada", () => assert.equal(resolveInstallmentDisplay({ physicalNumber: 1, physicalCount: 5, firstOriginalNumber: 5, originalCount: 10 }), null));
+test("read model converte físico 1/6 em 5/10", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 1, physicalCount: 6, origin: "system", metadataValid: true, firstOriginalNumber: 5, originalCount: 10 }), { installmentNumber: 5, installmentCount: 10 }));
+test("read model converte próxima fatura física 2/6 em 6/10", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 2, physicalCount: 6, origin: "system", metadataValid: true, firstOriginalNumber: 5, originalCount: 10 }), { installmentNumber: 6, installmentCount: 10 }));
+test("read model converte última física 6/6 em 10/10", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 6, physicalCount: 6, origin: "system", metadataValid: true, firstOriginalNumber: 5, originalCount: 10 }), { installmentNumber: 10, installmentCount: 10 }));
+test("compra normal sem metadata preserva numeração", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 2, physicalCount: 3, origin: "web" }), { installmentNumber: 2, installmentCount: 3 }));
+test("compra normal do Telegram sem metadata preserva numeração", () => assert.deepEqual(resolveInstallmentDisplay({ physicalNumber: 3, physicalCount: 3, origin: "telegram" }), { installmentNumber: 3, installmentCount: 3 }));
+test("compra importada sem metadata falha fechada", () => assert.equal(resolveInstallmentDisplay({ physicalNumber: 1, physicalCount: 6, origin: "system" }), null));
+test("metadata de outra purchase ou cartão falha fechada", () => assert.equal(resolveInstallmentDisplay({ physicalNumber: 1, physicalCount: 6, origin: "system", metadataValid: false, firstOriginalNumber: 5, originalCount: 10 }), null));
+test("metadata inconsistente falha fechada", () => assert.equal(resolveInstallmentDisplay({ physicalNumber: 1, physicalCount: 5, origin: "system", metadataValid: true, firstOriginalNumber: 5, originalCount: 10 }), null));
+test("metadata que excede total original falha fechada", () => assert.equal(resolveInstallmentDisplay({ physicalNumber: 6, physicalCount: 6, origin: "system", metadataValid: true, firstOriginalNumber: 6, originalCount: 10 }), null));
 test("Ver fatura usa metadata sem alterar ledger", () => { assert.match(detailService, /LEFT JOIN card_purchase_import_metadata/u); assert.match(detailService, /resolveInstallmentDisplay/u); });
 test("lista geral de parcelas também usa numeração original", () => { assert.match(advancedRoute, /cardPurchaseImportMetadata/u); assert.match(advancedRoute, /inconsistentInstallmentDisplay/u); });
 test("dashboard e relatórios também usam numeração original", () => { assert.match(analytics, /card_purchase_import_metadata/u); assert.match(analytics, /first_original_installment_number \+ ci\.installment_number - 1/u); });

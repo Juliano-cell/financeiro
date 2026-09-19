@@ -156,6 +156,14 @@ test("analytics falha fechado quando metadata importada não corresponde às par
   assert.match(route, /FinanceAnalyticsIntegrityError[\s\S]+status: 409/u);
 });
 
+test("analytics falha fechado quando compra importada está sem metadata", () => {
+  const { db, a } = seedAnalyticsScenario();
+  db.prepare("UPDATE card_purchases SET origin = 'system' WHERE household_id = ? AND id = 'purchase_active'").run(a.household);
+  const rows = events(db, a.household, "WHERE e.entity_type = 'card_installment'");
+  assert.equal(rows.length, 3);
+  assert.ok(rows.every((row) => row.installment_number === null && row.installment_count === null));
+});
+
 test("analytics falha fechado quando metadata aponta para batch de outro cartão", () => {
   const { db, a } = seedAnalyticsScenario();
   db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run("card_other", a.household, "Outro", "Banco", "A", 500_000, 5, 10, AT, AT);

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { buildOnboardingPayload, canAddOnboardingCommitment, createOnboardingAttemptManager, friendlyOnboardingError, MAX_ONBOARDING_COMMITMENTS, nextOriginalInstallments, parseOnboardingSuccessResponse, referenceMonthOptions, validateInstallmentDraft } from "@/lib/card-onboarding-ui-rules.mjs";
+import { buildOnboardingPayload, canAddOnboardingCommitment, createOnboardingAttemptRegistry, friendlyOnboardingError, MAX_ONBOARDING_COMMITMENTS, nextOriginalInstallments, parseOnboardingSuccessResponse, referenceMonthOptions, validateInstallmentDraft } from "@/lib/card-onboarding-ui-rules.mjs";
 
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: { id: string; name: string; categoryId: string; isActive?: boolean }[] };
 type Card = { id: string; name: string };
@@ -16,6 +16,7 @@ type Success = { declaredCurrentInvoiceTotalCents: number; openingBalanceCents: 
 
 const money = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
 const newInstallment = (): InstallmentDraft => ({ id: crypto.randomUUID(), description: "", originalTotal: "", originalInstallmentCount: "", currentInstallmentNumber: "", installmentAmount: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" });
+const onboardingAttempts = createOnboardingAttemptRegistry();
 
 async function onboardingRequest(url: string, init?: RequestInit) {
   const response = await fetch(url, { cache: "no-store", ...init });
@@ -39,19 +40,23 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState<Success | null>(null);
   const submittingRef = useRef(false);
-  const attempt = useRef(createOnboardingAttemptManager());
+  const attempt = onboardingAttempts.forCard(card.id);
   const expenseCategories = categories.filter((item) => item.isActive && (item.type === "expense" || item.type === "both"));
 
   useEffect(() => {
     const controller = new AbortController();
     onboardingRequest(`/api/finance/card-onboarding?cardId=${encodeURIComponent(card.id)}`, { signal: controller.signal })
-      .then((body) => setEligibility(body.eligible === true ? "eligible" : "ineligible"))
+      .then((body) => {
+        const eligible = body.eligible === true;
+        if (!eligible) attempt.resolve();
+        setEligibility(eligible ? "eligible" : "ineligible");
+      })
       .catch((caught) => { if (caught?.name !== "AbortError") setEligibility("error"); });
     return () => controller.abort();
   }, [card.id, eligibilityVersion]);
 
   const reset = () => {
-    setStep("invoice"); setReferenceMonth(months[0]?.value ?? ""); setInvoiceTotal(""); setHasInstallments(null); setInstallments([]); setError(""); setSuccess(null); setSubmitting(false); submittingRef.current = false; attempt.current.clear();
+    setStep("invoice"); setReferenceMonth(months[0]?.value ?? ""); setInvoiceTotal(""); setHasInstallments(null); setInstallments([]); setError(""); setSuccess(null); setSubmitting(false); submittingRef.current = false; attempt.clearPrepared();
   };
   const close = () => { setOpen(false); reset(); };
   const updateInstallment = (id: string, changes: Partial<InstallmentDraft>) => setInstallments((current) => current.map((item) => item.id === id ? { ...item, ...changes } : item));
@@ -75,17 +80,34 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
     const result = buildOnboardingPayload(draft);
     if (!result.valid || !result.payload) { setError(result.error ?? "Revise os dados informados."); return; }
     submittingRef.current = true; setSubmitting(true); setError("");
-    const idempotencyKey = attempt.current.keyFor(result.payload);
     try {
+      const prepared = attempt.prepare(result.payload);
+      if (prepared.kind === "requires_revalidation") {
+        const latest = await onboardingRequest(`/api/finance/card-onboarding?cardId=${encodeURIComponent(card.id)}`);
+        if (latest.eligible !== true) {
+          attempt.resolve(); setEligibility("ineligible");
+          setError("Este cartão já foi configurado. Nenhuma nova configuração foi enviada.");
+          return;
+        }
+        setError("Existe uma tentativa anterior com resultado indefinido. Para evitar duplicidade, repita os mesmos dados enviados anteriormente.");
+        return;
+      }
+      const idempotencyKey = prepared.key;
       const body = await onboardingRequest("/api/finance/card-onboarding", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...result.payload, idempotencyKey }) });
       const outcome = parseOnboardingSuccessResponse(body, card.id);
       if (!outcome) throw Object.assign(new Error("Resposta financeira inválida."), { status: 502 });
-      attempt.current.clear(); setSuccess(outcome); setStep("success"); setEligibility("ineligible");
+      attempt.resolve(); setSuccess(outcome); setStep("success"); setEligibility("ineligible");
       try { await onChanged(); } catch { setError("A configuração foi concluída, mas a tela não pôde ser atualizada. Recarregue a página."); }
     } catch (caught) {
       const status = typeof caught === "object" && caught && "status" in caught ? Number(caught.status) : 500;
       setError(friendlyOnboardingError(status, caught instanceof Error ? caught.message : ""));
-      if (status === 409 || status === 404) { setEligibility("loading"); setEligibilityVersion((value) => value + 1); }
+      if (status >= 500) {
+        const prepared = attempt.prepare(result.payload);
+        if (prepared.kind === "ready") attempt.markAmbiguous(result.payload, prepared.key);
+      } else {
+        attempt.resolve();
+        if (status === 409 || status === 404) { setEligibility("loading"); setEligibilityVersion((value) => value + 1); }
+      }
     } finally { submittingRef.current = false; setSubmitting(false); }
   };
 

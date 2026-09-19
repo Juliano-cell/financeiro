@@ -377,6 +377,17 @@ test("relação entre purchase e invoice de cartões distintos falha fechada sem
   assert.deepEqual(after, before);
 });
 
+test("Ver fatura e lista avançada falham fechadas para compra importada sem metadata", async t => {
+  const f = await setup(t);
+  f.db.prepare("UPDATE card_purchases SET origin='system' WHERE household_id='ha'").run();
+  const invoiceResponse = await detail({ invoiceId: f.invoiceId });
+  assert.equal(invoiceResponse.status, 409);
+  assert.equal(invoiceResponse.body.code, "INVOICE_DETAIL_INCONSISTENT");
+  const advancedResponse = await advanced.GET(new Request("https://fixture.invalid/api/finance/advanced?month=2026-09"));
+  assert.equal(advancedResponse.status, 409);
+  assert.match((await advancedResponse.json()).error, /inconsistentes/iu);
+});
+
 test("detalhe preserva estados quitado, parcial, aberto e legado", async t => {
   const f = await setup(t); await pay(f); let response = await detail({ invoiceId: f.invoiceId });
   assert.deepEqual([response.body.invoice.paymentStatus, response.body.invoice.cycleStatus, response.body.invoice.remainingCents], ["settled", "closed", 0]);

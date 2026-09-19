@@ -27,6 +27,7 @@ type DetailRow = {
   installment_count: number;
   first_original_installment_number: number | null;
   original_installment_count: number | null;
+  valid_import_batch_id: string | null;
   purchase_total_cents: number;
   origin: "web" | "telegram" | "system";
   status: "pending" | "paid" | "cancelled";
@@ -62,6 +63,8 @@ function item(row: DetailRow): InvoiceDetailItem {
   const display = resolveInstallmentDisplay({
     physicalNumber: row.installment_number,
     physicalCount: row.installment_count,
+    origin: row.origin,
+    metadataValid: row.valid_import_batch_id !== null,
     firstOriginalNumber: row.first_original_installment_number,
     originalCount: row.original_installment_count,
   });
@@ -136,6 +139,7 @@ const ITEM_SELECT = `SELECT
   s.installment_count,
   m.first_original_installment_number,
   m.original_installment_count,
+  ib.id AS valid_import_batch_id,
   p.total_cents AS purchase_total_cents,
   p.origin,
   s.status
@@ -152,6 +156,9 @@ LEFT JOIN subcategories sc
   ON sc.household_id = p.household_id AND sc.id = p.subcategory_id
 LEFT JOIN card_purchase_import_metadata m
   ON m.household_id = p.household_id AND m.purchase_id = p.id
+LEFT JOIN card_import_batches ib
+  ON ib.household_id = m.household_id AND ib.id = m.import_batch_id
+  AND ib.card_id = p.card_id AND ib.status = 'completed'
 WHERE s.household_id = ? AND s.invoice_id = ?`;
 
 const ITEM_ORDER = " ORDER BY p.purchase_date, p.created_at, s.installment_number, s.id LIMIT ? OFFSET ?";
