@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { FinanceAnalyticsValidationError, getFinanceAnalytics, resolveAuthenticatedAnalyticsContext } from "@/lib/finance-analytics-service";
+import { FinanceAnalyticsIntegrityError, FinanceAnalyticsValidationError, getFinanceAnalytics, resolveAuthenticatedAnalyticsContext } from "@/lib/finance-analytics-service";
 import type { AnalyticsFilters } from "@/lib/finance-analytics-types";
 
 export const dynamic = "force-dynamic";
@@ -43,6 +43,7 @@ export async function GET(request: Request) {
   } catch (error) {
     if (error instanceof z.ZodError) return privateJson({ error: "Filtros inválidos.", details: error.flatten() }, { status: 400 });
     if (error instanceof FinanceAnalyticsValidationError) return privateJson({ error: error.message }, { status: 400 });
+    if (error instanceof FinanceAnalyticsIntegrityError) return privateJson({ error: error.message }, { status: 409 });
     console.error("finance_analytics_failed", error);
     return privateJson({ error: "Não foi possível carregar a análise financeira." }, { status: 500 });
   }

@@ -129,11 +129,44 @@ test("analytics apresenta a numeração original de parcelamento importado", () 
   const { db, a } = seedAnalyticsScenario();
   db.prepare("UPDATE card_purchases SET origin = 'system' WHERE household_id = ? AND id = 'purchase_active'").run(a.household);
   db.prepare("INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
-    .run("batch_imported", a.household, "card_a", a.user, "analytics-import", "fingerprint", "2026-09", 30_000, 0, 1, 3, "pending", AT);
+    .run("batch_imported", a.household, "card_a", a.user, "analytics-import", "fingerprint", "2026-09", 10_000, 0, 1, 3, "pending", AT);
   db.prepare("INSERT INTO card_purchase_import_metadata(id,household_id,purchase_id,import_batch_id,first_original_installment_number,original_installment_count,original_total_cents,original_purchase_date,imported_at) VALUES(?,?,?,?,?,?,?,?,?)")
     .run("metadata_imported", a.household, "purchase_active", "batch_imported", 5, 7, 30_000, "2026-05-01", AT);
+  db.prepare("UPDATE card_import_batches SET status = 'completed', completed_at = ? WHERE household_id = ? AND id = 'batch_imported'").run(AT, a.household);
   const rows = events(db, a.household, "WHERE e.entity_type = 'card_installment' ORDER BY e.installment_number");
   assert.deepEqual(rows.map((row) => [row.installment_number, row.installment_count]), [[5, 7], [6, 7], [7, 7]]);
+});
+
+test("analytics falha fechado quando metadata importada não corresponde às parcelas físicas", () => {
+  const { db, a } = seedAnalyticsScenario();
+  db.prepare("UPDATE card_purchases SET origin = 'system' WHERE household_id = ? AND id = 'purchase_active'").run(a.household);
+  db.prepare("INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run("batch_inconsistent", a.household, "card_a", a.user, "analytics-inconsistent", "fingerprint", "2026-09", 10_000, 0, 1, 3, "pending", AT);
+  db.prepare("INSERT INTO card_purchase_import_metadata(id,household_id,purchase_id,import_batch_id,first_original_installment_number,original_installment_count,original_total_cents,original_purchase_date,imported_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("metadata_inconsistent", a.household, "purchase_active", "batch_inconsistent", 5, 7, 30_000, "2026-05-01", AT);
+  db.prepare("UPDATE card_import_batches SET status = 'completed', completed_at = ? WHERE household_id = ? AND id = 'batch_inconsistent'").run(AT, a.household);
+  db.exec("DROP TRIGGER card_purchase_import_metadata_immutable_update");
+  db.prepare("UPDATE card_purchase_import_metadata SET original_installment_count = 8 WHERE household_id = ? AND purchase_id = 'purchase_active'").run(a.household);
+  const rows = events(db, a.household, "WHERE e.entity_type = 'card_installment'");
+  assert.equal(rows.length, 3);
+  assert.ok(rows.every((row) => row.installment_number === null && row.installment_count === null));
+  const service = readFileSync(new URL("../lib/finance-analytics-service.ts", import.meta.url), "utf8");
+  const route = readFileSync(new URL("../app/api/finance/analytics/route.ts", import.meta.url), "utf8");
+  assert.match(service, /throw new FinanceAnalyticsIntegrityError/u);
+  assert.match(route, /FinanceAnalyticsIntegrityError[\s\S]+status: 409/u);
+});
+
+test("analytics falha fechado quando metadata aponta para batch de outro cartão", () => {
+  const { db, a } = seedAnalyticsScenario();
+  db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run("card_other", a.household, "Outro", "Banco", "A", 500_000, 5, 10, AT, AT);
+  db.prepare("UPDATE card_purchases SET origin = 'system' WHERE household_id = ? AND id = 'purchase_active'").run(a.household);
+  db.prepare("INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run("batch_wrong_card", a.household, "card_other", a.user, "analytics-wrong-card", "fingerprint", "2026-09", 30_000, 0, 1, 3, "pending", AT);
+  db.exec("DROP TRIGGER card_purchase_import_metadata_relations_insert");
+  db.prepare("INSERT INTO card_purchase_import_metadata(id,household_id,purchase_id,import_batch_id,first_original_installment_number,original_installment_count,original_total_cents,original_purchase_date,imported_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("metadata_wrong_card", a.household, "purchase_active", "batch_wrong_card", 5, 7, 30_000, "2026-05-01", AT);
+  const rows = events(db, a.household, "WHERE e.entity_type = 'card_installment'");
+  assert.ok(rows.every((row) => row.installment_number === null && row.installment_count === null));
 });
 
 test("saldo usa todo o histórico, ignora futuro e mantém contas inativas separadas", () => {

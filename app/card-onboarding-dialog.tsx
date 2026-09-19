@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { buildOnboardingPayload, createOnboardingAttemptManager, friendlyOnboardingError, nextOriginalInstallments, referenceMonthOptions, validateInstallmentDraft } from "@/lib/card-onboarding-ui-rules.mjs";
+import { buildOnboardingPayload, canAddOnboardingCommitment, createOnboardingAttemptManager, friendlyOnboardingError, MAX_ONBOARDING_COMMITMENTS, nextOriginalInstallments, parseOnboardingSuccessResponse, referenceMonthOptions, validateInstallmentDraft } from "@/lib/card-onboarding-ui-rules.mjs";
 
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: { id: string; name: string; categoryId: string; isActive?: boolean }[] };
 type Card = { id: string; name: string };
@@ -78,8 +78,8 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
     const idempotencyKey = attempt.current.keyFor(result.payload);
     try {
       const body = await onboardingRequest("/api/finance/card-onboarding", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...result.payload, idempotencyKey }) });
-      const outcome = { declaredCurrentInvoiceTotalCents: Number(body.declaredCurrentInvoiceTotalCents), openingBalanceCents: Number(body.openingBalanceCents), importedPurchaseCount: Number(body.importedPurchaseCount), importedInstallmentCount: Number(body.importedInstallmentCount) };
-      if (Object.values(outcome).some((value) => !Number.isSafeInteger(value) || value < 0)) throw Object.assign(new Error("Resposta financeira inválida."), { status: 500 });
+      const outcome = parseOnboardingSuccessResponse(body, card.id);
+      if (!outcome) throw Object.assign(new Error("Resposta financeira inválida."), { status: 502 });
       attempt.current.clear(); setSuccess(outcome); setStep("success"); setEligibility("ineligible");
       try { await onChanged(); } catch { setError("A configuração foi concluída, mas a tela não pôde ser atualizada. Recarregue a página."); }
     } catch (caught) {
@@ -128,7 +128,8 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
               <Button className="sm:col-span-2 sm:justify-self-start" type="button" variant="outline" onClick={() => setInstallments((current) => current.filter((item) => item.id !== installment.id))}><Trash2 className="h-4 w-4" /> Remover parcelamento</Button>
             </fieldset>;
           })}
-          <Button type="button" variant="outline" onClick={() => setInstallments((current) => [...current, newInstallment()])}><Plus className="h-4 w-4" /> Adicionar parcelamento</Button>
+          <Button type="button" variant="outline" disabled={!canAddOnboardingCommitment(installments.length)} onClick={() => setInstallments((current) => canAddOnboardingCommitment(current.length) ? [...current, newInstallment()] : current)}><Plus className="h-4 w-4" /> Adicionar parcelamento</Button>
+          {installments.length >= MAX_ONBOARDING_COMMITMENTS && <p className="text-sm text-[#52645f]" role="status">Limite de {MAX_ONBOARDING_COMMITMENTS} parcelamentos atingido. Remova um item para adicionar outro.</p>}
           <DialogFooter><Button variant="outline" onClick={() => setStep("invoice")}>Voltar</Button><Button onClick={continueFromInstallments}>Revisar</Button></DialogFooter>
         </div>}
 

@@ -44,6 +44,7 @@ type SqlRow = Record<string, unknown>;
 type QueryParts = { sql: string; bindings: unknown[] };
 
 export class FinanceAnalyticsValidationError extends Error {}
+export class FinanceAnalyticsIntegrityError extends Error {}
 
 const NO_CATEGORY = "Sem categoria";
 const NO_SUBCATEGORY = "Sem subcategoria";
@@ -138,6 +139,9 @@ function detailSelect(where: string, suffix = "") {
 }
 
 function mapDetail(row: SqlRow): AnalyticsDetail {
+  if (row.entity_type === "card_installment" && (row.installment_number === null || row.installment_number === undefined || row.installment_count === null || row.installment_count === undefined)) {
+    throw new FinanceAnalyticsIntegrityError("Os dados de parcelamento estão inconsistentes e não podem ser exibidos.");
+  }
   return {
     id: String(row.id),
     entityType: row.entity_type === "card_installment" ? "card_installment" : "transaction",
