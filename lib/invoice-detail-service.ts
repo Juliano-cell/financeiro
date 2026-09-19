@@ -27,6 +27,7 @@ type DetailRow = {
   installment_count: number;
   first_original_installment_number: number | null;
   original_installment_count: number | null;
+  original_total_cents: number | null;
   valid_import_batch_id: string | null;
   purchase_total_cents: number;
   origin: "web" | "telegram" | "system";
@@ -69,6 +70,10 @@ function item(row: DetailRow): InvoiceDetailItem {
     originalCount: row.original_installment_count,
   });
   if (!display) throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
+  const purchaseTotalCents = row.origin === "system" ? row.original_total_cents : row.purchase_total_cents;
+  if (!Number.isSafeInteger(purchaseTotalCents) || purchaseTotalCents === null || purchaseTotalCents <= 0) {
+    throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
+  }
   return {
     installmentId: row.installment_id,
     purchaseId: row.purchase_id,
@@ -81,7 +86,7 @@ function item(row: DetailRow): InvoiceDetailItem {
     installmentAmountCents: row.installment_amount_cents,
     installmentNumber: display.installmentNumber,
     installmentCount: display.installmentCount,
-    purchaseTotalCents: row.purchase_total_cents,
+    purchaseTotalCents,
     origin: row.origin,
     status: row.status,
     includedInTotal,
@@ -139,6 +144,7 @@ const ITEM_SELECT = `SELECT
   s.installment_count,
   m.first_original_installment_number,
   m.original_installment_count,
+  m.original_total_cents,
   ib.id AS valid_import_batch_id,
   p.total_cents AS purchase_total_cents,
   p.origin,

@@ -28,6 +28,7 @@ const invoiceDetails = await import("../app/api/finance/invoice-details/route.ts
 const main = await import("../app/api/finance/route.ts");
 const notifications = await import("../app/api/notifications/run/route.ts");
 const { getCurrentAccountBalances, getFinanceAnalytics } = await import("../lib/finance-analytics-service.ts");
+const { configureCardCurrentState } = await import("../lib/card-onboarding-service.ts");
 const { createCardPurchase } = await import("../lib/finance-service.ts");
 const { handleTelegramUpdate } = await import("../lib/telegram-handler.ts");
 const COOKIE = "isolated-fixture-session";
@@ -57,7 +58,7 @@ class LocalD1 {
     catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
 }
-async function setup(t, clock = "2026-10-02T12:00:00Z") {
+async function setup(t, clock = "2026-10-02T12:00:00Z", seedPurchase = true) {
   const NativeDate = globalThis.Date;
   globalThis.Date = class extends NativeDate {
     constructor(...args) { super(...(args.length ? args : [clock])); }
@@ -89,8 +90,30 @@ async function setup(t, clock = "2026-10-02T12:00:00Z") {
   const d1 = new LocalD1(db); Object.assign(runtime, { DB: d1, TELEGRAM_BOT_TOKEN: "fixture", NOTIFICATION_CRON_SECRET: "fixture" });
   globalThis.__invoiceTestCookie = COOKIE;
   const f = { db, d1, sent };
-  await buy(f, 50000);
-  f.invoiceId = db.prepare("SELECT id FROM card_invoices WHERE household_id='ha'").get().id;
+  if (seedPurchase) {
+    await buy(f, 50000);
+    f.invoiceId = db.prepare("SELECT id FROM card_invoices WHERE household_id='ha'").get().id;
+  }
+  return f;
+}
+
+async function setupImported(t) {
+  const f = await setup(t, "2026-09-16T12:00:00Z", false);
+  const result = await configureCardCurrentState({
+    cardId: "carda",
+    initialReferenceMonth: "2026-09",
+    declaredCurrentInvoiceTotalCents: 10000,
+    idempotencyKey: "invoice-detail-import",
+    commitments: [{
+      description: "Compra teste antiga",
+      installmentAmountCents: 6000,
+      firstOriginalInstallmentNumber: 5,
+      originalInstallmentCount: 10,
+      originalTotalCents: 60000,
+      categoryId: "cata",
+    }],
+  }, { householdId: "ha", userId: "ua", d1: f.d1, timestamp: AT });
+  f.invoiceId = result.invoiceId;
   return f;
 }
 async function buy(f, totalCents, suffix = "a") {
@@ -284,6 +307,82 @@ test("detalhe mostra somente a parcela da competência com numeração e valor o
   const response = await detail({ invoiceId: october });
   assert.equal(response.status, 200); assert.equal(response.body.active.totalItems, 1);
   assert.deepEqual(response.body.active.items.map(item => [item.description, item.installmentNumber, item.installmentCount, item.installmentAmountCents, item.purchaseTotalCents]), [["Parcelada", 2, 3, 10000, 30000]]);
+});
+
+test("detalhe importado usa total histórico do metadata sem alterar fatos financeiros", async t => {
+  const f = await setupImported(t);
+  const tables = ["card_import_batches", "card_invoice_adjustments", "card_purchase_import_metadata", "card_purchases", "card_invoices", "card_installments", "transactions", "audit_logs"];
+  const before = tables.map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
+  const invoices = f.db.prepare("SELECT id,reference_month FROM card_invoices WHERE household_id='ha' ORDER BY reference_month").all();
+  const displayed = [];
+  for (const invoice of invoices) {
+    const response = await detail({ invoiceId: invoice.id });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.active.items.length, 1);
+    displayed.push(response.body.active.items[0]);
+    const expectedTotal = invoice.reference_month === "2026-09" ? 10000 : 6000;
+    assert.equal(response.body.invoice.invoiceTotalCents, expectedTotal);
+  }
+  assert.deepEqual(displayed.map(item => [item.installmentNumber, item.installmentCount]), [[5, 10], [6, 10], [7, 10], [8, 10], [9, 10], [10, 10]]);
+  assert.ok(displayed.every(item => item.installmentAmountCents === 6000));
+  assert.ok(displayed.every(item => item.purchaseTotalCents === 60000));
+  assert.equal(displayed.some(item => item.purchaseTotalCents === 36000), false);
+  assert.deepEqual({ ...f.db.prepare("SELECT total_cents,installment_count FROM card_purchases WHERE household_id='ha'").get() }, { total_cents: 36000, installment_count: 6 });
+  assert.deepEqual({ ...f.db.prepare("SELECT original_total_cents,first_original_installment_number,original_installment_count FROM card_purchase_import_metadata WHERE household_id='ha'").get() }, { original_total_cents: 60000, first_original_installment_number: 5, original_installment_count: 10 });
+  assert.deepEqual({ ...f.db.prepare("SELECT amount_cents,status FROM card_invoice_adjustments WHERE household_id='ha'").get() }, { amount_cents: 4000, status: "active" });
+  assert.equal(count(f, "transactions"), 0);
+  const after = tables.map(table => f.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
+  assert.deepEqual(after, before);
+});
+
+test("detalhe de importação falha fechado quando o total histórico está ausente", async t => {
+  const f = await setupImported(t);
+  f.db.exec("DROP TRIGGER card_purchase_import_metadata_immutable_update");
+  f.db.prepare("UPDATE card_purchase_import_metadata SET original_total_cents=NULL WHERE household_id='ha'").run();
+  const response = await detail({ invoiceId: f.invoiceId });
+  assert.equal(response.status, 409);
+  assert.equal(response.body.code, "INVOICE_DETAIL_INCONSISTENT");
+});
+
+test("detalhe de importação falha fechado para metadata ligada a outro batch", async t => {
+  const f = await setupImported(t);
+  f.db.exec("DROP TRIGGER card_purchase_import_metadata_immutable_update");
+  f.db.exec("DROP INDEX card_import_batches_active_card_unique");
+  f.db.exec("DROP TRIGGER card_import_batches_financial_identity_insert");
+  f.db.prepare(`INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at,completed_at,voided_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run("other-batch", "ha", "carda", "ua", "other-batch-key", "other-batch-fingerprint", "2026-09", 0, 0, 0, 0, "pending", AT, null, null);
+  f.db.prepare("UPDATE card_purchase_import_metadata SET import_batch_id='other-batch' WHERE household_id='ha'").run();
+  assert.equal((await detail({ invoiceId: f.invoiceId })).status, 409);
+});
+
+test("detalhe de importação falha fechado para metadata ligada a cartão incompatível", async t => {
+  const f = await setupImported(t);
+  f.db.exec("DROP TRIGGER card_purchase_import_metadata_immutable_update");
+  f.db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    .run("carda-other", "ha", "Outro cartão", "Fixture", "Fixture", 500000, 17, 25, AT, AT);
+  f.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("other-card-invoice", "ha", "carda-other", "2026-09", "2026-09-25", "2026-09-17", "open", AT, AT);
+  f.db.prepare(`INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at,completed_at,voided_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run("other-card-batch", "ha", "carda-other", "ua", "other-card-key", "other-card-fingerprint", "2026-09", 0, 0, 0, 0, "pending", AT, null, null);
+  f.db.prepare("UPDATE card_import_batches SET status='completed',completed_at=? WHERE household_id='ha' AND id='other-card-batch'").run(AT);
+  f.db.prepare("UPDATE card_purchase_import_metadata SET import_batch_id='other-card-batch' WHERE household_id='ha'").run();
+  assert.equal((await detail({ invoiceId: f.invoiceId })).status, 409);
+});
+
+test("metadata de outro household nunca substitui a importação local", async t => {
+  const f = await setupImported(t);
+  const foreign = await buy(f, 12000, "b");
+  f.db.prepare("UPDATE card_purchases SET origin='system' WHERE household_id='hb' AND id=?").run(foreign.id);
+  f.db.prepare(`INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at,completed_at,voided_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run("foreign-batch", "hb", "cardb", "ub", "foreign-key", "foreign-fingerprint", "2026-09", 12000, 0, 1, 1, "pending", AT, null, null);
+  f.db.prepare("INSERT INTO card_purchase_import_metadata(id,household_id,purchase_id,import_batch_id,first_original_installment_number,original_installment_count,original_total_cents,original_purchase_date,imported_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("foreign-metadata", "hb", foreign.id, "foreign-batch", 1, 1, 12000, "2026-09-16", AT);
+  f.db.prepare("UPDATE card_import_batches SET status='completed',completed_at=? WHERE household_id='hb' AND id='foreign-batch'").run(AT);
+  f.db.exec("DROP TRIGGER card_purchase_import_metadata_delete");
+  f.db.prepare("DELETE FROM card_purchase_import_metadata WHERE household_id='ha'").run();
+  const response = await detail({ invoiceId: f.invoiceId });
+  assert.equal(response.status, 409);
+  assert.doesNotMatch(JSON.stringify(response.body), /foreign|12000|cardb/iu);
 });
 
 test("detalhe traz categoria/subcategoria e ordenação determinística", async t => {

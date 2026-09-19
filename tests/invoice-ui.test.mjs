@@ -72,6 +72,15 @@ test("detalhamento mostra valor da parcela, numeração, classificação e cance
   assert.equal((html.match(/R\$ 1\.800,00/gu) ?? []).length, 1);
 });
 
+test("detalhamento importado apresenta o total histórico recebido do metadata", () => {
+  const page = { page: 1, pageSize: 10, totalItems: 1, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
+  const imported = { installmentId: "imported-installment", purchaseId: "imported-purchase", purchaseDate: "2026-09-19", description: "Compra teste antiga", categoryId: null, categoryName: null, subcategoryId: null, subcategoryName: null, installmentAmountCents: 6000, installmentNumber: 5, installmentCount: 10, purchaseTotalCents: 60000, origin: "system", status: "pending", includedInTotal: true };
+  const detail = { invoice: { ...invoice, invoiceTotalCents: 10000, paidCents: 0, remainingCents: 10000, paymentStatus: "unpaid" }, adjustments: [{ adjustmentId: "opening", itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 4000, status: "active", includedInTotal: true }], active: { ...page, items: [imported] }, cancelled: { ...page, totalItems: 0, items: [] } };
+  const html = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail, onActivePage() {}, onCancelledPage() {} }));
+  for (const expected of ["Compra teste antiga", "R$ 60,00", "Parcela 5/10", "Valor original da compra: R$ 600,00", "Saldo anterior à implantação", "R$ 40,00"]) assert.ok(html.includes(expected), expected);
+  assert.doesNotMatch(html, /Valor original da compra: R\$ 360,00/u);
+});
+
 test("detalhamento exibe opening balance separado e reconciliável em todas as páginas", () => {
   const adjustment = { adjustmentId: "opening", itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 130000, status: "active", includedInTotal: true };
   const installment = { installmentId: "part", purchaseId: "purchase", purchaseDate: "2026-09-18", description: "Compra importada", categoryId: null, categoryName: null, subcategoryId: null, subcategoryName: null, installmentAmountCents: 10000, installmentNumber: 1, installmentCount: 1, purchaseTotalCents: 10000, origin: "system", status: "pending", includedInTotal: true };
