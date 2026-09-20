@@ -63,3 +63,34 @@ Uma etapa posterior deverá, de forma controlada:
 
 Até essa decisão, não deve haver execução simultânea dos dois caminhos de
 envio para o mesmo evento.
+
+## Planner local de contas a pagar
+
+`lib/notification-planner.ts` implementa o planner independente da Etapa 3A.
+Ele não possui rota HTTP nem agendamento: recebe um D1 e um relógio injetável,
+seleciona somente preferências `telegram` habilitadas com membership e vínculo
+Telegram ativos e cria itens na outbox pelo repositório idempotente da fundação.
+O vínculo é apenas validado por existência; `chat_id`, token e conteúdo de
+mensagem não são lidos nem copiados.
+
+Somente contas a pagar com status `pending` são consideradas. Para cada
+destinatário, o planner examina o intervalo civil ontem/hoje/amanhã no timezone
+da preferência. Faturas de cartão e `upcoming_digest` ficam fora desta etapa.
+As datas de referência têm a seguinte semântica:
+
+- `bill_due_tomorrow`: dia local em que a conta se torna elegível ao aviso;
+- `bill_due_today`: dia local do vencimento e do aviso;
+- `bill_overdue`: primeiro dia local após o vencimento.
+
+Por isso, uma conta atrasada há dois ou mais dias não gera novo evento. A
+identidade persistida continua sendo a composição determinística da fundação,
+e não o timestamp da execução.
+
+O resumo do planner contém apenas contadores: destinatários e contas avaliados,
+eventos elegíveis, inseridos, deduplicados e ignorados. `billsEvaluated` conta a
+avaliação por destinatário; nenhum valor, descrição, identificador ou dado do
+Telegram é retornado.
+
+Planejamento não garante entrega. Antes de qualquer envio, o futuro dispatcher
+deverá revalidar que a conta continua `pending`, a membership continua ativa, o
+vínculo Telegram continua ativo e a preferência/evento continuam habilitados.
