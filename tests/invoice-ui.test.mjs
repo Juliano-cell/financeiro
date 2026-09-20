@@ -11,7 +11,7 @@ const { buildInvoicePayment, buildInvoiceReversal, createFinancialRefreshControl
 
 const invoice = { id: "fixture-invoice", cardId: "fixture-card", referenceMonth: "2026-09", dueDate: "2026-09-20", closesOn: "2026-09-18", cycleStatus: "open", paymentStatus: "settled", invoiceTotalCents: 50000, paidCents: 50000, remainingCents: 0, status: "paid", installments: [] };
 const reopened = { ...invoice, invoiceTotalCents: 60000, remainingCents: 10000, paymentStatus: "partial" };
-const accounts = [{ id: "fixture-account", name: "Conta de teste", isActive: true }, { id: "inactive", name: "Conta inativa", isActive: false }];
+const accounts = [{ id: "fixture-account", name: "Conta de teste", currentBalanceCents: 8313, isActive: true }, { id: "inactive", name: "Conta inativa", currentBalanceCents: 100, isActive: false }];
 const source = readFileSync(new URL("../app/invoice-lifecycle.tsx", import.meta.url), "utf8");
 const detailSource = readFileSync(new URL("../app/invoice-detail-dialog.tsx", import.meta.url), "utf8");
 const advanced = readFileSync(new URL("../app/advanced-finance.tsx", import.meta.url), "utf8");
@@ -20,7 +20,7 @@ const parent = readFileSync(new URL("../app/finance-app.tsx", import.meta.url), 
 // Execute the real React component, substituting only visual primitives/API transport.
 // No browser, database, network or generated file is required.
 const primitives = `import {createElement} from ${JSON.stringify(import.meta.resolve("react"))};
-${["Button", "Badge", "Input", "Label", "Dialog", "DialogContent", "DialogDescription", "DialogFooter", "DialogHeader", "DialogTitle"].map((name) => `export function ${name}({children,...props}) { return createElement(${JSON.stringify(({ Button: "button", Input: "input", Label: "label", DialogTitle: "h2" })[name] ?? "div")}, props, children); }`).join("\n")}`;
+${["Button", "Badge", "Input", "Label", "Dialog", "DialogContent", "DialogDescription", "DialogFooter", "DialogHeader", "DialogTitle", "Select", "SelectContent", "SelectItem", "SelectTrigger", "SelectValue"].map((name) => `export function ${name}({children,...props}) { return createElement(${JSON.stringify(({ Button: "button", Input: "input", Label: "label", DialogTitle: "h2" })[name] ?? "div")}, props, children); }`).join("\n")}`;
 const primitiveUrl = `data:text/javascript,${encodeURIComponent(primitives)}`;
 const apiUrl = `data:text/javascript,${encodeURIComponent("export class AdvancedApiError extends Error {} export async function advancedApi(){throw new Error('transport not enabled in render test')} ")}`;
 let compiledDetail = ts.transpileModule(detailSource, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -37,7 +37,7 @@ compiled = compiled.replace(/from "([^"]+)"/gu, (_, specifier) => {
 });
 const { InvoiceLifecycle, InvoiceOperationDialog } = await import(`data:text/javascript,${encodeURIComponent(compiled)}`);
 const lifecycleUrl = `data:text/javascript,${encodeURIComponent(compiled)}`;
-const extraPrimitives = `${primitives}\n${["Checkbox", "Select", "SelectContent", "SelectItem", "SelectTrigger", "SelectValue"].map((name) => `export function ${name}({children}) { return createElement("div", null, children); }`).join("\n")}`;
+const extraPrimitives = `${primitives}\nexport function Checkbox({children,...props}) { return createElement("div", props, children); }`;
 let compiledAdvanced = ts.transpileModule(advanced, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiledAdvanced = compiledAdvanced.replace(/from "([^"]+)"/gu, (_, specifier) => {
   const url = specifier.startsWith("@/components/") ? `data:text/javascript,${encodeURIComponent(extraPrimitives)}` : specifier === "@/app/invoice-lifecycle" ? lifecycleUrl : specifier === "@/app/card-onboarding-dialog" ? "data:text/javascript,export function CardOnboardingAction(){return null}" : specifier.startsWith("@/lib/") ? new URL(`../lib/${specifier.slice(6)}`, import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
@@ -171,10 +171,9 @@ test("pagamento exige escolha de uma conta ativa", () => {
 });
 test("dialog real inicia sem conta e não escolhe primeira conta", () => {
   const html = renderDialog({ kind: "payment" });
-  assert.match(html, /value="" disabled="" selected=""/);
-  assert.match(html, /Selecione uma conta/); assert.doesNotMatch(html, /Conta inativa/);
+  assert.match(html, /Selecione uma conta/); assert.match(html, /Conta de teste/); assert.match(html, /83,13/); assert.doesNotMatch(html, /Conta inativa/);
   assert.match(html, /disabled="">Confirmar pagamento/);
-  assert.match(html, /Valor restante/); assert.match(html, /100,00/);
+  assert.match(html, />Valor</); assert.match(html, /100,00/);
 });
 test("operationId seguro e novo a cada nova tentativa, sem amount autoritativo", () => {
   const a = buildInvoicePayment(reopened, accounts[0].id, accounts, "2026-09-16");
@@ -243,15 +242,51 @@ test("data local usa America/Sao_Paulo em virada de mês/ano", () => {
 });
 for (const status of [400, 401, 403, 404, 409, 503]) test(`erro HTTP${status} possui mensagem amigável`, () => assert.ok(invoiceErrorMessage(status).length > 15));
 test("limite total/utilizado/disponível usam exclusivamente o snapshot canônico, inclusive negativo", () => {
-  assert.match(advanced, /label="Utilizado" value=\{brl\(item.usedCents\)\}/);
-  assert.match(advanced, /label="Disponível" value=\{brl\(item.availableCents\)\}/);
+  assert.match(advanced, /label="Utilizado" value=\{brl\(card.usedCents\)\}/);
+  assert.match(advanced, /label="Disponível" value=\{brl\(card.availableCents\)\}/);
   assert.doesNotMatch(advanced, /Math.max\([^\n]*availableCents|installments.reduce/);
-  assert.match(advanced, /invoice=\{invoice\}/); assert.doesNotMatch(advanced, /invoice.status === "paid"|accounts.find\(\(item\) => item.isActive\)/);
+  assert.match(advanced, /invoice=\{selectedInvoice\}/); assert.doesNotMatch(advanced, /invoice.status === "paid"|accounts.find\(\(item\) => item.isActive\)/);
 });
-test("cartões reais exibem utilizado1200 e disponível negativo sem recalcular parcelas", () => {
-  const card = { id: invoice.cardId, name: "Cartão de teste", institution: "Instituição de teste", holder: "Titular de teste", limitCents: 100000, usedCents: 120000, availableCents: -20000, currentInvoiceCents: 40000, nextInvoiceCents: 40000, installmentPurchaseCount: 1, closingDay: 18, dueDay: 20, isActive: true };
-  const html = renderToStaticMarkup(createElement(AdvancedFinanceView, { view: "cards", data: { cards: [card], invoices: [invoice], selectedMonth: "2026-09" }, accounts, categories: [], onChanged: async () => {} }));
-  assert.match(html, /Utilizado/); assert.match(html, /1\.200,00/); assert.match(html, /-R\$\s*200,00/);
+const cardFixture = { id: invoice.cardId, name: "Cartão de teste", institution: "Instituição de teste", holder: "Titular de teste", limitCents: 100000, usedCents: 120000, availableCents: -20000, currentInvoiceCents: 40000, nextInvoiceCents: 40000, installmentPurchaseCount: 1, closingDay: 18, dueDay: 20, isActive: true };
+test("resumo compacto exibe disponível negativo sem recalcular parcelas nem expandir fatura", () => {
+  const html = renderToStaticMarkup(createElement(AdvancedFinanceView, { view: "cards", data: { cards: [cardFixture], invoices: [invoice], selectedMonth: "2026-09" }, accounts, categories: [], onChanged: async () => {} }));
+  assert.match(html, /Disponível/); assert.match(html, /Próxima fatura/); assert.match(html, /-R\$\s*200,00/); assert.match(html, /Ver cartão/);
+  assert.doesNotMatch(html, /Utilizado|1\.200,00|Total da fatura/);
+});
+test("resumo do cartão prioriza o restante canônico da fatura atual", () => {
+  const current = { ...reopened, id: "current-partial", remainingCents: 12345, cardId: cardFixture.id };
+  const html = renderToStaticMarkup(createElement(AdvancedFinanceView, { view: "cards", data: { cards: [{ ...cardFixture, nextInvoiceCents: 99999 }], invoices: [current], selectedMonth: "2026-09" }, accounts, categories: [], onChanged: async () => {} }));
+  assert.match(html, /Restante da fatura/); assert.match(html, /R\$\s*123,45/);
+  assert.doesNotMatch(html, /Próxima fatura|999,99/);
+});
+test("resumo do cartão usa próxima fatura do backend quando a atual não tem saldo", () => {
+  const html = renderToStaticMarkup(createElement(AdvancedFinanceView, { view: "cards", data: { cards: [cardFixture], invoices: [invoice], selectedMonth: "2026-09" }, accounts, categories: [], onChanged: async () => {} }));
+  assert.match(html, /Próxima fatura/); assert.match(html, /R\$\s*400,00/);
+  assert.doesNotMatch(html, /Restante da fatura/);
+});
+test("cinco cartões continuam compactos e não expandem nenhuma fatura na tela principal", () => {
+  const cards = Array.from({ length: 5 }, (_, index) => ({ ...cardFixture, id: `card-${index}`, name: `Cartão ${index + 1}` }));
+  const html = renderToStaticMarkup(createElement(AdvancedFinanceView, { view: "cards", data: { cards, invoices: cards.map((card, index) => ({ ...invoice, id: `invoice-${index}`, cardId: card.id })), selectedMonth: "2026-09" }, accounts, categories: [], onChanged: async () => {} }));
+  assert.equal((html.match(/Ver cartão/gu) ?? []).length, 5);
+  assert.doesNotMatch(html, /Total da fatura|Histórico de pagamentos|Pagar restante/);
+});
+test("pagamento usa seletor integrado com nome e saldo, sem select nativo", () => {
+  assert.match(source, /<Select value=\{accountId \|\| "none"\}/);
+  assert.match(source, /account.name\} · \{money\(account.currentBalanceCents\)\}/);
+  assert.doesNotMatch(source, /<select id="invoice-account"/);
+});
+test("histórico é um diálogo isolado e não expande dentro da fatura", () => {
+  assert.match(source, /<Dialog open=\{historyOpen\}/);
+  assert.match(source, /Consulte os pagamentos e reversões desta fatura/);
+  assert.doesNotMatch(source, /ficam isolados das demais faturas/);
+  assert.doesNotMatch(source, /historyOpen && <div className="mt-4 border-t/);
+});
+test("reversão abre confirmação antes da data e não aciona calendário por foco automático", () => {
+  const event = invoiceHistoryEvents({ ...history, operations: [] }, accounts)[0];
+  const html = renderDialog({ kind: "reversal", event });
+  assert.match(html, /Data da reversão/); assert.match(html, /type="date"/); assert.match(html, /Fatura/); assert.match(html, /09\/2026/);
+  assert.match(source, /onOpenAutoFocus=\{\(event\) => \{ event.preventDefault\(\); cancelButton.current\?\.focus\(\); \}\}/);
+  assert.doesNotMatch(source, /autoFocus|showPicker\(/);
 });
 test("advancedApi preserva status409 e encaminha AbortSignal sem consultar rede", async () => {
   const original = globalThis.fetch;
@@ -274,6 +309,29 @@ test("mobile não exige tabela horizontal e mantém modal/controles acessíveis"
   assert.doesNotMatch(html, /<table|overflow-x-auto/); assert.match(html, /sm:grid-cols-3/);
   assert.match(source, /max-h-\[85dvh\] overflow-y-auto/); assert.match(source, /min-h-11/);
   assert.match(source, /htmlFor="invoice-account"/); assert.match(source, /role="alert"/);
+});
+test("layout móvel reserva a altura real da navegação fixa e respeita a safe area", () => {
+  assert.match(parent, /\[--mobile-nav-offset:calc\(4\.5rem\+env\(safe-area-inset-bottom\)\)\]/);
+  assert.match(parent, /pb-\[var\(--mobile-nav-offset\)\]/);
+  assert.match(parent, /min-h-\[var\(--mobile-nav-offset\)\]/);
+  assert.match(parent, /pb-\[calc\(0\.375rem\+env\(safe-area-inset-bottom\)\)\]/);
+  assert.doesNotMatch(parent, /<section className="pb-20/);
+});
+test("cabeçalho contextual participa do fluxo no mobile e só fica sticky no desktop", () => {
+  assert.match(parent, /<header className="flex[^\"]*lg:sticky lg:top-0 lg:z-20"/);
+  assert.doesNotMatch(parent, /<header className="sticky top-0 z-20/);
+});
+test("detalhe e atalhos de fatura usam grids compactos sem perder ações táteis", () => {
+  assert.match(advanced, /grid min-w-0 grid-cols-2 gap-3 xl:grid-cols-4/);
+  assert.match(advanced, /rounded-2xl border bg-white p-3 sm:p-4/);
+  assert.match(advanced, /bg-white p-3\.5 sm:p-4/);
+  assert.match(advanced, /mt-3 min-h-11 w-full sm:w-auto/);
+  assert.match(advanced, /Veja os próximos vencimentos deste cartão/);
+  assert.doesNotMatch(advanced, /Apenas uma fatura permanece expandida por vez|Resumos compactos dos próximos ciclos/);
+});
+test("pagamento explica a ação em linguagem de usuário", () => {
+  assert.match(source, /Confira o valor restante e escolha a conta usada para o pagamento/);
+  assert.doesNotMatch(source, /escolha explicitamente a conta|O residual será pago integralmente/);
 });
 test("ignora histórico abortado/obsoleto e callbacks após desmontagem", () => {
   assert.match(source, /return \(\) => controller.abort\(\)/);
@@ -362,11 +420,47 @@ const control = (tree, label) => nodes(tree).find((node) => node.props.onClick &
 const deferred = () => { let resolve, reject; const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; }); return { promise, resolve, reject }; };
 const flush = async () => { for (let i = 0; i < 16; i++) await Promise.resolve(); };
 function financialFixture() { const financial = createFinancialRefreshController(); financial.mount(); return financial; }
+test("Ver cartão abre subview, organiza faturas e voltar restaura a lista compacta", () => {
+  const h = hookHarness(), store = h.store();
+  const cards = Array.from({ length: 5 }, (_, index) => ({ ...cardFixture, id: `card-${index}`, name: `Cartão ${index + 1}` }));
+  const invoices = [
+    { ...reopened, id: "current", cardId: cards[0].id, referenceMonth: "2026-09" },
+    { ...reopened, id: "future", cardId: cards[0].id, referenceMonth: "2026-10", dueDate: "2026-10-20", paidCents: 0, paymentStatus: "unpaid" },
+    { ...invoice, id: "history", cardId: cards[0].id, referenceMonth: "2026-08", dueDate: "2026-08-20" },
+  ];
+  const props = { data: { cards, invoices, selectedMonth: "2026-09" }, accounts, categories: [], onChanged: async () => {} };
+  const render = () => h.render(h.CardsView, props, store);
+  let tree = render();
+  assert.equal(nodes(tree).filter((node) => node.type === h.InvoiceLifecycle).length, 0);
+  assert.equal(nodes(tree).filter((node) => node.props.onClick && text(node).includes("Ver cartão")).length, 5);
+  control(tree, "Ver cartão").props.onClick(); tree = render();
+  for (const label of ["Voltar para cartões", "Fatura relevante", "Próximas faturas", "Histórico e faturas quitadas"]) assert.ok(text(tree).includes(label), label);
+  const expanded = nodes(tree).filter((node) => node.type === h.InvoiceLifecycle); assert.equal(expanded.length, 1); assert.equal(expanded[0].props.invoice.id, "current");
+  control(tree, "Abrir fatura").props.onClick(); tree = render();
+  const selected = nodes(tree).filter((node) => node.type === h.InvoiceLifecycle); assert.equal(selected.length, 1); assert.equal(selected[0].props.invoice.id, "future");
+  control(tree, "Voltar para cartões").props.onClick(); tree = render(); assert.equal(nodes(tree).filter((node) => node.type === h.InvoiceLifecycle).length, 0);
+});
+test("histórico abre modal e reversão abre primeiro o diálogo de confirmação", async () => {
+  const paymentHistory = { payments: [{ id: "payment", accountId: accounts[0].id, amountCents: 10000, paidAt: "2026-09-15" }], operations: [] };
+  const h = hookHarness(async () => paymentHistory), store = h.store(), props = { invoice: reopened, accounts, financial: financialFixture(), onChanged: async () => {} };
+  const render = () => h.render(h.InvoiceLifecycle, props, store);
+  let tree = render(); control(tree, "Histórico de pagamentos").props.onClick(); render(); await flush(); tree = render();
+  const openHistory = nodes(tree).find((node) => node.type === "Dialog" && node.props.open === true); assert.ok(openHistory);
+  control(tree, "Reverter pagamento").props.onClick(); tree = render();
+  const operation = nodes(tree).find((node) => node.type === h.InvoiceOperationDialog); assert.equal(operation.props.editing.kind, "reversal");
+  assert.equal(nodes(tree).find((node) => node.type === "Dialog" && Object.hasOwn(node.props, "open")).props.open, false);
+});
+test("cancelar confirmação de reversão não chama transporte financeiro", () => {
+  let calls = 0, closes = 0; const h = hookHarness(async () => { calls++; }), store = h.store();
+  const event = invoiceHistoryEvents({ ...history, operations: [] }, accounts)[0];
+  const tree = h.render(h.InvoiceOperationDialog, { invoice: reopened, accounts, editing: { kind: "reversal", event }, onClose: () => { closes++; }, onChanged: async () => {}, onInvalidate() {} }, store);
+  control(tree, "Cancelar").props.onClick(); assert.equal(calls, 0); assert.equal(closes, 1);
+});
 function operationFixture(transport, financial = financialFixture(), extra = {}) {
   const harness = hookHarness(transport), store = harness.store();
   const props = { invoice: reopened, accounts, editing: { kind: "payment" }, financial, onInvalidate: () => financial.settle(reopened.id), onClose() {}, onChanged: async () => {}, ...extra };
   let tree = harness.render(harness.InvoiceOperationDialog, props, store);
-  nodes(tree).find((node) => node.props.id === "invoice-account" && node.type === "select").props.onChange({ target: { value: accounts[0].id } });
+  nodes(tree).find((node) => node.type === "Select" && typeof node.props.onValueChange === "function").props.onValueChange(accounts[0].id);
   tree = harness.render(harness.InvoiceOperationDialog, props, store);
   return { harness, store, props, financial, confirm: () => (control(tree, "Confirmar pagamento") ?? control(tree, "Tentar novamente a mesma operação")).props.onClick(), render: () => harness.render(harness.InvoiceOperationDialog, props, store) };
 }
@@ -453,7 +547,7 @@ test("histórico: troca aborta GET antigo; resposta antiga e unmount não atuali
   assert.equal(requests[0].signal.aborted, true); const updates = store.updates;
   requests[0].result.resolve({ payments: [{ id: "old", amountCents: 99900, paidAt: "2026-09-01", accountId: accounts[0].id }], operations: [] }); await flush(); assert.equal(store.updates, updates);
   requests[1].result.resolve({ payments: [], operations: [] }); await flush(); tree = h.render(h.InvoiceLifecycle, props, store); assert.ok(text(tree).includes("Nenhum pagamento registrado")); assert.equal(text(tree).includes("999,00"), false);
-  control(tree, "Histórico de pagamentos").props.onClick(); h.render(h.InvoiceLifecycle, props, store); control(h.render(h.InvoiceLifecycle, props, store), "Histórico de pagamentos").props.onClick(); h.render(h.InvoiceLifecycle, props, store);
+  control(tree, "Fechar histórico").props.onClick(); h.render(h.InvoiceLifecycle, props, store); control(h.render(h.InvoiceLifecycle, props, store), "Histórico de pagamentos").props.onClick(); h.render(h.InvoiceLifecycle, props, store);
   const last = requests.at(-1); h.unmount(store); assert.equal(last.signal.aborted, true); const after = store.updates;
   last.result.reject(new Error("unmounted")); await flush(); assert.equal(store.updates, after);
 });
