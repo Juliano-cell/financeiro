@@ -2,9 +2,47 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { ACCOUNT_MOVEMENTS_CTE, CURRENT_ACCOUNT_BALANCES_SQL, FINANCIAL_EVENTS_CTE } from "../lib/finance-analytics.mjs";
+import {
+  ACCOUNT_BANK_EVENTS_CTE,
+  ACCOUNT_MOVEMENTS_CTE,
+  CURRENT_ACCOUNT_BALANCES_SQL,
+  FINANCIAL_EVENTS_CTE,
+} from "../lib/finance-analytics.mjs";
 
 const AT = "2026-09-12T12:00:00.000Z";
+
+const LEGACY_CURRENT_ACCOUNT_BALANCES_SQL = `
+WITH transaction_totals AS (
+  SELECT
+    account_id,
+    SUM(CASE WHEN type = 'income' THEN amount_cents ELSE -amount_cents END) AS net_cents
+  FROM transactions
+  WHERE household_id = ? AND status = 'confirmed' AND transaction_date <= ?
+  GROUP BY account_id
+), payment_totals AS (
+  SELECT account_id, SUM(signed_cents) AS net_cents
+  FROM (
+    SELECT household_id, account_id, substr(paid_at, 1, 10) AS event_date, -amount_cents AS signed_cents
+    FROM invoice_payments
+    UNION ALL
+    SELECT household_id, account_id, occurred_on, amount_cents
+    FROM invoice_payment_operations WHERE kind = 'reversal'
+  )
+  WHERE household_id = ? AND event_date <= ?
+  GROUP BY account_id
+)
+SELECT
+  a.id AS account_id,
+  a.is_active,
+  a.initial_balance_cents
+    + COALESCE(t.net_cents, 0)
+    + COALESCE(p.net_cents, 0) AS current_balance_cents
+FROM accounts a
+LEFT JOIN transaction_totals t ON t.account_id = a.id
+LEFT JOIN payment_totals p ON p.account_id = a.id
+WHERE a.household_id = ?
+ORDER BY a.id
+`;
 
 function database() {
   const db = new DatabaseSync(":memory:");
@@ -288,4 +326,197 @@ test("paginação é estável e respostas vazias permanecem vazias", () => {
   assert.equal(second.length, 2);
   assert.deepEqual(new Set([...first, ...second].map((row) => row.id)).size, 4);
   assert.deepEqual(db.prepare(query).all(a.household, a.household, "2024-01-01", "2024-01-31", 50, 0), []);
+});
+
+function accountBalance(db, sql, householdId, throughDate, accountId) {
+  return db.prepare(sql)
+    .all(householdId, throughDate, householdId, throughDate, householdId)
+    .find((row) => row.account_id === accountId)?.current_balance_cents;
+}
+
+function insertInvoiceOperation(db, values) {
+  db.prepare(`INSERT INTO invoice_payment_operations(
+    id, household_id, idempotency_key, kind, invoice_id, account_id,
+    created_by_user_id, amount_cents, occurred_on, reversed_payment_id,
+    request_fingerprint, created_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    values.id,
+    values.householdId,
+    values.idempotencyKey,
+    values.kind,
+    values.invoiceId,
+    values.accountId,
+    values.userId,
+    values.amountCents,
+    values.occurredOn,
+    values.reversedPaymentId ?? null,
+    values.requestFingerprint,
+    AT,
+  );
+}
+
+test("fonte bancária canônica inclui somente movimentos realizados e mantém identidades distintas", () => {
+  const { db, a, b } = seedAnalyticsScenario();
+
+  insertTransaction(db, {
+    id: "pending-transaction",
+    householdId: a.household,
+    type: "expense",
+    amountCents: 700,
+    description: "Pendente",
+    date: "2026-09-02",
+    userId: a.user,
+    accountId: a.account,
+    status: "pending",
+  });
+  insertTransaction(db, {
+    id: "cancelled-transaction",
+    householdId: a.household,
+    type: "expense",
+    amountCents: 800,
+    description: "Cancelada",
+    date: "2026-09-02",
+    userId: a.user,
+    accountId: a.account,
+    status: "cancelled",
+  });
+  insertTransaction(db, {
+    id: "same-day-expense",
+    householdId: a.household,
+    type: "expense",
+    amountCents: 900,
+    description: "Segunda no mesmo dia",
+    date: "2026-09-02",
+    userId: a.user,
+    accountId: a.account,
+  });
+  insertInvoiceOperation(db, {
+    id: "invoice-payment-reversal",
+    householdId: a.household,
+    idempotencyKey: "reversal-key",
+    kind: "reversal",
+    invoiceId: "invoice_2026-09",
+    accountId: a.account,
+    userId: a.user,
+    amountCents: 10_000,
+    occurredOn: "2026-09-11",
+    reversedPaymentId: "invoice_payment",
+    requestFingerprint: "reversal-fingerprint",
+  });
+  insertInvoiceOperation(db, {
+    id: "invoice-no-payment",
+    householdId: a.household,
+    idempotencyKey: "no-payment-key",
+    kind: "no_payment",
+    invoiceId: "invoice_2026-10",
+    accountId: a.account,
+    userId: a.user,
+    amountCents: 0,
+    occurredOn: "2026-09-11",
+    requestFingerprint: "no-payment-fingerprint",
+  });
+
+  db.prepare("INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .run("opening-batch", a.household, "card_a", a.user, "opening-key", "opening-fingerprint", "2026-09", 15_000, 5_000, 0, 0, "pending", AT);
+  db.prepare("INSERT INTO card_invoice_adjustments(id,household_id,invoice_id,import_batch_id,kind,amount_cents,status,created_by_user_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("opening-adjustment", a.household, "invoice_2026-09", "opening-batch", "opening_balance", 5_000, "active", a.user, AT);
+  db.prepare("UPDATE card_import_batches SET status = 'completed', completed_at = ? WHERE id = ? AND household_id = ?")
+    .run(AT, "opening-batch", a.household);
+
+  const rows = db.prepare(`${ACCOUNT_BANK_EVENTS_CTE}
+    SELECT source_type, source_id, household_id, account_id, event_date,
+      signed_amount_cents, event_type
+    FROM account_bank_events
+    ORDER BY event_date, source_type, source_id`).all(a.household, a.household);
+  const byId = new Map(rows.map((row) => [row.source_id, row]));
+
+  assert.equal(byId.get("income")?.event_type, "income");
+  assert.equal(byId.get("income")?.signed_amount_cents, 200_000);
+  assert.equal(byId.get("market")?.event_type, "expense");
+  assert.equal(byId.get("market")?.signed_amount_cents, -10_000);
+  assert.equal(byId.get("invoice_payment")?.event_type, "invoice_payment");
+  assert.equal(byId.get("invoice_payment")?.signed_amount_cents, -10_000);
+  assert.equal(byId.get("invoice-payment-reversal")?.event_type, "invoice_payment_reversal");
+  assert.equal(byId.get("invoice-payment-reversal")?.signed_amount_cents, 10_000);
+  assert.equal(
+    byId.get("invoice_payment").signed_amount_cents + byId.get("invoice-payment-reversal").signed_amount_cents,
+    0,
+  );
+
+  for (const excludedId of [
+    "pending-transaction",
+    "cancelled-transaction",
+    "invoice-no-payment",
+    "purchase_active",
+    "installment_1",
+    "opening-adjustment",
+    "bill_pending",
+  ]) assert.equal(byId.has(excludedId), false, `${excludedId} não deve ser evento bancário`);
+
+  assert.equal(rows.filter((row) => row.source_id === "paid-bill-transaction").length, 1);
+  assert.equal(rows.filter((row) => row.event_date === "2026-09-02").length, 2);
+  assert.equal(new Set(rows.filter((row) => row.event_date === "2026-09-02").map((row) => row.source_id)).size, 2);
+  assert.ok(rows.every((row) => row.household_id === a.household));
+  assert.ok(!rows.some((row) => row.account_id === b.account || row.source_id === "other-house"));
+});
+
+test("saldo canônico preserva exatamente a consulta anterior e exclui eventos futuros", () => {
+  const { db, a } = seedAnalyticsScenario();
+  insertInvoiceOperation(db, {
+    id: "balance-reversal",
+    householdId: a.household,
+    idempotencyKey: "balance-reversal-key",
+    kind: "reversal",
+    invoiceId: "invoice_2026-09",
+    accountId: a.account,
+    userId: a.user,
+    amountCents: 10_000,
+    occurredOn: "2026-09-11",
+    reversedPaymentId: "invoice_payment",
+    requestFingerprint: "balance-reversal-fingerprint",
+  });
+
+  for (const throughDate of ["2026-09-09", "2026-09-10", "2026-09-11", "2026-10-01"]) {
+    assert.deepEqual(
+      db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, throughDate, a.household, throughDate, a.household),
+      db.prepare(LEGACY_CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, throughDate, a.household, throughDate, a.household),
+    );
+  }
+  assert.equal(accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, "2026-09-30", a.account), 265_000);
+  assert.equal(accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, "2026-10-01", a.account), 175_000);
+});
+
+test("saldo de 78,13 passa a -21,87 com pagamento e volta a 78,13 com reversão", () => {
+  const { db, a } = seedAnalyticsScenario();
+  db.prepare("INSERT INTO accounts(id,household_id,name,type,initial_balance_cents,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+    .run("manual-account", a.household, "Conta teste manual", "bank", 7_813, 1, AT, AT);
+  db.prepare("INSERT INTO credit_cards(id,household_id,name,institution,holder,limit_cents,closing_day,due_day,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+    .run("manual-card", a.household, "Cartão manual", "Teste", "A", 100_000, 5, 10, AT, AT);
+  db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+    .run("manual-invoice", a.household, "manual-card", "2026-09", "2026-09-25", "open", AT, AT);
+  db.prepare("INSERT INTO invoice_payments(id,household_id,invoice_id,account_id,amount_cents,paid_at,created_by_user_id,created_at) VALUES(?,?,?,?,?,?,?,?)")
+    .run("manual-payment", a.household, "manual-invoice", "manual-account", 10_000, "2026-09-19", a.user, AT);
+  insertInvoiceOperation(db, {
+    id: "manual-reversal",
+    householdId: a.household,
+    idempotencyKey: "manual-reversal-key",
+    kind: "reversal",
+    invoiceId: "manual-invoice",
+    accountId: "manual-account",
+    userId: a.user,
+    amountCents: 10_000,
+    occurredOn: "2026-09-20",
+    reversedPaymentId: "manual-payment",
+    requestFingerprint: "manual-reversal-fingerprint",
+  });
+
+  assert.equal(accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, "2026-09-18", "manual-account"), 7_813);
+  assert.equal(accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, "2026-09-19", "manual-account"), -2_187);
+  assert.equal(accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, "2026-09-20", "manual-account"), 7_813);
+  for (const throughDate of ["2026-09-18", "2026-09-19", "2026-09-20"]) {
+    assert.equal(
+      accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, throughDate, "manual-account"),
+      accountBalance(db, LEGACY_CURRENT_ACCOUNT_BALANCES_SQL, a.household, throughDate, "manual-account"),
+    );
+  }
 });
