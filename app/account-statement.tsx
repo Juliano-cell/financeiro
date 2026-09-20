@@ -57,7 +57,7 @@ async function fetchStatement(query: string, signal: AbortSignal) {
 
 function SummaryCard({ label, value, tone = "neutral" }: { label: string; value: number; tone?: "neutral" | "credit" | "debit" }) {
   const color = tone === "credit" ? "text-[#39742c]" : tone === "debit" ? "text-[#a14435]" : "text-[#17342d]";
-  return <div className="rounded-2xl border border-[#dce4e1] bg-white p-4"><p className="text-xs font-semibold uppercase tracking-[.1em] text-[#71837e]">{label}</p><p className={`mt-2 text-xl font-semibold ${color}`}>{formatStatementMoney(value)}</p></div>;
+  return <div className="min-w-0 rounded-2xl border border-[#dce4e1] bg-white p-4"><p className="text-xs font-semibold uppercase tracking-[.1em] text-[#71837e]">{label}</p><p className={`mt-2 break-words text-lg font-semibold leading-tight tabular-nums [overflow-wrap:anywhere] sm:text-xl ${color}`}>{formatStatementMoney(value)}</p></div>;
 }
 
 function ItemMetadata({ item }: { item: AccountStatementItem }) {
@@ -165,7 +165,7 @@ export function AccountStatementView({ account, onBack }: { account: StatementAc
     }
   }, [account.id, eventType, from, loadingMore, period, snapshot, to]);
 
-  return <section>
+  return <section className="min-w-0 pb-[var(--mobile-nav-offset)] lg:pb-0">
     <Button type="button" variant="ghost" className="-ml-3 mb-4 text-[#48645e]" onClick={onBack}><ArrowLeft className="h-4 w-4" /> Voltar para contas</Button>
     <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
       <div><div className="flex flex-wrap items-center gap-2"><h2 className="text-3xl font-semibold tracking-[-.04em]">Extrato da conta</h2>{!account.isActive && <Badge variant="outline">Conta inativa</Badge>}</div><p className="mt-2 text-[#71837e]">{account.name}</p></div>
@@ -186,7 +186,7 @@ export function AccountStatementView({ account, onBack }: { account: StatementAc
     {!loading && error && !snapshot && <div className="mt-6 rounded-[24px] border border-[#ead6d1] bg-white p-8 text-center" role="alert"><RefreshCw className="mx-auto h-6 w-6 text-[#a14435]" /><p className="mt-4 font-medium">{error}</p><Button className="mt-5" variant="outline" onClick={() => errorStatus === 401 ? window.location.assign("/entrar") : setRetry((value) => value + 1)}>{errorStatus === 401 ? "Ir para o login" : "Tentar novamente"}</Button></div>}
 
     {!loading && snapshot && <>
-      <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Reconciliação do período"><SummaryCard label="Saldo anterior" value={snapshot.summary.openingBalanceCents} /><SummaryCard label="Entradas" value={snapshot.summary.periodCreditsCents} tone="credit" /><SummaryCard label="Saídas" value={snapshot.summary.periodDebitsCents} tone="debit" /><SummaryCard label="Saldo final" value={snapshot.summary.closingBalanceCents} /></div>
+      <div className="mt-6 grid min-w-0 grid-cols-2 gap-3 xl:grid-cols-4" aria-label="Reconciliação do período"><SummaryCard label="Saldo anterior" value={snapshot.summary.openingBalanceCents} /><SummaryCard label="Entradas" value={snapshot.summary.periodCreditsCents} tone="credit" /><SummaryCard label="Saídas" value={snapshot.summary.periodDebitsCents} tone="debit" /><SummaryCard label="Saldo final" value={snapshot.summary.closingBalanceCents} /></div>
       <div className="mt-6 overflow-hidden rounded-[24px] border border-[#dce4e1] bg-white">
         <div className="flex flex-col gap-2 border-b border-[#e6ece9] px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5"><div><h3 className="font-semibold">Movimentações</h3><p className="mt-1 text-sm text-[#71837e]">{formatStatementDate(snapshot.period.from)} a {formatStatementDate(snapshot.period.to)}</p></div><div className="flex items-center gap-2 text-xs text-[#71837e]"><CalendarDays className="h-4 w-4" /> Ordem mais recente primeiro</div></div>
         {snapshot.items.length ? <ul><>{snapshot.items.map((item) => <StatementItem key={item.id} item={item} />)}</></ul> : <div className="grid min-h-52 place-items-center p-6 text-center"><div><Landmark className="mx-auto h-7 w-7 text-[#78908a]" /><p className="mt-3 font-medium">{statementEmptyMessage(eventType, snapshot.summary)}</p><p className="mt-1 text-sm text-[#71837e]">A reconciliação acima permanece referente ao período completo.</p></div></div>}

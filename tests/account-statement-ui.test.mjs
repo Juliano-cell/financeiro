@@ -130,6 +130,10 @@ test("metadados exibem categoria, subcategoria, forma, cartão e referência sem
   assert.doesNotMatch(componentSource, /item\.categoryId/);
   assert.doesNotMatch(componentSource, /item\.cardId/);
   assert.equal(statementPaymentMethodLabel("pix"), "Pix");
+  assert.equal(statementPaymentMethodLabel("conta_a_pagar"), "Conta a pagar");
+  assert.equal(statementPaymentMethodLabel("debit"), "Débito");
+  assert.equal(statementPaymentMethodLabel("transfer"), "Transferência");
+  assert.notEqual(statementPaymentMethodLabel("conta_a_pagar"), "conta_a_pagar");
   assert.equal(statementPaymentMethodLabel("custom"), "custom");
 });
 
@@ -161,10 +165,21 @@ test("loading inicial não exibe falso zero e paginação mantém a lista", () =
 });
 
 test("layout é responsivo, em lista e sem tabela horizontal", () => {
-  assert.match(componentSource, /sm:grid-cols-2 xl:grid-cols-4/);
+  assert.match(componentSource, /grid-cols-2 gap-3 xl:grid-cols-4/);
+  assert.match(componentSource, /min-w-0 rounded-2xl/);
+  assert.match(componentSource, /\[overflow-wrap:anywhere\]/);
   assert.match(componentSource, /sm:flex-row/);
   assert.match(componentSource, /<ul>/);
   assert.doesNotMatch(componentSource, /<Table|overflow-x-auto/);
+});
+
+test("extrato reserva a navegação móvel pelo offset global e preserva o header não sticky no mobile", () => {
+  assert.match(componentSource, /pb-\[var\(--mobile-nav-offset\)\] lg:pb-0/);
+  assert.match(financeAppSource, /\[--mobile-nav-offset:calc\(4\.5rem\+env\(safe-area-inset-bottom\)\)\]/);
+  assert.match(financeAppSource, /min-h-\[var\(--mobile-nav-offset\)\]/);
+  const headerClasses = financeAppSource.match(/<header className="([^"]+)"/)?.[1]?.split(/\s+/u) ?? [];
+  assert.ok(headerClasses.includes("lg:sticky"));
+  assert.ok(!headerClasses.includes("sticky"));
 });
 
 test("filtros do frontend permanecem alinhados ao contrato validado pela API", () => {
