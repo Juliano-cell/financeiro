@@ -5,15 +5,21 @@ import {
   activeBillSubcategories,
   billActions,
   billClassificationError,
+  billDueDayOffset,
+  billRelativeDueLabel,
+  billTiming,
+  billTodayInSaoPaulo,
   buildBillPaymentPayload,
   buildRecurringBillCalendarPayload,
   changeBillCategory,
   eligibleRecurringBillIds,
+  filterAndSortBills,
   friendlyBillPaymentError,
   initialBillPaymentAccountId,
   normalizeBillAccountId,
   normalizeRecurringBillSelection,
   recurringBillOccurrences,
+  summarizePendingBills,
   toggleRecurringBillSelection,
 } from "../lib/bill-ui-rules.mjs";
 
@@ -24,6 +30,62 @@ const categories = [
   { id: "inactive", name: "Inativa", type: "expense", isActive: false, subcategories: [] },
 ];
 const accounts = [{ id: "primary", name: "Principal", isActive: true }, { id: "second", name: "Segunda", isActive: true }, { id: "old", name: "Antiga", isActive: false }];
+const today = "2026-09-20";
+const bills = [
+  { id: "future", description: "Curso", amountCents: 5000, dueDate: "2026-09-22", accountId: "second", categoryId: "transport", status: "pending" },
+  { id: "cancelled", description: "Academia", amountCents: 6000, dueDate: "2026-09-18", accountId: null, categoryId: "food", status: "cancelled" },
+  { id: "today", description: "Seguro", amountCents: 11366, dueDate: "2026-09-20", accountId: "primary", categoryId: "transport", status: "pending" },
+  { id: "paid", description: "Água", amountCents: 7000, dueDate: "2026-09-17", accountId: "primary", categoryId: "food", status: "paid" },
+  { id: "tomorrow", description: "Internet", amountCents: 11990, dueDate: "2026-09-21", accountId: null, categoryId: "food", status: "pending" },
+  { id: "overdue", description: "Energia", amountCents: 25000, dueDate: "2026-09-17", accountId: "primary", categoryId: "food", status: "pending" },
+];
+
+test("classificação civil distingue atrasada, hoje, amanhã, futura, paga e cancelada", () => {
+  assert.equal(billTiming(bills.find((bill) => bill.id === "overdue"), today), "overdue");
+  assert.equal(billTiming(bills.find((bill) => bill.id === "today"), today), "today");
+  assert.equal(billTiming(bills.find((bill) => bill.id === "tomorrow"), today), "upcoming");
+  assert.equal(billTiming(bills.find((bill) => bill.id === "future"), today), "upcoming");
+  assert.equal(billTiming(bills.find((bill) => bill.id === "paid"), today), "paid");
+  assert.equal(billTiming(bills.find((bill) => bill.id === "cancelled"), today), "cancelled");
+});
+
+test("indicadores relativos preservam amanhã, futuro e pluralização do atraso", () => {
+  assert.equal(billRelativeDueLabel("2026-09-20", today), "Hoje");
+  assert.equal(billRelativeDueLabel("2026-09-21", today), "Amanhã");
+  assert.equal(billRelativeDueLabel("2026-09-22", today), "Vence em 2 dias");
+  assert.equal(billRelativeDueLabel("2026-09-19", today), "Atrasada há 1 dia");
+  assert.equal(billRelativeDueLabel("2026-09-17", today), "Atrasada há 3 dias");
+  assert.equal(billDueDayOffset("2026-09-17", today), -3);
+});
+
+test("hoje financeiro usa America/Sao_Paulo na virada do UTC", () => {
+  assert.equal(billTodayInSaoPaulo(new Date("2026-09-21T01:30:00.000Z")), "2026-09-20");
+  assert.equal(billTodayInSaoPaulo(new Date("2026-09-21T03:30:00.000Z")), "2026-09-21");
+});
+
+test("filtro padrão mostra pendentes na ordem atrasadas, hoje e próximas", () => {
+  assert.deepEqual(filterAndSortBills(bills, { today }).map((bill) => bill.id), ["overdue", "today", "tomorrow", "future"]);
+});
+
+test("filtros Pagas, Canceladas e Todas preservam os registros", () => {
+  assert.deepEqual(filterAndSortBills(bills, { today, status: "paid" }).map((bill) => bill.id), ["paid"]);
+  assert.deepEqual(filterAndSortBills(bills, { today, status: "cancelled" }).map((bill) => bill.id), ["cancelled"]);
+  assert.deepEqual(filterAndSortBills(bills, { today, status: "all" }).map((bill) => bill.id), ["overdue", "today", "tomorrow", "future", "paid", "cancelled"]);
+});
+
+test("busca, conta e categoria filtram somente os dados já carregados", () => {
+  assert.deepEqual(filterAndSortBills(bills, { today, status: "all", search: "internet" }).map((bill) => bill.id), ["tomorrow"]);
+  assert.deepEqual(filterAndSortBills(bills, { today, status: "all", accountId: "unassigned" }).map((bill) => bill.id), ["tomorrow", "cancelled"]);
+  assert.deepEqual(filterAndSortBills(bills, { today, status: "all", categoryId: "transport" }).map((bill) => bill.id), ["today", "future"]);
+});
+
+test("resumo considera apenas pendentes e soma valores por urgência", () => {
+  assert.deepEqual(summarizePendingBills(bills, today), {
+    overdue: { count: 1, valueCents: 25000 },
+    today: { count: 1, valueCents: 11366 },
+    upcoming: { count: 2, valueCents: 16990 },
+  });
+});
 
 test("pagamento preseleciona somente a conta ativa definida na bill", () => {
   assert.equal(initialBillPaymentAccountId({ accountId: "second" }, accounts), "second");
@@ -133,4 +195,10 @@ test("interface abre confirmação e delega operações sem fallback automático
   assert.match(source, /disabled=\{busy \|\| \(scope === "selected" && selectedIds\.length === 0\)\}/);
   assert.match(source, /action: "cancel_recurring_bill_series"/);
   assert.match(source, /await onChanged\(\)/);
+  assert.match(source, /useState<BillStatusFilter>\("pending"\)/);
+  assert.match(source, /Resumo dos vencimentos pendentes/);
+  assert.match(source, /Buscar descrição/);
+  assert.match(source, /Todas as contas/);
+  assert.match(source, /Todas as categorias/);
+  assert.match(source, /min-h-11 flex-1 sm:flex-none/);
 });
