@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { type AnySQLiteColumn, check, foreignKey, index, integer, sqliteTable, text, unique, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { type AnySQLiteColumn, check, foreignKey, index, integer, primaryKey, sqliteTable, text, unique, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(), name: text("name").notNull(), email: text("email").notNull(), avatarUrl: text("avatar_url"),
@@ -208,6 +208,65 @@ export const notificationPreferences = sqliteTable("notification_preferences", {
 export const notificationLog = sqliteTable("notification_log", {
   id: text("id").primaryKey(), householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }), entityType: text("entity_type").notNull(), entityId: text("entity_id").notNull(), eventKey: text("event_key").notNull(), channel: text("channel").notNull(), recipientKey: text("recipient_key").notNull(), sentAt: text("sent_at").notNull(),
 }, (table) => [uniqueIndex("notification_log_idempotency_unique").on(table.householdId, table.entityType, table.entityId, table.eventKey, table.channel, table.recipientKey), index("idx_notification_log_household_sent").on(table.householdId, table.sentAt)]);
+
+export const userNotificationPreferences = sqliteTable("user_notification_preferences", {
+  householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull(),
+  channel: text("channel", { enum: ["telegram", "push"] }).notNull(),
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(false),
+  billDueTomorrow: integer("bill_due_tomorrow", { mode: "boolean" }).notNull().default(true),
+  billDueToday: integer("bill_due_today", { mode: "boolean" }).notNull().default(true),
+  billOverdue: integer("bill_overdue", { mode: "boolean" }).notNull().default(true),
+  upcomingDigest: integer("upcoming_digest", { mode: "boolean" }).notNull().default(false),
+  preferredLocalTime: text("preferred_local_time").notNull().default("09:00"),
+  timezone: text("timezone").notNull().default("America/Sao_Paulo"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.householdId, table.userId, table.channel] }),
+  index("idx_user_notification_preferences_user").on(table.userId, table.householdId),
+  index("idx_user_notification_preferences_enabled_channel").on(table.enabled, table.channel, table.householdId),
+  check("user_notification_preferences_channel_check", sql`${table.channel} in ('telegram','push')`),
+  check("user_notification_preferences_flags_check", sql`${table.enabled} in (0,1) and ${table.billDueTomorrow} in (0,1) and ${table.billDueToday} in (0,1) and ${table.billOverdue} in (0,1) and ${table.upcomingDigest} in (0,1)`),
+  check("user_notification_preferences_time_check", sql`length(${table.preferredLocalTime}) = 5 and ${table.preferredLocalTime} glob '[0-2][0-9]:[0-5][0-9]' and substr(${table.preferredLocalTime},1,2) between '00' and '23'`),
+  check("user_notification_preferences_timezone_check", sql`length(trim(${table.timezone})) between 1 and 100`),
+  foreignKey({ columns: [table.householdId, table.userId], foreignColumns: [householdMembers.householdId, householdMembers.userId], name: "user_notification_preferences_household_user_fk" }),
+]);
+
+export const notificationOutbox = sqliteTable("notification_outbox", {
+  id: text("id").primaryKey(),
+  householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }),
+  recipientUserId: text("recipient_user_id").notNull(),
+  channel: text("channel", { enum: ["telegram", "push"] }).notNull(),
+  entityType: text("entity_type", { enum: ["bill", "household"] }).notNull(),
+  entityId: text("entity_id").notNull(),
+  eventType: text("event_type", { enum: ["bill_due_tomorrow", "bill_due_today", "bill_overdue", "upcoming_digest"] }).notNull(),
+  referenceDate: text("reference_date").notNull(),
+  dedupeKey: text("dedupe_key").notNull(),
+  status: text("status", { enum: ["pending", "processing", "sent", "failed", "uncertain", "cancelled"] }).notNull().default("pending"),
+  attempts: integer("attempts").notNull().default(0),
+  nextAttemptAt: text("next_attempt_at"),
+  leaseUntil: text("lease_until"),
+  providerMessageId: text("provider_message_id"),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  sentAt: text("sent_at"),
+}, (table) => [
+  uniqueIndex("notification_outbox_dedupe_key_unique").on(table.dedupeKey),
+  uniqueIndex("notification_outbox_logical_event_unique").on(table.householdId, table.recipientUserId, table.channel, table.entityType, table.entityId, table.eventType, table.referenceDate),
+  index("idx_notification_outbox_dispatch").on(table.status, table.nextAttemptAt, table.leaseUntil),
+  index("idx_notification_outbox_household_recipient").on(table.householdId, table.recipientUserId, table.createdAt),
+  index("idx_notification_outbox_entity").on(table.householdId, table.entityType, table.entityId),
+  check("notification_outbox_channel_check", sql`${table.channel} in ('telegram','push')`),
+  check("notification_outbox_entity_check", sql`(${table.eventType} in ('bill_due_tomorrow','bill_due_today','bill_overdue') and ${table.entityType} = 'bill') or (${table.eventType} = 'upcoming_digest' and ${table.entityType} = 'household')`),
+  check("notification_outbox_event_check", sql`${table.eventType} in ('bill_due_tomorrow','bill_due_today','bill_overdue','upcoming_digest')`),
+  check("notification_outbox_status_check", sql`${table.status} in ('pending','processing','sent','failed','uncertain','cancelled')`),
+  check("notification_outbox_attempts_check", sql`typeof(${table.attempts}) = 'integer' and ${table.attempts} between 0 and 1000`),
+  check("notification_outbox_error_check", sql`${table.lastError} is null or length(${table.lastError}) <= 1000`),
+  foreignKey({ columns: [table.householdId, table.recipientUserId], foreignColumns: [householdMembers.householdId, householdMembers.userId], name: "notification_outbox_household_recipient_fk" }),
+  foreignKey({ columns: [table.householdId, table.recipientUserId, table.channel], foreignColumns: [userNotificationPreferences.householdId, userNotificationPreferences.userId, userNotificationPreferences.channel], name: "notification_outbox_preference_fk" }),
+]);
 
 export const telegramLinks = sqliteTable("telegram_links", {
   id: text("id").primaryKey(), householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }), userId: text("user_id").notNull(), telegramUserId: text("telegram_user_id").notNull(), chatId: text("chat_id").notNull(), isActive: integer("is_active", { mode: "boolean" }).notNull().default(true), linkedAt: text("linked_at").notNull(), updatedAt: text("updated_at").notNull(),
