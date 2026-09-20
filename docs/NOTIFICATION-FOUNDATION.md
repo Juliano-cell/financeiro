@@ -5,15 +5,16 @@
 A infraestrutura nova é paralela ao sistema legado e não envia mensagens. Ela
 é composta por preferências individuais (`user_notification_preferences`), uma
 outbox idempotente (`notification_outbox`) e o serviço independente em
-`lib/notification-foundation.ts`.
+`lib/notification-foundation.ts`, pelo planner local e pelo dispatcher seguro com
+transport injetável.
 
 O fluxo futuro previsto é:
 
 `Cron -> planner -> outbox -> dispatcher`
 
 Nenhuma dessas peças depende da rota HTTP legada para planejar ou persistir os
-eventos. O dispatcher, retries externos e integrações de entrega não fazem
-parte desta etapa.
+eventos. O dispatcher novo também permanece sem rota pública, Cron ou transport
+real; integrações externas de entrega não fazem parte desta etapa.
 
 ## Opt-in e isolamento
 
@@ -57,7 +58,7 @@ Uma etapa posterior deverá, de forma controlada:
 
 1. expor opt-in individual;
 2. implementar o planner sem faturas de cartão;
-3. implementar leasing e dispatcher;
+3. validar o leasing e o dispatcher com transport real em ambiente seguro;
 4. validar Telegram em ambiente seguro;
 5. só então desativar a rota legada e avaliar migração de preferências.
 
@@ -94,3 +95,59 @@ Telegram é retornado.
 Planejamento não garante entrega. Antes de qualquer envio, o futuro dispatcher
 deverá revalidar que a conta continua `pending`, a membership continua ativa, o
 vínculo Telegram continua ativo e a preferência/evento continuam habilitados.
+
+## Dispatcher seguro com transport simulado
+
+`lib/notification-dispatcher.ts` implementa a Etapa 3B como serviço independente
+e recebe obrigatoriamente um transport injetável. Ele não importa o cliente
+Telegram existente, não lê token, não expõe endpoint e não possui agendamento.
+Os testes usam somente transports em memória.
+
+O claim é um único `UPDATE ... RETURNING`, que move atomicamente o primeiro item
+elegível de `pending` para `processing`. Um item `processing` só pode ser retomado
+depois do vencimento de `lease_until`; a duração padrão do lease é de cinco
+minutos. A atualização e todas as transições seguintes conferem o valor exato do
+lease, impedindo que um worker antigo prossiga depois de perder a posse.
+
+Antes do transport, o dispatcher relê a outbox, a conta, a membership, a
+preferência e o vínculo Telegram. A conta deve continuar `pending` e no mesmo
+household; canal, opt-in e flag do evento devem continuar habilitados. O evento
+é recalculado com o timezone atual da preferência e deve conservar `event_type`
+e `reference_date`. Qualquer divergência cancela o item com um motivo técnico,
+sem chamar o transport. O `chat_id` é resolvido internamente somente depois
+dessa revalidação e nunca entra no resumo ou na outbox.
+
+### Fronteira externa e resultado incerto
+
+Imediatamente antes de chamar o transport, o dispatcher faz uma transição
+durável de `processing` para `uncertain`, remove o lease e incrementa `attempts`.
+Esse estado funciona como fence da fronteira externa:
+
+- `processing` com lease expirado significa que a chamada externa ainda não foi
+  armada e pode ser retomada;
+- `uncertain` significa que a chamada pode ter ocorrido e nunca é retomada
+  automaticamente.
+
+Um crash entre gravar o fence e iniciar a chamada pode produzir um falso
+positivo de incerteza, mas não uma mensagem duplicada. Essa escolha é
+intencional. O schema da migration `0007` já suporta a estratégia e não precisa
+ser alterado nesta etapa.
+
+### Sucesso, falhas e retries
+
+Sucesso move o item para `sent`, registra `sent_at` e, quando fornecido, apenas
+o identificador da mensagem do provedor. Falha permanente move para `failed`.
+Erros persistidos são códigos técnicos controlados; respostas externas, token,
+URL, `chat_id` e o texto financeiro não são armazenados.
+
+Uma resposta conhecida de rate limit retorna o item a `pending` e agenda
+`next_attempt_at` pelo `retry_after`. Falhas transitórias conhecidas usam
+backoff exponencial de 60, 120 e 240 segundos. São permitidas no máximo quatro
+chamadas externas; a quarta falha encerra o item como `failed`. Exceções,
+timeouts e qualquer resultado potencialmente ambíguo permanecem `uncertain`,
+sem retry automático.
+
+As mensagens são construídas somente após a revalidação, com descrição, valor
+em reais e data civil atuais da conta. O resumo do dispatcher contém apenas os
+contadores `claimed`, `sent`, `failed`, `retried`, `uncertain`, `cancelled` e
+`skipped`.
