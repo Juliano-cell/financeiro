@@ -48,22 +48,16 @@ Datas civis são calculadas pelo timezone da preferência usando relógio
 injetável. O padrão inicial é `America/Sao_Paulo`; UTC não é usado como atalho
 para definir hoje, amanhã ou atraso.
 
-## Coexistência temporária
+## Transição do legado
 
-As estruturas `notification_preferences`, `notification_log` e a rota
-`/api/notifications/run` permanecem inalteradas. Elas continuam sendo o sistema
-legado e não são fonte canônica da nova fundação.
+As estruturas `notification_preferences` e `notification_log` permanecem
+intactas para auditoria, mas não são fonte canônica da nova fundação e nenhum
+opt-in é migrado automaticamente. A rota `/api/notifications/run` permanece
+temporariamente por compatibilidade, respondendo explicitamente que o motor
+legado foi desativado, sem consultar finanças, gravar estado ou enviar Telegram.
 
-Uma etapa posterior deverá, de forma controlada:
-
-1. expor opt-in individual;
-2. implementar o planner sem faturas de cartão;
-3. validar o leasing e o dispatcher com transport real em ambiente seguro;
-4. validar Telegram em ambiente seguro;
-5. só então desativar a rota legada e avaliar migração de preferências.
-
-Até essa decisão, não deve haver execução simultânea dos dois caminhos de
-envio para o mesmo evento.
+O plano operacional e as travas do primeiro deploy estão documentados em
+`docs/NOTIFICATION-DEPLOYMENT-TRANSITION.md`.
 
 ## Planner local de contas a pagar
 
@@ -174,9 +168,9 @@ há configuração de Push nem de faturas de cartão.
 O estado do vínculo Telegram continua vindo da infraestrutura existente. A
 tela informa apenas conectado ou não conectado e reutiliza o mesmo código de
 conexão; nenhum identificador do Telegram é exposto. Salvar preferências não
-executa planner ou dispatcher, não cria outbox e não envia mensagem. O sistema
-legado (`notification_preferences`, `notification_log` e
-`/api/notifications/run`) permanece inalterado.
+executa planner ou dispatcher, não cria outbox e não envia mensagem. A mesma
+transação sincroniza a elegibilidade do cursor. As tabelas legadas permanecem
+preservadas, enquanto `/api/notifications/run` fica inerte.
 
 ## Transport Telegram do novo dispatcher
 

@@ -233,6 +233,48 @@ export const userNotificationPreferences = sqliteTable("user_notification_prefer
   foreignKey({ columns: [table.householdId, table.userId], foreignColumns: [householdMembers.householdId, householdMembers.userId], name: "user_notification_preferences_household_user_fk" }),
 ]);
 
+export const notificationScheduleState = sqliteTable("notification_schedule_state", {
+  householdId: text("household_id").notNull(),
+  userId: text("user_id").notNull(),
+  channel: text("channel", { enum: ["telegram", "push"] }).notNull(),
+  preferredLocalTime: text("preferred_local_time").notNull(),
+  timezone: text("timezone").notNull(),
+  preferenceUpdatedAt: text("preference_updated_at").notNull(),
+  nextRunAt: text("next_run_at"),
+  scheduledLocalDate: text("scheduled_local_date"),
+  leaseUntil: text("lease_until"),
+  leaseToken: text("lease_token"),
+  lastCompletedLocalDate: text("last_completed_local_date"),
+  lastResult: text("last_result", { enum: ["completed", "missed"] }),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.householdId, table.userId, table.channel] }),
+  index("idx_notification_schedule_state_due").on(table.nextRunAt, table.leaseUntil).where(sql`${table.nextRunAt} is not null`),
+  index("idx_notification_schedule_state_lease").on(table.leaseUntil, table.nextRunAt).where(sql`${table.leaseUntil} is not null`),
+  check("notification_schedule_state_channel_check", sql`${table.channel} in ('telegram','push')`),
+  check("notification_schedule_state_time_check", sql`length(${table.preferredLocalTime}) = 5 and ${table.preferredLocalTime} glob '[0-2][0-9]:[0-5][0-9]' and substr(${table.preferredLocalTime},1,2) between '00' and '23'`),
+  check("notification_schedule_state_timezone_check", sql`length(trim(${table.timezone})) between 1 and 100`),
+  check("notification_schedule_state_slot_check", sql`(${table.nextRunAt} is null and ${table.scheduledLocalDate} is null) or (${table.nextRunAt} is not null and ${table.scheduledLocalDate} is not null)`),
+  check("notification_schedule_state_utc_check", sql`length(${table.preferenceUpdatedAt}) = 24 and substr(${table.preferenceUpdatedAt},11,1) = 'T' and substr(${table.preferenceUpdatedAt},24,1) = 'Z' and julianday(${table.preferenceUpdatedAt}) is not null and length(${table.createdAt}) = 24 and substr(${table.createdAt},11,1) = 'T' and substr(${table.createdAt},24,1) = 'Z' and julianday(${table.createdAt}) is not null and length(${table.updatedAt}) = 24 and substr(${table.updatedAt},11,1) = 'T' and substr(${table.updatedAt},24,1) = 'Z' and julianday(${table.updatedAt}) is not null and (${table.nextRunAt} is null or (length(${table.nextRunAt}) = 24 and substr(${table.nextRunAt},11,1) = 'T' and substr(${table.nextRunAt},24,1) = 'Z' and julianday(${table.nextRunAt}) is not null)) and (${table.leaseUntil} is null or (length(${table.leaseUntil}) = 24 and substr(${table.leaseUntil},11,1) = 'T' and substr(${table.leaseUntil},24,1) = 'Z' and julianday(${table.leaseUntil}) is not null))`),
+  check("notification_schedule_state_lease_check", sql`(${table.leaseUntil} is null and ${table.leaseToken} is null) or (${table.leaseUntil} is not null and ${table.leaseToken} is not null and ${table.nextRunAt} is not null and length(trim(${table.leaseToken})) between 1 and 200)`),
+  check("notification_schedule_state_result_check", sql`(${table.lastCompletedLocalDate} is null and ${table.lastResult} is null) or (${table.lastCompletedLocalDate} is not null and ${table.lastResult} in ('completed','missed'))`),
+  foreignKey({ columns: [table.householdId, table.userId, table.channel], foreignColumns: [userNotificationPreferences.householdId, userNotificationPreferences.userId, userNotificationPreferences.channel], name: "notification_schedule_state_preference_fk" }).onDelete("cascade"),
+]);
+
+export const notificationTransportState = sqliteTable("notification_transport_state", {
+  channel: text("channel", { enum: ["telegram", "push"] }).primaryKey(),
+  pausedUntil: text("paused_until"),
+  leaseUntil: text("lease_until"),
+  leaseToken: text("lease_token"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  check("notification_transport_state_channel_check", sql`${table.channel} in ('telegram','push')`),
+  check("notification_transport_state_utc_check", sql`(${table.pausedUntil} is null or (length(${table.pausedUntil}) = 24 and substr(${table.pausedUntil},11,1) = 'T' and substr(${table.pausedUntil},24,1) = 'Z' and julianday(${table.pausedUntil}) is not null)) and (${table.leaseUntil} is null or (length(${table.leaseUntil}) = 24 and substr(${table.leaseUntil},11,1) = 'T' and substr(${table.leaseUntil},24,1) = 'Z' and julianday(${table.leaseUntil}) is not null)) and length(${table.createdAt}) = 24 and substr(${table.createdAt},11,1) = 'T' and substr(${table.createdAt},24,1) = 'Z' and julianday(${table.createdAt}) is not null and length(${table.updatedAt}) = 24 and substr(${table.updatedAt},11,1) = 'T' and substr(${table.updatedAt},24,1) = 'Z' and julianday(${table.updatedAt}) is not null`),
+  check("notification_transport_state_lease_check", sql`(${table.leaseUntil} is null and ${table.leaseToken} is null) or (${table.leaseUntil} is not null and ${table.leaseToken} is not null and length(trim(${table.leaseToken})) between 1 and 200)`),
+]);
+
 export const notificationOutbox = sqliteTable("notification_outbox", {
   id: text("id").primaryKey(),
   householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }),

@@ -78,7 +78,7 @@ function insertOutbox(db, values) {
 }
 
 test("0007 é sequencial, não faz backfill e cria preferências opt-in individuais", (t) => {
-  assert.equal(migrations.at(-1), "0007_notification_foundation.sql");
+  assert.equal(migrations[migrations.indexOf("0006_card_financial_onboarding.sql") + 1], "0007_notification_foundation.sql");
   const db = databaseThrough(t, "0006_card_financial_onboarding.sql");
   const a = seedHousehold(db, "a", true);
   db.prepare("INSERT INTO notification_preferences(household_id,enabled,offsets_json,updated_at) VALUES(?,1,'[1,0,-1]',?)").run(a.household, AT);

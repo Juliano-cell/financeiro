@@ -86,6 +86,9 @@ function runner(db, values = {}) {
     d1: new LocalD1(db),
     now: values.now ?? AT,
     householdId: values.householdId,
+    userId: values.userId,
+    channel: values.channel,
+    referenceDate: values.referenceDate,
     createId: () => `${values.prefix ?? "planner"}-${++sequence}`,
   });
 }
@@ -222,6 +225,50 @@ test("dois households permanecem isolados e podem ser executados com escopo", as
     { household_id: a.household, total: 1 },
     { household_id: b.household, total: 1 },
   ]);
+});
+
+test("escopo exato restringe household, usuário, canal e usa referenceDate civil explícita", async (t) => {
+  const db = database(t);
+  const a = seedHousehold(db, "exact-a");
+  const otherUser = addMember(db, a.household, "exact-a-2");
+  const b = seedHousehold(db, "exact-b");
+  optIn(db, a.household, a.user, "exact-a", {});
+  optIn(db, a.household, otherUser, "exact-a-2", {});
+  optIn(db, b.household, b.user, "exact-b", {});
+  addBill(db, a.household, a.user, "exact-a", "2026-09-21");
+  addBill(db, b.household, b.user, "exact-b", "2026-09-21");
+  db.prepare(`INSERT INTO user_notification_preferences(
+    household_id,user_id,channel,enabled,preferred_local_time,timezone,created_at,updated_at
+  ) VALUES(?,?,'push',1,'09:00','America/Sao_Paulo',?,?)`).run(a.household, a.user, AT, AT);
+
+  const summary = await runner(db, {
+    householdId: a.household,
+    userId: a.user,
+    channel: "telegram",
+    referenceDate: "2026-09-21",
+    now: "2026-09-20T12:00:00.000Z",
+    prefix: "exact",
+  })();
+
+  assert.deepEqual(summary, { recipientsEvaluated: 1, billsEvaluated: 1, eventsEligible: 1, inserted: 1, deduplicated: 0, skipped: 0 });
+  assert.deepEqual({ ...db.prepare(`SELECT household_id,recipient_user_id,channel,event_type,reference_date
+    FROM notification_outbox`).get() }, {
+    household_id: a.household,
+    recipient_user_id: a.user,
+    channel: "telegram",
+    event_type: "bill_due_today",
+    reference_date: "2026-09-21",
+  });
+});
+
+test("userId sem householdId falha fechado em vez de fazer scan global", async (t) => {
+  const db = database(t);
+  const a = seedHousehold(db, "incomplete");
+  optIn(db, a.household, a.user, "incomplete", {});
+  await assert.rejects(
+    runner(db, { userId: a.user })(),
+    (error) => error?.code === "NOTIFICATION_PLANNER_INCOMPLETE_SCOPE",
+  );
 });
 
 test("timezone de São Paulo governa a virada UTC", async (t) => {

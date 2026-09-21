@@ -45,6 +45,18 @@ class Statement {
 class LocalD1 {
   constructor(db) { this.db = db; }
   prepare(sql) { return new Statement(this.db, sql); }
+  async batch(statements) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const results = [];
+      for (const statement of statements) results.push(await statement.run());
+      this.db.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
 }
 
 function seed(db) {

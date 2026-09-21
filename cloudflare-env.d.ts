@@ -7,5 +7,7 @@ declare namespace Cloudflare {
     TELEGRAM_WEBHOOK_SECRET?: string;
     TELEGRAM_LINK_CODE_SECRET?: string;
     NOTIFICATION_CRON_SECRET?: string;
+    NOTIFICATION_PLANNER_ENABLED?: string;
+    NOTIFICATION_DISPATCHER_ENABLED?: string;
   }
 }

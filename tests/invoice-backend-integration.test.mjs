@@ -141,7 +141,7 @@ function analytics(from = "2026-09-01", to = "2026-09-30", changes = {}) {
 function count(f, table) { return f.db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n; }
 async function notify() {
   const result = await notifications.POST(new Request("https://fixture.invalid/api/notifications/run", { method: "POST", headers: { authorization: "Bearer fixture" } }));
-  assert.equal(result.status, 200); return result.json();
+  assert.equal(result.status, 410); return result.json();
 }
 function prepareNotification(f) {
   f.db.prepare("UPDATE card_invoices SET due_date='2026-10-02' WHERE id=?").run(f.invoiceId);
@@ -248,15 +248,15 @@ test("overpayment histórico não inventa crédito extra no limite", async t => 
   const f = await setup(t); f.db.prepare("INSERT INTO invoice_payments(id,household_id,invoice_id,account_id,amount_cents,paid_at,created_by_user_id,created_at) VALUES(?,?,?,?,?,?,?,?)").run("legacy", "ha", f.invoiceId, "aa", 70000, "2026-09-30", "ua", AT);
   const a = await snapshot(); assert.equal(a.invoices[0].remainingCents, 0); assert.equal(a.cards[0].availableCents, 500000); assert.equal(await balance("2026-10-02"), 30000);
 });
-test("notificação não cobra invoice de residual zero", async t => {
-  const f = await setup(t); await pay(f); prepareNotification(f); assert.equal((await notify()).sent, 0); assert.equal(f.sent.length, 0);
-});
-test("notificação parcial cobra só 100 e independe do status legado paid", async t => {
-  const f = await setup(t); await pay(f); await buy(f, 10000); prepareNotification(f); f.db.exec("UPDATE card_invoices SET status='paid'");
-  assert.equal((await notify()).sent, 1); assert.match(f.sent[0].text, /100,00/u); assert.doesNotMatch(f.sent[0].text, /600,00/u); assert.equal((await notify()).sent, 0);
-});
-test("notificação não envia para vínculo sem membership ativa", async t => {
-  const f = await setup(t); prepareNotification(f); f.db.exec("UPDATE household_members SET status='removed' WHERE id='ma'"); assert.equal((await notify()).sent, 0); assert.equal(f.sent.length, 0);
+test("rota legada permanece inerte mesmo com dados financeiros elegíveis", async t => {
+  const f = await setup(t); prepareNotification(f);
+  const beforeLog = count(f, "notification_log");
+  const beforeOutbox = count(f, "notification_outbox");
+  const result = await notify();
+  assert.deepEqual(result, { ok: false, disabled: true, code: "LEGACY_NOTIFICATION_ENGINE_DISABLED" });
+  assert.equal(f.sent.length, 0);
+  assert.equal(count(f, "notification_log"), beforeLog);
+  assert.equal(count(f, "notification_outbox"), beforeOutbox);
 });
 test("histórico operation_id NULL e parcelas paid continuam no ledger", async t => {
   const f = await setup(t); f.db.prepare("INSERT INTO invoice_payments(id,household_id,invoice_id,account_id,amount_cents,paid_at,created_by_user_id,created_at) VALUES(?,?,?,?,?,?,?,?)").run("legacy", "ha", f.invoiceId, "aa", 50000, "2026-09-30", "ua", AT);

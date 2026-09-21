@@ -5,6 +5,13 @@
   "compatibility_date": "2026-05-15",
   "compatibility_flags": ["nodejs_compat"],
   "no_bundle": true,
+  "triggers": {
+    "crons": []
+  },
+  "vars": {
+    "NOTIFICATION_PLANNER_ENABLED": "false",
+    "NOTIFICATION_DISPATCHER_ENABLED": "false"
+  },
   "assets": {
     "directory": "./dist/client"
   },

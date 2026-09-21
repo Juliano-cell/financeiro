@@ -25,12 +25,24 @@ class Statement {
   bind(...bindings) { return new Statement(this.db, this.sql, bindings); }
   async first() { return this.db.prepare(this.sql).get(...this.bindings) ?? null; }
   async all() { return { success: true, results: this.db.prepare(this.sql).all(...this.bindings), meta: { changes: 0 } }; }
-  async run() { const result = this.db.prepare(this.sql).run(...this.bindings); return { success: true, results: [], meta: { changes: Number(result.changes) } }; }
+  runSync() { const result = this.db.prepare(this.sql).run(...this.bindings); return { success: true, results: [], meta: { changes: Number(result.changes) } }; }
+  async run() { return this.runSync(); }
 }
 
 class LocalD1 {
   constructor(db) { this.db = db; }
   prepare(sql) { return new Statement(this.db, sql); }
+  async batch(statements) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const results = statements.map((statement) => statement.runSync());
+      this.db.exec("COMMIT");
+      return results;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
 }
 
 function database(t) {

@@ -6,6 +6,13 @@
   "compatibility_flags": ["nodejs_compat"],
   "no_bundle": true,
   "find_additional_modules": true,
+  "triggers": {
+    "crons": []
+  },
+  "vars": {
+    "NOTIFICATION_PLANNER_ENABLED": "false",
+    "NOTIFICATION_DISPATCHER_ENABLED": "false"
+  },
   "rules": [
     {
       "type": "ESModule",

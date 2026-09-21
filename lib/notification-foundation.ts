@@ -256,7 +256,7 @@ export async function getUserNotificationPreference(context: NotificationContext
 export async function saveUserNotificationPreference(context: NotificationContext, input: SaveNotificationPreferenceInput) {
   const preference = validateNotificationPreference(input);
   const at = timestamp(context);
-  const result = await context.d1.prepare(`INSERT INTO user_notification_preferences (
+  const preferenceStatement = context.d1.prepare(`INSERT INTO user_notification_preferences (
       household_id,user_id,channel,enabled,bill_due_tomorrow,bill_due_today,bill_overdue,
       upcoming_digest,preferred_local_time,timezone,created_at,updated_at
     ) SELECT ?,?,?,?,?,?,?,?,?,?,?,?
@@ -278,7 +278,96 @@ export async function saveUserNotificationPreference(context: NotificationContex
     preference.billOverdue ? 1 : 0, preference.upcomingDigest ? 1 : 0,
     preference.preferredLocalTime, preference.timezone, at, at,
     context.householdId, context.userId,
-  ).run();
+  );
+
+  let scheduleStatement: D1PreparedStatement;
+  if (!preference.enabled) {
+    scheduleStatement = context.d1.prepare(`UPDATE notification_schedule_state
+      SET preferred_local_time = ?, timezone = ?, preference_updated_at = ?,
+        next_run_at = NULL, scheduled_local_date = NULL,
+        lease_until = NULL, lease_token = NULL, updated_at = ?
+      WHERE household_id = ? AND user_id = ? AND channel = ?
+        AND EXISTS (
+          SELECT 1 FROM user_notification_preferences p
+          WHERE p.household_id = notification_schedule_state.household_id
+            AND p.user_id = notification_schedule_state.user_id
+            AND p.channel = notification_schedule_state.channel
+            AND p.enabled = 0 AND p.updated_at = ?
+        )`).bind(
+      preference.preferredLocalTime,
+      preference.timezone,
+      at,
+      at,
+      context.householdId,
+      context.userId,
+      preference.channel,
+      at,
+    );
+  } else {
+    const { calculateNextNotificationScheduleAfterCompleted } = await import("./notification-schedule-state.ts");
+    const occurrence = calculateNextNotificationScheduleAfterCompleted({
+      now: at,
+      preferredLocalTime: preference.preferredLocalTime,
+      timezone: preference.timezone,
+    });
+    const following = calculateNextNotificationScheduleAfterCompleted({
+      now: at,
+      preferredLocalTime: preference.preferredLocalTime,
+      timezone: preference.timezone,
+      lastCompletedLocalDate: occurrence.scheduledLocalDate,
+    });
+    scheduleStatement = context.d1.prepare(`INSERT INTO notification_schedule_state (
+        household_id,user_id,channel,preferred_local_time,timezone,preference_updated_at,
+        next_run_at,scheduled_local_date,lease_until,lease_token,
+        last_completed_local_date,last_result,created_at,updated_at
+      ) SELECT p.household_id,p.user_id,p.channel,p.preferred_local_time,p.timezone,p.updated_at,
+        ?,?,NULL,NULL,NULL,NULL,?,?
+      FROM user_notification_preferences p
+      INNER JOIN household_members m
+        ON m.household_id = p.household_id AND m.user_id = p.user_id AND m.status = 'active'
+      WHERE p.household_id = ? AND p.user_id = ? AND p.channel = ? AND p.enabled = 1
+        AND p.preferred_local_time = ? AND p.timezone = ? AND p.updated_at = ?
+      ON CONFLICT(household_id,user_id,channel) DO UPDATE SET
+        preferred_local_time = excluded.preferred_local_time,
+        timezone = excluded.timezone,
+        preference_updated_at = excluded.preference_updated_at,
+        next_run_at = CASE
+          WHEN notification_schedule_state.next_run_at IS NULL
+            OR notification_schedule_state.preferred_local_time <> excluded.preferred_local_time
+            OR notification_schedule_state.timezone <> excluded.timezone
+          THEN CASE
+            WHEN notification_schedule_state.last_completed_local_date IS NOT NULL
+              AND notification_schedule_state.last_completed_local_date >= excluded.scheduled_local_date
+            THEN ? ELSE excluded.next_run_at END
+          ELSE notification_schedule_state.next_run_at END,
+        scheduled_local_date = CASE
+          WHEN notification_schedule_state.next_run_at IS NULL
+            OR notification_schedule_state.preferred_local_time <> excluded.preferred_local_time
+            OR notification_schedule_state.timezone <> excluded.timezone
+          THEN CASE
+            WHEN notification_schedule_state.last_completed_local_date IS NOT NULL
+              AND notification_schedule_state.last_completed_local_date >= excluded.scheduled_local_date
+            THEN ? ELSE excluded.scheduled_local_date END
+          ELSE notification_schedule_state.scheduled_local_date END,
+        lease_until = NULL,
+        lease_token = NULL,
+        updated_at = excluded.updated_at`).bind(
+      occurrence.nextRunAt,
+      occurrence.scheduledLocalDate,
+      at,
+      at,
+      context.householdId,
+      context.userId,
+      preference.channel,
+      preference.preferredLocalTime,
+      preference.timezone,
+      at,
+      following.nextRunAt,
+      following.scheduledLocalDate,
+    );
+  }
+
+  const [result] = await context.d1.batch([preferenceStatement, scheduleStatement]);
   if ((result.meta.changes ?? 0) === 0) throw new NotificationFoundationError("Usuário não possui membership ativa nesta família.", "NOTIFICATION_INACTIVE_MEMBERSHIP");
   const saved = await getUserNotificationPreference(context, preference.channel);
   if (!saved) throw new NotificationFoundationError("Preferência não encontrada após gravação.", "NOTIFICATION_PREFERENCE_NOT_FOUND");

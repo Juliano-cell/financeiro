@@ -1,9 +1,11 @@
 import {
   NotificationFoundationError,
   assertNotificationDate,
-  billNotificationEvent,
   createNotificationOutboxItem,
+  isNotificationChannel,
   notificationLocalDate,
+  type NotificationChannel,
+  type NotificationEvent,
   type NotificationEventType,
 } from "./notification-foundation.ts";
 
@@ -11,6 +13,9 @@ export type BillNotificationPlannerContext = {
   d1: D1Database;
   now?: Date | string;
   householdId?: string;
+  userId?: string;
+  channel?: NotificationChannel;
+  referenceDate?: string;
   createId?: () => string;
 };
 
@@ -26,6 +31,7 @@ export type BillNotificationPlannerSummary = {
 type EligibleRecipientRow = {
   household_id: string;
   user_id: string;
+  channel: NotificationChannel;
   bill_due_tomorrow: number;
   bill_due_today: number;
   bill_overdue: number;
@@ -52,15 +58,73 @@ function isEventEnabled(recipient: EligibleRecipientRow, eventType: Notification
   return false;
 }
 
-async function listEligibleTelegramRecipients(context: BillNotificationPlannerContext) {
+function requiredIdentifier(value: string, label: string) {
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new NotificationFoundationError(`${label} é obrigatório.`, "NOTIFICATION_INVALID_IDENTIFIER");
+  }
+  return normalized;
+}
+
+function billNotificationEventForDate(
+  entityId: string,
+  dueDate: string,
+  referenceDate: string,
+): NotificationEvent | null {
+  assertNotificationDate(dueDate);
+  assertNotificationDate(referenceDate);
+  const offset = Math.round(
+    (Date.parse(`${dueDate}T00:00:00.000Z`) - Date.parse(`${referenceDate}T00:00:00.000Z`)) / 86_400_000,
+  );
+  const eventType: NotificationEventType | null = offset === 1
+    ? "bill_due_tomorrow"
+    : offset === 0
+      ? "bill_due_today"
+      : offset < 0
+        ? "bill_overdue"
+        : null;
+  if (!eventType) return null;
+  return {
+    entityType: "bill",
+    entityId: requiredIdentifier(entityId, "Vencimento"),
+    eventType,
+    referenceDate: eventType === "bill_overdue" ? addCivilDays(dueDate, 1) : referenceDate,
+  };
+}
+
+async function listEligibleRecipients(context: BillNotificationPlannerContext) {
   const householdId = context.householdId?.trim();
   if (context.householdId !== undefined && !householdId) {
     throw new NotificationFoundationError("Família é obrigatória.", "NOTIFICATION_INVALID_IDENTIFIER");
   }
-  const householdFilter = householdId ? "AND p.household_id = ?" : "";
+  const userId = context.userId?.trim();
+  if (context.userId !== undefined && !userId) {
+    throw new NotificationFoundationError("Usuário é obrigatório.", "NOTIFICATION_INVALID_IDENTIFIER");
+  }
+  if (userId && !householdId) {
+    throw new NotificationFoundationError(
+      "Família é obrigatória para restringir o usuário.",
+      "NOTIFICATION_PLANNER_INCOMPLETE_SCOPE",
+    );
+  }
+  const channel = context.channel ?? "telegram";
+  if (!isNotificationChannel(channel)) {
+    throw new NotificationFoundationError("Canal inválido.", "NOTIFICATION_INVALID_CHANNEL");
+  }
+  const filters: string[] = [];
+  const bindings: string[] = [channel];
+  if (householdId) {
+    filters.push("AND p.household_id = ?");
+    bindings.push(householdId);
+  }
+  if (userId) {
+    filters.push("AND p.user_id = ?");
+    bindings.push(userId);
+  }
   const statement = context.d1.prepare(`SELECT
       p.household_id,
       p.user_id,
+      p.channel,
       p.bill_due_tomorrow,
       p.bill_due_today,
       p.bill_overdue,
@@ -70,18 +134,18 @@ async function listEligibleTelegramRecipients(context: BillNotificationPlannerCo
       ON m.household_id = p.household_id
       AND m.user_id = p.user_id
       AND m.status = 'active'
-    WHERE p.channel = 'telegram'
+    WHERE p.channel = ?
       AND p.enabled = 1
-      ${householdFilter}
-      AND EXISTS (
+      ${filters.join("\n      ")}
+      AND (p.channel <> 'telegram' OR EXISTS (
         SELECT 1
         FROM telegram_links link
         WHERE link.household_id = p.household_id
           AND link.user_id = p.user_id
           AND link.is_active = 1
-      )
+      ))
     ORDER BY p.household_id, p.user_id`);
-  const result = await (householdId ? statement.bind(householdId) : statement).all<EligibleRecipientRow>();
+  const result = await statement.bind(...bindings).all<EligibleRecipientRow>();
   return result.results ?? [];
 }
 
@@ -102,7 +166,10 @@ async function listBillCandidates(d1: D1Database, householdId: string, localDate
 
 export async function runBillNotificationPlanner(context: BillNotificationPlannerContext): Promise<BillNotificationPlannerSummary> {
   const now = context.now ?? new Date();
-  const recipients = await listEligibleTelegramRecipients(context);
+  const requestedReferenceDate = context.referenceDate === undefined
+    ? null
+    : assertNotificationDate(context.referenceDate);
+  const recipients = await listEligibleRecipients(context);
   const summary: BillNotificationPlannerSummary = {
     recipientsEvaluated: recipients.length,
     billsEvaluated: 0,
@@ -113,12 +180,12 @@ export async function runBillNotificationPlanner(context: BillNotificationPlanne
   };
 
   for (const recipient of recipients) {
-    const localDate = notificationLocalDate(now, recipient.timezone);
+    const localDate = requestedReferenceDate ?? notificationLocalDate(now, recipient.timezone);
     const bills = await listBillCandidates(context.d1, recipient.household_id, localDate);
     summary.billsEvaluated += bills.length;
 
     for (const bill of bills) {
-      const event = billNotificationEvent(bill.id, bill.due_date, now, recipient.timezone);
+      const event = billNotificationEventForDate(bill.id, bill.due_date, localDate);
       if (!event || !isEventEnabled(recipient, event.eventType)) {
         summary.skipped += 1;
         continue;
@@ -131,7 +198,7 @@ export async function runBillNotificationPlanner(context: BillNotificationPlanne
         userId: recipient.user_id,
         now,
         createId: context.createId,
-      }, "telegram", event);
+      }, recipient.channel, event);
 
       if (result.created) summary.inserted += 1;
       else if (result.duplicate) summary.deduplicated += 1;

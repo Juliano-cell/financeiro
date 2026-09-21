@@ -35,9 +35,14 @@ Cada recorrência mensal possui uma linha própria em `recurring_bill_series`; a
 
 ## Notificações e Cron
 
-`POST /api/notifications/run` verifica contas e faturas pendentes nos marcos configurados (7, 3, 1, 0 e após o vencimento), envia somente aos Telegrams ativos da família e registra uma chave única por entidade, evento, canal e destinatário.
+O antigo `POST /api/notifications/run` foi mantido apenas para compatibilidade e
+responde que o mecanismo está desativado. Ele não consulta contas ou faturas,
+não envia Telegram e não grava logs ou outbox.
 
-Esta versão não ativa Cron em produção. Após deploy e autorização explícita, configure um Cron Trigger diário e faça o handler agendado chamar internamente a rotina protegida por `NOTIFICATION_CRON_SECRET`, ou conecte um Worker agendador separado ao endpoint. A sugestão é executar diariamente às 09:00 no fuso operacional escolhido e manter a comparação de datas em UTC documentada.
+Esta versão declara `triggers.crons: []`. A arquitetura nova usa entrypoint
+agendado próprio e duas flags fail-closed, hoje desligadas; não se deve conectar
+um agendador externo à rota legada. `NOTIFICATION_CRON_SECRET` permanece apenas
+durante a janela de transição e poderá ser removido após confirmação operacional.
 
 ## Ordem exata para publicação posterior
 

@@ -30,7 +30,17 @@ export type NotificationDispatcherContext = {
   leaseDurationMs?: number;
   maxAttempts?: number;
   maxItems?: number;
+  handleRateLimit?: (input: NotificationRateLimitContext) => Promise<boolean>;
 };
+
+export type NotificationRateLimitContext = Readonly<{
+  outboxId: string;
+  attempt: number;
+  exhausted: boolean;
+  error: string;
+  nextAttemptAt: string;
+  now: string;
+}>;
 
 export type NotificationDispatcherSummary = {
   claimed: number;
@@ -383,34 +393,34 @@ async function dispatchClaim(
   at: Date,
   maxAttempts: number,
   summary: NotificationDispatcherSummary,
-) {
+): Promise<"continue" | "stop"> {
   const validation = await revalidateClaim(context, claim, at);
   if ("reason" in validation) {
     if (validation.reason === "claim_no_longer_owned") summary.skipped += 1;
     else if (await cancelClaim(context, claim, validation.reason, at)) summary.cancelled += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   const bill = validation.bill;
   if (bill.attempts >= maxAttempts) {
     if (await failExhaustedClaim(context, bill, at)) summary.failed += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   const chatId = await resolveTelegramDestination(context, bill);
   if (!chatId) {
     if (await cancelClaim(context, claim, "telegram_link_inactive", at)) summary.cancelled += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   const text = buildBillNotificationMessage(bill);
   const armed = await armExternalAttempt(context, bill, at);
   if (!armed) {
     summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   const attempt = Number(armed.attempts);
@@ -420,54 +430,69 @@ async function dispatchClaim(
   } catch {
     if (await keepUncertain(context, bill.id, attempt, "transport_uncertain", at)) summary.uncertain += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   if (result.kind === "sent") {
     if (await finishSent(context, bill.id, attempt, result, at)) summary.sent += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   if (result.kind === "permanent_failure") {
     const error = safeErrorCode("transport_permanent", result.errorCode);
     if (await finishFailed(context, bill.id, attempt, error, at)) summary.failed += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   if (result.kind === "rate_limited") {
-    if (attempt >= maxAttempts) {
-      if (await finishFailed(context, bill.id, attempt, "transport_rate_limit_exhausted", at)) summary.failed += 1;
-      else summary.skipped += 1;
-      return;
-    }
     const retryAfter = Number.isFinite(result.retryAfterSeconds) && result.retryAfterSeconds > 0
       ? Math.ceil(result.retryAfterSeconds)
       : retryBackoffSeconds(attempt);
     const nextAttemptAt = addMilliseconds(at, retryAfter * 1000);
     const error = safeErrorCode("transport_rate_limited", result.errorCode);
+    if (context.handleRateLimit) {
+      const persisted = await context.handleRateLimit({
+        outboxId: bill.id,
+        attempt,
+        exhausted: attempt >= maxAttempts,
+        error,
+        nextAttemptAt,
+        now: at.toISOString(),
+      });
+      if (persisted && attempt >= maxAttempts) summary.failed += 1;
+      else if (persisted) summary.retried += 1;
+      else summary.skipped += 1;
+      return "stop";
+    }
+    if (attempt >= maxAttempts) {
+      if (await finishFailed(context, bill.id, attempt, "transport_rate_limit_exhausted", at)) summary.failed += 1;
+      else summary.skipped += 1;
+      return "continue";
+    }
     if (await finishRetry(context, bill.id, attempt, error, nextAttemptAt, at)) summary.retried += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   if (result.kind === "transient_failure") {
     if (attempt >= maxAttempts) {
       if (await finishFailed(context, bill.id, attempt, "transport_retry_limit_exhausted", at)) summary.failed += 1;
       else summary.skipped += 1;
-      return;
+      return "continue";
     }
     const nextAttemptAt = addMilliseconds(at, retryBackoffSeconds(attempt) * 1000);
     const error = safeErrorCode("transport_transient", result.errorCode);
     if (await finishRetry(context, bill.id, attempt, error, nextAttemptAt, at)) summary.retried += 1;
     else summary.skipped += 1;
-    return;
+    return "continue";
   }
 
   const error = safeErrorCode("transport_uncertain", result.errorCode);
   if (await keepUncertain(context, bill.id, attempt, error, at)) summary.uncertain += 1;
   else summary.skipped += 1;
+  return "continue";
 }
 
 export async function runNotificationDispatcher(context: NotificationDispatcherContext): Promise<NotificationDispatcherSummary> {
@@ -489,7 +514,8 @@ export async function runNotificationDispatcher(context: NotificationDispatcherC
     const claim = await claimNext(context, at, leaseDurationMs);
     if (!claim) break;
     summary.claimed += 1;
-    await dispatchClaim(context, claim, at, maxAttempts, summary);
+    const decision = await dispatchClaim(context, claim, at, maxAttempts, summary);
+    if (decision === "stop") break;
   }
 
   return summary;
