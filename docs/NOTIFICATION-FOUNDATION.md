@@ -177,3 +177,33 @@ conexão; nenhum identificador do Telegram é exposto. Salvar preferências não
 executa planner ou dispatcher, não cria outbox e não envia mensagem. O sistema
 legado (`notification_preferences`, `notification_log` e
 `/api/notifications/run`) permanece inalterado.
+
+## Transport Telegram do novo dispatcher
+
+A Etapa 3D adiciona `TelegramNotificationTransport`, uma implementação do
+contrato injetável do dispatcher. O transport recebe somente o `chat_id` já
+revalidado e o texto já construído, chama `sendMessage` e converte a resposta
+externa para resultados internos sanitizados: `sent`, `permanent_failure`,
+`rate_limited`, `transient_failure` ou `uncertain`. Ele verifica tanto o status
+HTTP quanto o campo `ok` da Bot API e persiste, via dispatcher, somente o
+`message_id` quando disponível.
+
+Respostas 429 respeitam `parameters.retry_after` quando ele é numérico,
+positivo e limitado a 24 horas; na ausência de um valor válido, o dispatcher
+usa seu backoff seguro. Respostas 4xx definitivas são permanentes e respostas
+5xx são transitórias. Descrições externas não atravessam o contrato: códigos
+internos nunca incluem token, destino, texto da mensagem ou valores da conta.
+
+O request tem timeout explícito de 10 segundos. Esse limite evita manter um
+worker indefinidamente preso sem ser agressivo com uma chamada normal à Bot
+API. Como um abort ou erro de rede pode acontecer depois de o Telegram ter
+recebido a requisição, ambos são classificados como `uncertain`; o fence
+durável do dispatcher impede retry automático e possível envio duplicado.
+
+`createTelegramNotificationDispatcherContext` compõe o D1 com um transport que
+usa exclusivamente `TELEGRAM_BOT_TOKEN`. A factory não executa o dispatcher e
+não está conectada a rota, startup, Cron, webhook ou salvamento. Uma futura
+execução manual controlada poderá criar esse contexto e passá-lo explicitamente
+a `runNotificationDispatcher`; essa chamada não existe nesta etapa. Os testes
+exigem `fetch` injetado e usam somente respostas locais falsas. O envio legado,
+o webhook e o fluxo `/conectar` permanecem intactos.
