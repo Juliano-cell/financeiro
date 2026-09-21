@@ -23,6 +23,9 @@ const loaderSource = `
     if (specifier === "cloudflare:workers") {
       return { shortCircuit: true, url: "data:text/javascript,export const env=globalThis.__telegramHandlerTestEnv" };
     }
+    if (specifier === "next/headers") {
+      return { shortCircuit: true, url: "data:text/javascript,export async function cookies(){return {get:()=>undefined}}" };
+    }
     if (specifier.startsWith("@/")) {
       const path = resolveFile(resolvePath(root, specifier.slice(2)));
       if (!path) throw new Error("Módulo de teste não encontrado: " + specifier);
