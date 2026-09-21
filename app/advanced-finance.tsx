@@ -24,6 +24,7 @@ type Installment = { id: string; purchaseId: string; invoiceId: string; installm
 type Invoice = CanonicalInvoice & { status: "open" | "closed" | "paid"; totalCents: number; installments: Installment[] };
 type Bill = { id: string; description: string; amountCents: number; dueDate: string; categoryId: string | null; subcategoryId: string | null; recurrence: "none" | "monthly"; recurrenceSeriesId: string | null; recurrenceEndDate: string | null; status: "pending" | "paid" | "cancelled"; displayStatus: "pending" | "paid" | "cancelled" | "overdue"; accountId: string | null; notes: string | null };
 type BillStatusFilter = "pending" | "paid" | "cancelled" | "all";
+type NotificationPreference = { exists: boolean; channel: "telegram"; enabled: boolean; billDueTomorrow: boolean; billDueToday: boolean; billOverdue: boolean; preferredLocalTime: string; timezone: "America/Sao_Paulo" };
 export type AdvancedSnapshot = { selectedMonth: string; cards: Card[]; invoices: Invoice[]; installments: Installment[]; bills: Bill[]; notificationSettings: { enabled: boolean; offsets: number[] }; summary: { availableCents: number; incomeCents: number; expenseCents: number; paidBillsCents: number; pendingBillsCents: number; cardCents: number; installmentCents: number; commitmentsCents: number; projectedCents: number } };
 
 const brl = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
@@ -57,6 +58,18 @@ async function telegramLinkStatus(signal?: AbortSignal) {
   return Boolean(result.connected);
 }
 
+async function notificationPreferencesApi(preference?: Omit<NotificationPreference, "exists">, signal?: AbortSignal) {
+  const response = await fetch("/api/notifications/preferences", preference ? {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(preference),
+    signal,
+  } : { signal, cache: "no-store" });
+  const result = await response.json() as NotificationPreference & { error?: string };
+  if (!response.ok) throw new Error(result.error ?? "Não foi possível carregar as preferências.");
+  return result;
+}
+
 export function MonthNavigator({ month, onChange }: { month: string; onChange: (month: string) => void }) {
   const current = new Date().toISOString().slice(0, 7);
   return <div className="flex items-center justify-between gap-1 rounded-xl border border-[#d8e1de] bg-white p-1 shadow-sm" aria-label="Selecionar mês"><Button variant="ghost" size="icon" onClick={() => onChange(addMonth(month, -1))} aria-label="Mês anterior"><ChevronLeft className="h-4 w-4" /></Button><button className="min-w-32 px-2 text-sm font-semibold capitalize" onClick={() => onChange(current)} title="Voltar ao mês atual">{monthLabel(month)}</button><Button variant="ghost" size="icon" onClick={() => onChange(addMonth(month, 1))} aria-label="Próximo mês"><ChevronRight className="h-4 w-4" /></Button></div>;
@@ -68,7 +81,7 @@ export function AdvancedFinanceView({ view, data, accounts, categories, onChange
   if (view === "installments") return <InstallmentsView data={data} />;
   if (view === "bills") return <BillsView data={data} accounts={accounts} categories={categories} onChanged={onChanged} />;
   if (view === "simulator") return <SimulatorView data={data} />;
-  return <TelegramSettings data={data} onChanged={onChanged} />;
+  return <TelegramSettings />;
 }
 
 export function CardsView({ data, accounts, categories, onChanged, financial, onFinancialRefresh }: { data: AdvancedSnapshot; accounts: Account[]; categories: Category[]; onChanged: () => Promise<void>; financial?: FinancialController; onFinancialRefresh?: FinancialRefresh }) {
@@ -315,10 +328,13 @@ function SimulatorView({ data }: { data: AdvancedSnapshot }) {
   return <section><Heading title="Simulador de Compra" text="Projete a compra nos próximos meses sem criar qualquer lançamento real." /><div className="mt-6 grid gap-5 xl:grid-cols-[.8fr_1.2fr]"><form onSubmit={run} className="grid gap-4 rounded-[24px] border bg-white p-5"><Field name="description" label="Descrição da compra" required /><Field name="amount" label="Valor total (R$)" inputMode="decimal" required /><Field name="purchaseDate" label="Data provável" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required /><SelectField name="paymentMethod" label="Forma de pagamento" items={[{ value: "cash", label: "À vista" }, { value: "credit_card", label: "Cartão de crédito" }]} /><Field name="installmentCount" label="Número de parcelas" type="number" min={1} max={120} defaultValue={1} required /><SelectField name="cardId" label="Cartão (se aplicável)" items={[{ value: "none", label: "Sem cartão" }, ...data.cards.filter((item) => item.isActive).map((item) => ({ value: item.id, label: item.name }))]} /><Button type="submit"><Sparkles className="h-4 w-4" /> Analisar compra</Button></form><div className="rounded-[24px] border bg-white p-5">{result ? <div><div className={`rounded-2xl border p-5 ${tone}`}><p className="text-xs font-semibold uppercase tracking-wider">{result.rating ? result.rating : "Dados insuficientes"}</p><h3 className="mt-1 text-xl font-semibold">{result.label ?? "Não existem informações suficientes para uma análise confiável."}</h3>{result.installmentCents != null && <p className="mt-2 text-sm">Parcela base: {brl(result.installmentCents)} · menor saldo: {brl(result.lowestBalanceCents ?? 0)}</p>}</div><ul className="mt-5 space-y-2 text-sm text-[#526b65]">{result.reasons.map((reason) => <li key={reason}>• {reason}</li>)}</ul>{result.months.length > 0 && <div className="mt-5 grid gap-2">{result.months.map((row) => <div key={row.month} className="flex justify-between rounded-xl bg-[#f5f7f6] p-3 text-sm"><span className="capitalize">{monthLabel(row.month)} · +{brl(row.simulatedCents)}</span><strong>{brl(row.projectedBalanceCents)}</strong></div>)}</div>}</div> : <Empty icon={Sparkles} text="Preencha os dados para comparar a compra com renda, contas, faturas e parcelas futuras." />}</div></div></section>;
 }
 
-function TelegramSettings({ data, onChanged }: { data: AdvancedSnapshot; onChanged: () => Promise<void> }) {
+function TelegramSettings() {
   const [code, setCode] = useState("");
   const [connection, setConnection] = useState<"loading" | "connected" | "disconnected" | "error">("loading");
   const [connectionBusy, setConnectionBusy] = useState(false);
+  const [preference, setPreference] = useState<NotificationPreference | null>(null);
+  const [preferenceState, setPreferenceState] = useState<"loading" | "ready" | "saving" | "saved" | "error">("loading");
+  const [preferenceError, setPreferenceError] = useState("");
   const loadConnection = async (signal?: AbortSignal) => {
     try {
       const connected = await telegramLinkStatus(signal);
@@ -328,11 +344,37 @@ function TelegramSettings({ data, onChanged }: { data: AdvancedSnapshot; onChang
       if (!signal?.aborted) setConnection("error");
     }
   };
+  const loadPreferences = async (signal?: AbortSignal) => {
+    setPreferenceState("loading");
+    setPreferenceError("");
+    try {
+      const result = await notificationPreferencesApi(undefined, signal);
+      if (!signal?.aborted) {
+        setPreference(result);
+        setPreferenceState("ready");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (!signal?.aborted) {
+        setPreferenceError(error instanceof Error ? error.message : "Não foi possível carregar as preferências.");
+        setPreferenceState("error");
+      }
+    }
+  };
   useEffect(() => {
     const controller = new AbortController();
     void telegramLinkStatus(controller.signal).then(
       (connected) => { if (!controller.signal.aborted) setConnection(connected ? "connected" : "disconnected"); },
       (error: unknown) => { if (!(error instanceof DOMException && error.name === "AbortError") && !controller.signal.aborted) setConnection("error"); },
+    );
+    void notificationPreferencesApi(undefined, controller.signal).then(
+      (result) => { if (!controller.signal.aborted) { setPreference(result); setPreferenceState("ready"); } },
+      (error: unknown) => {
+        if (!(error instanceof DOMException && error.name === "AbortError") && !controller.signal.aborted) {
+          setPreferenceError(error instanceof Error ? error.message : "Não foi possível carregar as preferências.");
+          setPreferenceState("error");
+        }
+      },
     );
     return () => controller.abort();
   }, []);
@@ -350,8 +392,33 @@ function TelegramSettings({ data, onChanged }: { data: AdvancedSnapshot; onChang
     } catch (error) { toast.error(error instanceof Error ? error.message : "Não foi possível desvincular o Telegram."); }
     finally { setConnectionBusy(false); }
   };
-  const saveAlerts = async (event: React.FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = new FormData(event.currentTarget); try { await advancedApi({ action: "update_notification_settings", enabled: form.get("enabled") === "on", offsets: [7, 3, 1, 0, -1].filter((offset) => form.get(`offset_${offset}`) === "on") }); toast.success("Alertas atualizados."); await onChanged(); } catch (error) { toast.error(error instanceof Error ? error.message : "Falha."); } };
-  return <section><Heading title="Configurações" text="Conecte cada pessoa da família ao Telegram e ajuste os alertas." /><div className="mt-6 grid max-w-4xl gap-5 md:grid-cols-2"><div className="rounded-[24px] border bg-white p-6"><div className="flex items-start gap-4"><div className="rounded-2xl bg-[#edf6f3] p-3"><Link2 className="h-5 w-5" /></div><div><h3 className="font-semibold">Conectar Telegram</h3><p className="mt-1 text-sm leading-6 text-[#71837e]">O vínculo é individual: cada pessoa conecta seu próprio Telegram à família.</p></div></div><div className="mt-5">{connection === "loading" && <p className="text-sm text-[#71837e]">Verificando conexão...</p>}{connection === "error" && <div><p className="text-sm text-[#a1444d]">Não foi possível verificar a conexão.</p><Button className="mt-3" variant="outline" onClick={() => { setConnection("loading"); void loadConnection(); }} disabled={connectionBusy}>Tentar novamente</Button></div>}{connection === "connected" && <div><p className="font-semibold text-[#287461]">Telegram conectado</p><p className="mt-1 text-sm text-[#71837e]">Seu usuário está habilitado para usar o bot desta família.</p><Button className="mt-4" variant="outline" onClick={() => void disconnect()} disabled={connectionBusy}>{connectionBusy ? "Desvinculando..." : "Desvincular Telegram"}</Button></div>}{connection === "disconnected" && <div><p className="font-semibold">Telegram não conectado</p><p className="mt-1 text-sm leading-6 text-[#71837e]">Gere um código e envie <strong>/conectar CÓDIGO</strong> ao bot. O código expira em 10 minutos.</p>{code ? <div className="mt-4 rounded-2xl bg-[#0d2925] p-5 text-center text-white"><p className="text-xs text-white/60">Código temporário · expira em 10 minutos</p><p className="mt-1 font-mono text-3xl tracking-[.25em]">{code}</p><p className="mt-2 text-xs text-white/60">/conectar {code}</p></div> : <Button className="mt-4" onClick={() => void generate()} disabled={connectionBusy}>{connectionBusy ? "Gerando..." : "Gerar código de conexão"}</Button>}</div>}</div></div><form onSubmit={saveAlerts} className="rounded-[24px] border bg-white p-6"><h3 className="font-semibold">Alertas de vencimento</h3><label className="mt-4 flex items-center gap-2 text-sm"><input type="checkbox" name="enabled" defaultChecked={data.notificationSettings.enabled} /> Ativar notificações</label><div className="mt-4 grid gap-2 text-sm">{[[7, "7 dias antes"], [3, "3 dias antes"], [1, "1 dia antes"], [0, "No vencimento"], [-1, "Após o vencimento"]].map(([offset, label]) => <label key={offset} className="flex items-center gap-2"><input type="checkbox" name={`offset_${offset}`} defaultChecked={data.notificationSettings.offsets.includes(Number(offset))} /> {label}</label>)}</div><Button className="mt-5" type="submit">Salvar alertas</Button></form></div></section>;
+  const updatePreference = (changes: Partial<NotificationPreference>) => setPreference((current) => current ? { ...current, ...changes } : current);
+  const savePreferences = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!preference || preferenceState === "saving") return;
+    setPreferenceState("saving");
+    setPreferenceError("");
+    try {
+      const saved = await notificationPreferencesApi({
+        channel: "telegram",
+        enabled: preference.enabled,
+        billDueTomorrow: preference.billDueTomorrow,
+        billDueToday: preference.billDueToday,
+        billOverdue: preference.billOverdue,
+        preferredLocalTime: preference.preferredLocalTime,
+        timezone: "America/Sao_Paulo",
+      });
+      setPreference(saved);
+      setPreferenceState("saved");
+      toast.success("Preferências de notificações salvas.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Não foi possível salvar as preferências.";
+      setPreferenceError(message);
+      setPreferenceState("error");
+      toast.error(message);
+    }
+  };
+  return <section><Heading title="Configurações" text="Conecte seu Telegram e escolha quando deseja receber avisos." /><div className="mt-6 grid max-w-4xl gap-5 md:grid-cols-2"><div className="rounded-[24px] border bg-white p-4 sm:p-6"><div className="flex items-start gap-4"><div className="rounded-2xl bg-[#edf6f3] p-3"><Link2 className="h-5 w-5" /></div><div><h3 className="font-semibold">Telegram</h3><p className="mt-1 text-sm leading-6 text-[#71837e]">O vínculo é individual: cada pessoa conecta seu próprio Telegram à família.</p></div></div><div className="mt-5">{connection === "loading" && <p className="text-sm text-[#71837e]">Verificando conexão...</p>}{connection === "error" && <div><p className="text-sm text-[#a1444d]">Não foi possível verificar a conexão.</p><Button className="mt-3 min-h-11" variant="outline" onClick={() => { setConnection("loading"); void loadConnection(); }} disabled={connectionBusy}>Tentar novamente</Button></div>}{connection === "connected" && <div><p className="font-semibold text-[#287461]">✓ Telegram conectado</p><p className="mt-1 text-sm text-[#71837e]">Seu Telegram está pronto para receber os avisos que você ativar.</p><Button className="mt-4 min-h-11 w-full sm:w-auto" variant="outline" onClick={() => void disconnect()} disabled={connectionBusy}>{connectionBusy ? "Desvinculando..." : "Desvincular Telegram"}</Button></div>}{connection === "disconnected" && <div><p className="font-semibold">Telegram não conectado</p><p className="mt-1 text-sm leading-6 text-[#71837e]">Conecte seu Telegram para receber avisos. Use o mesmo fluxo seguro: gere um código e envie <strong>/conectar CÓDIGO</strong> ao bot. O código expira em 10 minutos.</p>{code ? <div className="mt-4 rounded-2xl bg-[#0d2925] p-5 text-center text-white"><p className="text-xs text-white/60">Código temporário · expira em 10 minutos</p><p className="mt-1 font-mono text-3xl tracking-[.25em]">{code}</p><p className="mt-2 text-xs text-white/60">/conectar {code}</p></div> : <Button className="mt-4 min-h-11 w-full sm:w-auto" onClick={() => void generate()} disabled={connectionBusy}>{connectionBusy ? "Gerando..." : "Gerar código de conexão"}</Button>}</div>}</div></div><div className="rounded-[24px] border bg-white p-4 sm:p-6"><h3 className="font-semibold">Notificações</h3><p className="mt-1 text-sm leading-6 text-[#71837e]">Escolha seus avisos de contas e vencimentos. Salvar não envia nenhuma mensagem agora.</p>{preferenceState === "loading" && <div className="mt-5 rounded-2xl bg-[#f5f7f6] p-4 text-sm text-[#71837e]">Carregando preferências...</div>}{preferenceState === "error" && !preference && <div className="mt-5" role="alert"><p className="text-sm text-[#a1444d]">{preferenceError || "Não foi possível carregar as preferências."}</p><Button className="mt-3 min-h-11" type="button" variant="outline" onClick={() => void loadPreferences()}>Tentar novamente</Button></div>}{preference && <form onSubmit={savePreferences} className="mt-5 grid gap-5"><label className="flex min-h-11 items-center gap-3 rounded-2xl border p-3 text-sm font-medium"><input type="checkbox" name="enabled" checked={preference.enabled} onChange={(event) => updatePreference({ enabled: event.target.checked })} /> Ativar notificações</label><fieldset className="grid gap-2"><legend className="mb-2 text-sm font-semibold">Quero ser avisado:</legend>{[["billDueTomorrow", "1 dia antes"], ["billDueToday", "No dia do vencimento"], ["billOverdue", "Quando a conta ficar atrasada"]].map(([field, label]) => <label key={field} className="flex min-h-11 items-center gap-3 rounded-xl px-2 text-sm"><input type="checkbox" name={field} checked={preference[field as "billDueTomorrow" | "billDueToday" | "billOverdue"]} onChange={(event) => updatePreference({ [field]: event.target.checked })} /> {label}</label>)}</fieldset><div><Label htmlFor="notification-time">Horário preferido</Label><Input id="notification-time" name="preferredLocalTime" className="mt-2 min-h-11" type="time" value={preference.preferredLocalTime} onChange={(event) => updatePreference({ preferredLocalTime: event.target.value })} required /><p className="mt-2 text-xs text-[#71837e]">Seus avisos serão programados com base neste horário.</p></div><div className="rounded-2xl bg-[#f5f7f6] p-4"><p className="text-xs text-[#71837e]">Fuso horário</p><p className="mt-1 text-sm font-medium">Horário de Brasília</p></div>{preferenceState === "saved" && <p className="text-sm font-medium text-[#287461]" role="status">Preferências salvas.</p>}{preferenceState === "error" && preferenceError && <p className="text-sm text-[#a1444d]" role="alert">{preferenceError}</p>}<Button className="min-h-11 w-full sm:w-auto" type="submit" disabled={preferenceState === "saving"}>{preferenceState === "saving" ? "Salvando..." : "Salvar preferências"}</Button></form>}</div></div></section>;
 }
 
 function Heading({ title, text, action }: { title: string; text: string; action?: React.ReactNode }) { return <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><h2 className="text-3xl font-semibold tracking-[-.04em]">{title}</h2><p className="mt-2 max-w-2xl text-[#71837e]">{text}</p></div>{action}</div>; }

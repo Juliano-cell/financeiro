@@ -151,3 +151,29 @@ As mensagens são construídas somente após a revalidação, com descrição, v
 em reais e data civil atuais da conta. O resumo do dispatcher contém apenas os
 contadores `claimed`, `sent`, `failed`, `retried`, `uncertain`, `cancelled` e
 `skipped`.
+
+## Configurações individuais e opt-in
+
+A Etapa 3C adiciona `GET` e `POST` autenticados em
+`/api/notifications/preferences` e uma seção de Notificações na tela de
+Configurações. Household e usuário são sempre derivados da sessão e de uma
+membership ativa; o cliente não envia nem escolhe essas identidades. Escritas
+exigem same-origin, usam payload estrito e as respostas são privadas e sem
+cache.
+
+Quando ainda não existe preferência, o GET retorna defaults de interface sem
+gravar: `enabled = false`, os três avisos de contas habilitados, horário `09:00`
+e fuso de São Paulo. Portanto abrir a tela não cria opt-in. Somente o botão
+Salvar persiste uma escolha explícita do próprio usuário.
+
+Nesta versão, o único canal aceito é `telegram`, o fuso permanece fixo em
+`America/Sao_Paulo` e `upcoming_digest` é sempre gravado como falso. A interface
+expõe apenas aviso um dia antes, no vencimento e no primeiro dia de atraso. Não
+há configuração de Push nem de faturas de cartão.
+
+O estado do vínculo Telegram continua vindo da infraestrutura existente. A
+tela informa apenas conectado ou não conectado e reutiliza o mesmo código de
+conexão; nenhum identificador do Telegram é exposto. Salvar preferências não
+executa planner ou dispatcher, não cria outbox e não envia mensagem. O sistema
+legado (`notification_preferences`, `notification_log` e
+`/api/notifications/run`) permanece inalterado.
