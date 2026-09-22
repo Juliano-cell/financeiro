@@ -128,7 +128,7 @@ const validDetail = { invoice: { ...invoice, cardName: "Cartão de teste" }, adj
 
 test("validação runtime aceita contrato válido e rejeita estruturas financeiras incompletas", async () => {
   assert.deepEqual(parseInvoiceDetailPayload(validDetail), validDetail);
-  const withOpening = { ...validDetail, openingBalance: { originalCents: 140000, allocatedCents: 10000, residualCents: 130000, identifiedCents: 10000 }, adjustments: [{ adjustmentId: "opening", itemType: "opening_balance", description: "Saldo inicial ainda não identificado", amountCents: 130000, status: "active", includedInTotal: true }] };
+  const withOpening = { ...validDetail, openingBalance: { originalCents: 140000, openingCents: 140000, initialStateInstallmentsCents: 0, allocatedCents: 10000, residualCents: 130000, identifiedCents: 10000 }, adjustments: [{ adjustmentId: "opening", itemType: "opening_balance", description: "Saldo inicial ainda não identificado", amountCents: 130000, status: "active", includedInTotal: true }] };
   assert.deepEqual(parseInvoiceDetailPayload(withOpening), withOpening);
   assert.equal(parseInvoiceDetailPayload({ ...withOpening, openingBalance: { ...withOpening.openingBalance, identifiedCents: 11000 } }), null);
   const withoutInvoice = { active: validDetail.active, cancelled: validDetail.cancelled };

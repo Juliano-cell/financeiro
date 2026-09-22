@@ -60,9 +60,13 @@ function validAdjustment(value: unknown): value is InvoiceDetailAdjustment {
 
 function validOpeningBalance(value: unknown) {
   if (value === null || value === undefined) return true;
-  if (!record(value) || !safeInteger(value.originalCents) || !safeInteger(value.allocatedCents)
+  if (!record(value) || !safeInteger(value.originalCents) || !safeInteger(value.openingCents)
+    || !safeInteger(value.initialStateInstallmentsCents) || !safeInteger(value.allocatedCents)
     || !safeInteger(value.residualCents) || !safeInteger(value.identifiedCents)) return false;
-  return Number(value.allocatedCents) + Number(value.residualCents) === Number(value.originalCents);
+  return Number(value.initialStateInstallmentsCents) + Number(value.openingCents) === Number(value.originalCents)
+    && Number(value.allocatedCents) + Number(value.residualCents) === Number(value.openingCents)
+    && Number(value.initialStateInstallmentsCents) + Number(value.allocatedCents) === Number(value.identifiedCents)
+    && Number(value.identifiedCents) + Number(value.residualCents) === Number(value.originalCents);
 }
 
 export function parseInvoiceDetailPayload(value: unknown): InvoiceDetailResponse | null {
@@ -77,8 +81,6 @@ export function parseInvoiceDetailPayload(value: unknown): InvoiceDetailResponse
   const remaining = Math.max(Number(invoice.invoiceTotalCents) - Number(invoice.paidCents), 0);
   const paymentStatus = remaining === 0 ? "settled" : Number(invoice.paidCents) === 0 ? "unpaid" : "partial";
   if (Number(invoice.remainingCents) !== remaining || invoice.paymentStatus !== paymentStatus) return null;
-  if (record(value.openingBalance)
-    && Number(value.openingBalance.identifiedCents) !== Number(value.openingBalance.allocatedCents)) return null;
   return value as unknown as InvoiceDetailResponse;
 }
 

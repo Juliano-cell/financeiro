@@ -1,4 +1,5 @@
 import { getInvoiceState, InvoiceServiceError, type InvoiceContext } from "./invoice-service";
+import { resolveOpeningBalanceBreakdown } from "./card-opening-balance.mjs";
 import type { InvoiceDetailAdjustment, InvoiceDetailItem, InvoiceDetailPage, InvoiceDetailResponse } from "./invoice-detail-types";
 import { resolveInstallmentDisplay } from "./card-onboarding-ui-rules.mjs";
 
@@ -38,6 +39,8 @@ type AdjustmentRow = {
   adjustment_id: string;
   kind: "opening_balance";
   amount_cents: number;
+  initial_invoice_total_cents: number;
+  initial_opening_balance_cents: number;
   allocated_cents: number;
   status: "active";
 };
@@ -207,9 +210,13 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
     context.d1.prepare(`${ITEM_SELECT} AND s.status <> 'cancelled'${ITEM_ORDER}`).bind(context.householdId, parsed.invoiceId, parsed.pageSize, activeOffset).all<DetailRow>(),
     context.d1.prepare(`${ITEM_SELECT} AND s.status = 'cancelled'${ITEM_ORDER}`).bind(context.householdId, parsed.invoiceId, parsed.pageSize, cancelledOffset).all<DetailRow>(),
     context.d1.prepare(`SELECT a.id AS adjustment_id, a.kind, a.amount_cents, a.status,
+        b.declared_invoice_total_cents AS initial_invoice_total_cents,
+        b.opening_balance_cents AS initial_opening_balance_cents,
         COALESCE((SELECT SUM(o.amount_cents) FROM card_opening_balance_allocations o
           WHERE o.household_id = a.household_id AND o.opening_adjustment_id = a.id), 0) AS allocated_cents
       FROM card_invoice_adjustments a
+      INNER JOIN card_import_batches b ON b.household_id = a.household_id AND b.id = a.import_batch_id
+        AND b.import_kind = 'initial_state' AND b.status = 'completed'
       WHERE a.household_id = ? AND a.invoice_id = ? AND a.status = 'active'
       ORDER BY a.created_at, a.id`).bind(context.householdId, parsed.invoiceId).all<AdjustmentRow>(),
   ]);
@@ -220,7 +227,15 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
   const mappedAdjustments = adjustmentRows.results.map((row) => ({ row, adjustment: adjustment(row) }));
   const adjustments = mappedAdjustments.flatMap((entry) => entry.adjustment ? [entry.adjustment] : []);
   const openingRow = mappedAdjustments[0]?.row ?? null;
-  const openingResidualCents = openingRow ? openingRow.amount_cents - openingRow.allocated_cents : 0;
+  const openingBreakdown = openingRow ? resolveOpeningBalanceBreakdown({
+    initialInvoiceTotalCents: openingRow.initial_invoice_total_cents,
+    openingCents: openingRow.amount_cents,
+    allocatedCents: openingRow.allocated_cents,
+  }) : null;
+  if (openingRow && (!openingBreakdown || openingRow.initial_opening_balance_cents !== openingRow.amount_cents)) {
+    throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
+  }
+  const openingResidualCents = openingBreakdown?.residualCents ?? 0;
   const componentTotalCents = (counts?.active_total_cents ?? 0)
     + openingResidualCents;
   if (!Number.isSafeInteger(componentTotalCents) || componentTotalCents !== state.invoiceTotalCents) {
@@ -241,12 +256,7 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
       cycleStatus: state.cycleStatus,
       paymentStatus: state.paymentStatus,
     },
-    openingBalance: openingRow ? {
-      originalCents: openingRow.amount_cents,
-      allocatedCents: openingRow.allocated_cents,
-      residualCents: openingResidualCents,
-      identifiedCents: openingRow.allocated_cents,
-    } : null,
+    openingBalance: openingBreakdown,
     adjustments,
     active: page(activeRows.results, parsed.activePage, parsed.pageSize, activeCount),
     cancelled: page(cancelledRows.results, parsed.cancelledPage, parsed.pageSize, cancelledCount),

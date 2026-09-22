@@ -11,6 +11,7 @@ import { createCardPurchase, FinanceValidationError } from "@/lib/finance-servic
 import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
 import { cancelCardPurchase, getHouseholdInvoiceStates, getInvoicePaymentHistory, invoiceCivilDate, InvoiceServiceError, payInvoiceResidual, reverseInvoicePayment } from "@/lib/invoice-service";
 import { resolveInstallmentDisplay } from "@/lib/card-onboarding-ui-rules.mjs";
+import { resolveOpeningBalanceBreakdown } from "@/lib/card-opening-balance.mjs";
 import { CardServiceError, deactivateCard, reactivateCard } from "@/lib/card-service";
 
 export const dynamic = "force-dynamic";
@@ -94,16 +95,18 @@ export async function GET(request: Request) {
     return { ...item, installmentNumber: display?.installmentNumber ?? item.installmentNumber, installmentCount: display?.installmentCount ?? item.installmentCount, purchase: purchaseById.get(item.purchaseId), invoice: invoiceById.get(item.invoiceId), card: cardRows.find((card) => card.id === purchaseById.get(item.purchaseId)?.cardId) };
   });
   if (inconsistentInstallmentDisplay) return NextResponse.json({ error: "Não foi possível exibir as parcelas porque os dados estão inconsistentes." }, { status: 409, headers: privateHeaders });
+  let inconsistentOpeningBalance = false;
   const invoices = invoiceRows.map((invoice) => {
     const parts = installments.filter((item) => item.invoiceId === invoice.id && item.status !== "cancelled");
     const state = stateById.get(invoice.id)!;
-    const openingAdjustment = adjustmentRows.find((item) => item.invoiceId === invoice.id && item.status === "active");
+    const openingAdjustment = adjustmentRows.find((item) => item.invoiceId === invoice.id && item.kind === "opening_balance" && item.status === "active");
     const allocatedCents = openingAdjustment ? allocationRows.filter((item) => item.openingAdjustmentId === openingAdjustment.id).reduce((sum, item) => sum + item.amountCents, 0) : 0;
-    const residualCents = openingAdjustment ? openingAdjustment.amountCents - allocatedCents : 0;
-    const openingBalance = openingAdjustment ? { originalCents: openingAdjustment.amountCents, allocatedCents, residualCents, identifiedCents: allocatedCents } : null;
+    const initialBatch = openingAdjustment ? importBatchById.get(openingAdjustment.importBatchId) : undefined;
+    const openingBalance = openingAdjustment && initialBatch ? resolveOpeningBalanceBreakdown({ initialInvoiceTotalCents: initialBatch.declaredInvoiceTotalCents, openingCents: openingAdjustment.amountCents, allocatedCents }) : null;
+    if (openingAdjustment && (!openingBalance || initialBatch?.openingBalanceCents !== openingAdjustment.amountCents)) inconsistentOpeningBalance = true;
     return { ...invoice, ...state, totalCents: state.invoiceTotalCents, installments: parts, openingBalance };
   });
-  if (invoices.some((invoice) => invoice.openingBalance && invoice.openingBalance.residualCents < 0)) {
+  if (inconsistentOpeningBalance) {
     return NextResponse.json({ error: "Não foi possível exibir as faturas porque o saldo inicial está inconsistente." }, { status: 409, headers: privateHeaders });
   }
   const cards = cardRows.map((card) => {

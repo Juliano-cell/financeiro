@@ -40,6 +40,8 @@ export type InvoiceDetailAdjustment = {
 
 export type InvoiceOpeningBalanceBreakdown = {
   originalCents: number;
+  openingCents: number;
+  initialStateInstallmentsCents: number;
   allocatedCents: number;
   residualCents: number;
   identifiedCents: number;

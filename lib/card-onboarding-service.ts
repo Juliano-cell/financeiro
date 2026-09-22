@@ -1,4 +1,5 @@
 import { addMonths, daysInMonth } from "./finance-rules.mjs";
+import { resolveOpeningBalanceBreakdown } from "./card-opening-balance.mjs";
 import { canInvoiceReceivePurchase, conservativeLegacyInvoiceSnapshot, invoiceCivilDate, invoiceClosesOn, type InvoiceContext } from "./invoice-service";
 
 export type ImportedCardCommitmentInput = {
@@ -409,6 +410,7 @@ export async function getCardOnboardingPreview(cardId: string, selectedReference
 type OpeningBalanceContextRow = {
   initial_batch_id: string;
   initial_reference_month: string;
+  declared_invoice_total_cents: number;
   opening_balance_cents: number;
   invoice_id: string;
   due_date: string;
@@ -422,7 +424,7 @@ type OpeningBalanceContextRow = {
 
 async function openingBalanceContext(cardId: string, context: InvoiceContext) {
   const row = await context.d1.prepare(`SELECT b.id AS initial_batch_id,
-      b.initial_reference_month, b.opening_balance_cents, i.id AS invoice_id,
+      b.initial_reference_month, b.declared_invoice_total_cents, b.opening_balance_cents, i.id AS invoice_id,
       i.due_date, i.closes_on, i.status AS invoice_status,
       a.id AS adjustment_id, a.amount_cents AS adjustment_amount_cents,
       COALESCE((SELECT SUM(o.amount_cents) FROM card_opening_balance_allocations o
@@ -440,14 +442,18 @@ async function openingBalanceContext(cardId: string, context: InvoiceContext) {
     WHERE b.household_id = ? AND b.card_id = ? AND b.import_kind = 'initial_state' AND b.status = 'completed'
     LIMIT 1`).bind(context.householdId, cardId).first<OpeningBalanceContextRow>();
   if (!row) return null;
-  const values = [row.opening_balance_cents, row.allocated_cents, row.invoice_total_cents];
+  const values = [row.declared_invoice_total_cents, row.opening_balance_cents, row.allocated_cents, row.invoice_total_cents];
+  const breakdown = resolveOpeningBalanceBreakdown({
+    initialInvoiceTotalCents: row.declared_invoice_total_cents,
+    openingCents: row.opening_balance_cents,
+    allocatedCents: row.allocated_cents,
+  });
   if (!values.every((value) => Number.isSafeInteger(value) && value >= 0)
-    || row.allocated_cents > row.opening_balance_cents
+    || !breakdown
     || (row.opening_balance_cents === 0 && (row.adjustment_id !== null || row.adjustment_amount_cents !== null))
     || (row.opening_balance_cents > 0 && (row.adjustment_id === null || row.adjustment_amount_cents !== row.opening_balance_cents))) {
     throw new CardOnboardingError("O saldo inicial do cartão está inconsistente.", 409, "CARD_IMPORT_OPENING_INCONSISTENT");
   }
-  const openingResidualCents = row.opening_balance_cents - row.allocated_cents;
   return {
     initialBatchId: row.initial_batch_id,
     initialReferenceMonth: row.initial_reference_month,
@@ -456,11 +462,13 @@ async function openingBalanceContext(cardId: string, context: InvoiceContext) {
     closesOn: row.closes_on,
     invoiceStatus: row.invoice_status,
     openingAdjustmentId: row.adjustment_id,
+    initialInvoiceOriginalCents: breakdown.originalCents,
+    initialStateInstallmentsCents: breakdown.initialStateInstallmentsCents,
     openingOriginalCents: row.opening_balance_cents,
     allocatedCents: row.allocated_cents,
-    openingResidualCents,
+    openingResidualCents: breakdown.residualCents,
     invoiceTotalCents: row.invoice_total_cents,
-    identifiedInstallmentsCents: row.allocated_cents,
+    identifiedCents: breakdown.identifiedCents,
   };
 }
 

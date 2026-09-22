@@ -5,10 +5,12 @@ import {
   addReferenceMonth,
   buildExistingInstallmentPayload,
   buildOnboardingPayload,
+  canIdentifyOpeningBalance,
   canAddOnboardingCommitment,
   createOnboardingAttemptManager,
   createOnboardingAttemptRegistry,
   friendlyOnboardingError,
+  initialExistingInstallmentMode,
   MAX_ONBOARDING_COMMITMENTS,
   nextOriginalInstallments,
   parseBrlCents,
@@ -192,4 +194,19 @@ test("resposta complementar exige contrato financeiro completo", () => {
 });
 test("ação complementar está disponível somente no ramo de cartão ativo e possui revisão", () => {
   assert.match(advanced, /card\.isActive && .*CardExistingInstallmentAction/su); assert.match(existingComponent, /Adicionar parcelamento existente/u); assert.match(existingComponent, /Confirmar parcelamento/u); assert.match(existingComponent, /não movimenta conta nem registra pagamento/iu);
+});
+
+test("residual zero desabilita included com explicação sem escolher additional automaticamente", () => {
+  assert.equal(canIdentifyOpeningBalance(0), false);
+  assert.equal(initialExistingInstallmentMode("included", 0), "");
+  assert.equal(initialExistingInstallmentMode(undefined, 0), "");
+  assert.equal(initialExistingInstallmentMode("additional", 0), "additional");
+  assert.match(existingComponent, /disabled=\{!opening \|\| !canIdentifyOpeningBalance\(opening\.openingResidualCents\)\}/u);
+  assert.match(existingComponent, /Não há saldo inicial pendente para identificar\./u);
+});
+
+test("residual positivo habilita included e atalho contextual some quando residual é zero", () => {
+  assert.equal(canIdentifyOpeningBalance(1), true);
+  assert.equal(initialExistingInstallmentMode("included", 1), "included");
+  assert.match(advanced, /selectedInvoice\.openingBalance\.residualCents > 0[^]*triggerLabel="Identificar saldo inicial"/u);
 });

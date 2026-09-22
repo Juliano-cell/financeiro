@@ -152,6 +152,12 @@ function prepareNotification(f) {
   f.db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,linked_at,updated_at) VALUES(?,?,?,?,?,?,?)").run("link", "ha", "ua", "42", "42", AT, AT);
 }
 
+test("advanced read model inclui parcelas do initial_state no valor identificado", async (t) => {
+  await setupImported(t);
+  const data = await snapshot("2026-09");
+  assert.deepEqual(data.invoices[0].openingBalance, { originalCents: 10000, openingCents: 4000, initialStateInstallmentsCents: 6000, allocatedCents: 0, residualCents: 4000, identifiedCents: 6000 });
+});
+
 test("API paga residual integral sem criar transaction nem reescrever status", async t => {
   const f = await setup(t); const p = await pay(f); assert.equal(p.status, 200); assert.equal(p.body.amountCents, 50000);
   assert.equal(p.headers.get("cache-control"), "private, no-store"); assert.equal(count(f, "transactions"), 0);

@@ -425,7 +425,7 @@ test("detalhe read-only e invoices legadas sem adjustment permanecem coerentes",
   assert.equal(detail.active.items[0].installmentAmountCents, 10000);
   assert.equal(detail.active.items[0].installmentNumber, 5);
   assert.equal(detail.active.items[0].installmentCount, 10);
-  assert.deepEqual(detail.openingBalance, { originalCents: 130000, allocatedCents: 0, residualCents: 130000, identifiedCents: 0 });
+  assert.deepEqual(detail.openingBalance, { originalCents: 140000, openingCents: 130000, initialStateInstallmentsCents: 10000, allocatedCents: 0, residualCents: 130000, identifiedCents: 10000 });
   const importedInvoices = f.db.prepare("SELECT id, reference_month FROM card_invoices WHERE household_id='ha' ORDER BY reference_month").all();
   const nextDetail = await getInvoiceDetail({ invoiceId: importedInvoices.find((item) => item.reference_month === "2026-11").id }, f.context);
   const lastDetail = await getInvoiceDetail({ invoiceId: importedInvoices.find((item) => item.reference_month === "2027-03").id }, f.context);

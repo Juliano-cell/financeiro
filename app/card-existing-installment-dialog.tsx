@@ -6,13 +6,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { buildExistingInstallmentPayload, createOnboardingAttemptRegistry, friendlyOnboardingError, nextOriginalInstallments, parseExistingInstallmentSuccessResponse, referenceMonthOptions } from "@/lib/card-onboarding-ui-rules.mjs";
+import { buildExistingInstallmentPayload, canIdentifyOpeningBalance, createOnboardingAttemptRegistry, friendlyOnboardingError, initialExistingInstallmentMode, nextOriginalInstallments, parseExistingInstallmentSuccessResponse, referenceMonthOptions } from "@/lib/card-onboarding-ui-rules.mjs";
 
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: { id: string; name: string; categoryId: string; isActive?: boolean }[] };
 type Card = { id: string; name: string };
 type Draft = { description: string; installmentAmount: string; originalInstallmentCount: string; firstOriginalInstallmentNumber: string; firstReferenceMonth: string; categoryId: string; subcategoryId: string; originalTotal: string; originalPurchaseDate: string; notes: string };
 type Mode = "included" | "additional";
-type OpeningContext = { initialReferenceMonth: string; openingOriginalCents: number; allocatedCents: number; openingResidualCents: number; invoiceTotalCents: number; identifiedInstallmentsCents: number };
+type OpeningContext = { initialReferenceMonth: string; initialInvoiceOriginalCents: number; initialStateInstallmentsCents: number; openingOriginalCents: number; allocatedCents: number; openingResidualCents: number; invoiceTotalCents: number; identifiedCents: number };
 
 const attempts = createOnboardingAttemptRegistry();
 const money = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
@@ -38,7 +38,7 @@ export function CardExistingInstallmentAction({ card, categories, onChanged, def
   const [open, setOpen] = useState(false);
   const [opening, setOpening] = useState<OpeningContext | null>(null);
   const [loadingContext, setLoadingContext] = useState(false);
-  const [mode, setMode] = useState<Mode | "">(defaultMode ?? "");
+  const [mode, setMode] = useState<Mode | "">(() => defaultMode === "additional" ? "additional" : "");
   const [step, setStep] = useState<"form" | "review" | "success">("form");
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(months[0]?.value ?? ""));
   const [error, setError] = useState("");
@@ -57,7 +57,7 @@ export function CardExistingInstallmentAction({ card, categories, onChanged, def
     loadContext(card.id, controller.signal).then((value) => {
       if (!active) return;
       setOpening(value);
-      const selectedMode = defaultMode === "included" && value.openingResidualCents > 0 ? "included" : defaultMode ?? "";
+      const selectedMode = initialExistingInstallmentMode(defaultMode, value.openingResidualCents);
       setMode(selectedMode);
       setDraft((current) => ({ ...current, firstReferenceMonth: selectedMode === "included" ? value.initialReferenceMonth : current.firstReferenceMonth || months[0]?.value || "" }));
     }).catch((caught) => { if (active && caught?.name !== "AbortError") setError(caught instanceof Error ? caught.message : "Não foi possível carregar o saldo inicial."); })
@@ -67,7 +67,7 @@ export function CardExistingInstallmentAction({ card, categories, onChanged, def
 
   const update = (changes: Partial<Draft>) => setDraft((current) => ({ ...current, ...changes }));
   const reset = () => {
-    setStep("form"); setDraft(emptyDraft(months[0]?.value ?? "")); setMode(defaultMode ?? ""); setOpening(null); setLoadingContext(false); setError(""); setSubmitting(false); setCreatedCount(0); setSuccessSummary(null); submittingRef.current = false; attempt.clearPrepared();
+    setStep("form"); setDraft(emptyDraft(months[0]?.value ?? "")); setMode(defaultMode === "additional" ? "additional" : ""); setOpening(null); setLoadingContext(false); setError(""); setSubmitting(false); setCreatedCount(0); setSuccessSummary(null); submittingRef.current = false; attempt.clearPrepared();
   };
   const close = () => { setOpen(false); reset(); };
   const review = () => {
@@ -103,7 +103,7 @@ export function CardExistingInstallmentAction({ card, categories, onChanged, def
         <DialogHeader><DialogTitle>Adicionar parcelamento existente · {card.name}</DialogTitle><DialogDescription id="existing-installment-description">Cadastre somente as parcelas que ainda precisam ser acompanhadas.</DialogDescription></DialogHeader>
 
         {step === "form" && <div className="grid gap-4 sm:grid-cols-2">
-          <fieldset className="grid gap-2 sm:col-span-2" disabled={loadingContext}><legend className="font-semibold">Como este parcelamento entra na primeira fatura?</legend><label className="flex items-start gap-3 rounded-xl border p-3"><input className="mt-1" type="radio" name="existing-mode" checked={mode === "included"} disabled={!opening || opening.openingResidualCents === 0} onChange={() => { setMode("included"); if (opening) update({ firstReferenceMonth: opening.initialReferenceMonth }); }} /><span><strong className="block">Já está incluído na fatura inicial</strong><span className="text-sm text-[#52645f]">O total dessa fatura não muda. Vamos identificar parte do saldo inicial.</span></span></label><label className="flex items-start gap-3 rounded-xl border p-3"><input className="mt-1" type="radio" name="existing-mode" checked={mode === "additional"} onChange={() => { setMode("additional"); update({ firstReferenceMonth: months[0]?.value ?? "" }); }} /><span><strong className="block">É um novo valor</strong><span className="text-sm text-[#52645f]">Este valor ainda não fazia parte da fatura e será acrescentado.</span></span></label>{opening && opening.openingResidualCents > 0 && <p className="text-sm text-[#52645f]">Saldo inicial ainda não identificado: <strong>{money(opening.openingResidualCents)}</strong></p>}</fieldset>
+          <fieldset className="grid gap-2 sm:col-span-2" disabled={loadingContext}><legend className="font-semibold">Como este parcelamento entra na primeira fatura?</legend><label className="flex items-start gap-3 rounded-xl border p-3"><input className="mt-1" type="radio" name="existing-mode" checked={mode === "included"} disabled={!opening || !canIdentifyOpeningBalance(opening.openingResidualCents)} onChange={() => { setMode("included"); if (opening) update({ firstReferenceMonth: opening.initialReferenceMonth }); }} /><span><strong className="block">Já está incluído na fatura inicial</strong><span className="text-sm text-[#52645f]">O total dessa fatura não muda. Vamos identificar parte do saldo inicial.</span>{opening && !canIdentifyOpeningBalance(opening.openingResidualCents) && <span className="mt-1 block text-sm text-[#8c3434]">Não há saldo inicial pendente para identificar.</span>}</span></label><label className="flex items-start gap-3 rounded-xl border p-3"><input className="mt-1" type="radio" name="existing-mode" checked={mode === "additional"} onChange={() => { setMode("additional"); update({ firstReferenceMonth: months[0]?.value ?? "" }); }} /><span><strong className="block">É um novo valor</strong><span className="text-sm text-[#52645f]">Este valor ainda não fazia parte da fatura e será acrescentado.</span></span></label>{opening && canIdentifyOpeningBalance(opening.openingResidualCents) && <p className="text-sm text-[#52645f]">Saldo inicial ainda não identificado: <strong>{money(opening.openingResidualCents)}</strong></p>}</fieldset>
           <TextField id="existing-description" label="Descrição" value={draft.description} onChange={(value) => update({ description: value })} />
           <TextField id="existing-installment-amount" label="Valor da parcela (R$)" value={draft.installmentAmount} onChange={(value) => update({ installmentAmount: value })} inputMode="decimal" />
           <TextField id="existing-total-count" label="Quantidade original de parcelas" value={draft.originalInstallmentCount} onChange={(value) => update({ originalInstallmentCount: value })} type="number" min="1" max="120" />
@@ -120,7 +120,7 @@ export function CardExistingInstallmentAction({ card, categories, onChanged, def
 
         {step === "review" && parsed.valid && parsed.payload && parsed.preview && <div className="grid gap-5">
           <div className="rounded-xl border bg-[#f7faf9] p-4"><p className="font-semibold">{parsed.payload.description}</p><p className="mt-1 text-sm">Parcela {parsed.payload.firstOriginalInstallmentNumber}/{parsed.payload.originalInstallmentCount} · {money(Number(parsed.payload.installmentAmountCents))}</p><p className="mt-1 text-sm">Serão criadas {parsed.preview.remainingInstallmentCount} parcelas, totalizando {money(parsed.preview.remainingTotalCents)}.</p>{nextOriginalInstallments(parsed.payload.firstOriginalInstallmentNumber, parsed.payload.originalInstallmentCount).length > 0 && <p className="mt-1 text-xs text-[#71837e]">Próximas: {nextOriginalInstallments(parsed.payload.firstOriginalInstallmentNumber, parsed.payload.originalInstallmentCount).map((value) => `${value}/${parsed.payload.originalInstallmentCount}`).join(", ")}</p>}</div>
-          {opening && parsed.payload.mode === "included" && <div className="grid gap-2 rounded-xl border p-4"><p className="font-semibold">O total da primeira fatura não muda.</p><SummaryLine label="Total da primeira fatura" before={opening.invoiceTotalCents} after={opening.invoiceTotalCents} /><SummaryLine label="Lançamentos identificados" before={opening.identifiedInstallmentsCents} after={opening.identifiedInstallmentsCents + Number(parsed.payload.installmentAmountCents)} /><SummaryLine label="Saldo inicial ainda não identificado" before={opening.openingResidualCents} after={opening.openingResidualCents - Number(parsed.payload.installmentAmountCents)} /></div>}
+          {opening && parsed.payload.mode === "included" && <div className="grid gap-2 rounded-xl border p-4"><p className="font-semibold">O total da primeira fatura não muda.</p><SummaryLine label="Total da primeira fatura" before={opening.invoiceTotalCents} after={opening.invoiceTotalCents} /><SummaryLine label="Lançamentos identificados" before={opening.identifiedCents} after={opening.identifiedCents + Number(parsed.payload.installmentAmountCents)} /><SummaryLine label="Saldo inicial ainda não identificado" before={opening.openingResidualCents} after={opening.openingResidualCents - Number(parsed.payload.installmentAmountCents)} /></div>}
           {parsed.payload.mode === "additional" && <p className="rounded-xl border p-4 text-sm">Este é um novo valor. A primeira parcela de {money(Number(parsed.payload.installmentAmountCents))} será acrescentada à fatura selecionada.</p>}
           <p className="text-sm text-[#52645f]">A primeira parcela entrará em {parsed.payload.firstReferenceMonth.split("-").reverse().join("/")}. Faturas existentes serão reutilizadas; as demais serão criadas somente quando necessárias.</p>
           <DialogFooter><Button variant="outline" disabled={submitting} onClick={() => setStep("form")}>Alterar</Button><Button disabled={submitting} onClick={confirm}>{submitting ? "Adicionando…" : "Confirmar parcelamento"}</Button></DialogFooter>

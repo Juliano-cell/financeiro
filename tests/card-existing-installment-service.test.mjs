@@ -16,8 +16,9 @@ register(`data:text/javascript,${encodeURIComponent(`
   }
 `)}`, import.meta.url);
 
-const { addExistingCardInstallment, configureCardCurrentState, CardOnboardingError } = await import("../lib/card-onboarding-service.ts?existing-installments-tests");
+const { addExistingCardInstallment, configureCardCurrentState, getExistingCardInstallmentContext, CardOnboardingError } = await import("../lib/card-onboarding-service.ts?existing-installments-tests");
 const { getInvoiceState } = await import("../lib/invoice-service.ts?existing-installments-tests");
+const { getInvoiceDetail } = await import("../lib/invoice-detail-service.ts?existing-installments-tests");
 const { resolveInstallmentDisplay } = await import("../lib/card-onboarding-ui-rules.mjs?existing-installments-tests");
 const { FINANCIAL_EVENTS_CTE } = await import("../lib/finance-analytics.mjs?existing-installments-tests");
 const migrations = readdirSync(new URL("../drizzle", import.meta.url)).filter((name) => name.endsWith(".sql")).sort();
@@ -79,6 +80,55 @@ const included = { ...supplemental, mode: "included", idempotencyKey: "included-
 
 async function configured(t) { const fixture = setup(t); await configureCardCurrentState(initial, fixture.context); return fixture; }
 const count = (db, table) => db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
+
+test("indicador soma initial_state e included, mas não additional, no cenário visual de R$ 1.400", async (t) => {
+  const f = setup(t);
+  const configured = await configureCardCurrentState({
+    ...initial,
+    idempotencyKey: "manual-ux-initial",
+    commitments: [{
+      description: "Celular Teste",
+      installmentAmountCents: 20000,
+      firstOriginalInstallmentNumber: 5,
+      originalInstallmentCount: 10,
+      originalTotalCents: 200000,
+      originalPurchaseDate: "2026-05-10",
+      categoryId: "category-a",
+      subcategoryId: "subcategory-a",
+    }],
+  }, f.context);
+  const initialContext = await getExistingCardInstallmentContext("card-a", f.context);
+  assert.deepEqual({ original: initialContext.initialInvoiceOriginalCents, initialState: initialContext.initialStateInstallmentsCents, identified: initialContext.identifiedCents, residual: initialContext.openingResidualCents, total: initialContext.invoiceTotalCents }, { original: 140000, initialState: 20000, identified: 20000, residual: 120000, total: 140000 });
+  const usedCents = async () => {
+    const invoiceIds = f.db.prepare("SELECT id FROM card_invoices WHERE card_id='card-a'").all().map((row) => row.id);
+    const states = await Promise.all(invoiceIds.map((invoiceId) => getInvoiceState(invoiceId, f.context)));
+    return states.reduce((sum, state) => sum + state.remainingCents, 0);
+  };
+  assert.equal(await usedCents(), 240000);
+
+  const includedResult = await addExistingCardInstallment({
+    cardId: "card-a", firstReferenceMonth: "2026-10", mode: "included", expectedOpeningResidualCents: 120000, idempotencyKey: "manual-ux-included",
+    commitment: { description: "Notebook Teste", installmentAmountCents: 15000, originalInstallmentCount: 3, firstOriginalInstallmentNumber: 1, originalTotalCents: 45000, originalPurchaseDate: "2026-09-10", categoryId: "category-a", subcategoryId: "subcategory-a", notes: null },
+  }, f.context);
+  assert.deepEqual({ residual: includedResult.openingResidualCents, total: includedResult.invoiceTotalCents }, { residual: 105000, total: 140000 });
+  const includedContext = await getExistingCardInstallmentContext("card-a", f.context);
+  assert.deepEqual({ identified: includedContext.identifiedCents, residual: includedContext.openingResidualCents, total: includedContext.invoiceTotalCents }, { identified: 35000, residual: 105000, total: 140000 });
+  const includedDetail = await getInvoiceDetail({ invoiceId: configured.invoiceId }, f.context);
+  assert.deepEqual(includedDetail.openingBalance, { originalCents: 140000, openingCents: 120000, initialStateInstallmentsCents: 20000, allocatedCents: 15000, residualCents: 105000, identifiedCents: 35000 });
+  assert.equal(await usedCents(), 270000);
+
+  const additionalResult = await addExistingCardInstallment({
+    cardId: "card-a", firstReferenceMonth: "2026-10", mode: "additional", expectedOpeningResidualCents: 105000, idempotencyKey: "manual-ux-additional",
+    commitment: { description: "TV Teste", installmentAmountCents: 10000, originalInstallmentCount: 2, firstOriginalInstallmentNumber: 1, originalTotalCents: 20000, originalPurchaseDate: "2026-09-11", categoryId: "category-a", subcategoryId: "subcategory-a", notes: null },
+  }, f.context);
+  assert.deepEqual({ residual: additionalResult.openingResidualCents, total: additionalResult.invoiceTotalCents }, { residual: 105000, total: 150000 });
+  const additionalContext = await getExistingCardInstallmentContext("card-a", f.context);
+  assert.deepEqual({ identified: additionalContext.identifiedCents, residual: additionalContext.openingResidualCents, total: additionalContext.invoiceTotalCents }, { identified: 35000, residual: 105000, total: 150000 });
+  const additionalDetail = await getInvoiceDetail({ invoiceId: configured.invoiceId }, f.context);
+  assert.deepEqual(additionalDetail.openingBalance, includedDetail.openingBalance);
+
+  assert.equal(await usedCents(), 290000);
+});
 
 test("primeiro parcelamento complementar cria somente 10/12–12/12 e preserva opening balance", async (t) => {
   const f = await configured(t);
