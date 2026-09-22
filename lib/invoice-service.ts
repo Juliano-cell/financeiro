@@ -1,4 +1,4 @@
-import { addMonths, daysInMonth } from "./finance-rules.mjs";
+import { addMonths, dateForDayOfMonth, daysInMonth } from "./finance-rules.mjs";
 
 // Context is supplied by authenticated server code, never parsed from client input.
 export type InvoiceContext = { d1: D1Database; householdId: string; userId: string; timestamp?: string };
@@ -42,7 +42,7 @@ function assertIdentifier(value: string) {
 export function invoiceClosesOn(referenceMonth: string, closingDay: number, dueDay: number) {
   // referenceMonth is the due month produced by the existing invoiceSchedule.
   const closingMonth = addMonths(referenceMonth, dueDay <= closingDay ? -1 : 0);
-  return `${closingMonth}-${String(Math.min(closingDay, daysInMonth(closingMonth))).padStart(2, "0")}`;
+  return dateForDayOfMonth(closingMonth, closingDay);
 }
 
 export function canInvoiceReceivePurchase(invoice: { status: string; closesOn: string | null }, today: string) {

@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { buildOnboardingPayload, canAddOnboardingCommitment, createOnboardingAttemptRegistry, friendlyOnboardingError, MAX_ONBOARDING_COMMITMENTS, nextOriginalInstallments, parseOnboardingPreviewResponse, parseOnboardingSuccessResponse, validateInstallmentDraft } from "@/lib/card-onboarding-ui-rules.mjs";
+import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: { id: string; name: string; categoryId: string; isActive?: boolean }[] };
 type Card = { id: string; name: string };
@@ -16,7 +17,7 @@ type Success = { declaredCurrentInvoiceTotalCents: number; openingBalanceCents: 
 type Cycle = { referenceMonth: string; closesOn: string; dueOn: string; state: "open" | "closed" | "future"; requiresClosedCycleConfirmation: boolean };
 type Preview = { cardUpdatedAt: string; minimumReferenceMonth: string; maximumReferenceMonth: string; suggestedReferenceMonth: string; cycles: Cycle[] };
 
-const money = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
+const money = (cents: number) => formatFinancialCents(cents);
 const date = (value: string) => new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
 const month = (value: string) => new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(`${value}-01T00:00:00Z`));
 const newInstallment = (): InstallmentDraft => ({ id: crypto.randomUUID(), description: "", originalTotal: "", originalInstallmentCount: "", currentInstallmentNumber: "", installmentAmount: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" });

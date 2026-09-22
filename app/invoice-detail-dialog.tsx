@@ -6,9 +6,10 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cycleStatusLabel, paymentStatusLabel } from "@/lib/invoice-ui-rules.mjs";
 import type { InvoiceDetailAdjustment, InvoiceDetailItem, InvoiceDetailPage, InvoiceDetailResponse } from "@/lib/invoice-detail-types";
+import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 
 const PAGE_SIZE = 10;
-const money = (value: number) => Number.isSafeInteger(value) ? new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value / 100) : "Valor indisponível";
+const money = (value: number) => formatFinancialCents(value);
 const dateLabel = (value: string) => new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
 const monthLabel = (value: string) => value.split("-").reverse().join("/");
 const originLabel = (value: InvoiceDetailItem["origin"]) => value === "telegram" ? "Telegram" : value === "system" ? "Sistema" : "Aplicação";

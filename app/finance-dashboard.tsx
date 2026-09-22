@@ -9,16 +9,15 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { createDashboardNavigationIntent, type DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import type { AnalyticsBreakdown, AnalyticsComparison, AnalyticsDetail, AnalyticsResponse } from "@/lib/finance-analytics-types";
+import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 
-const currency = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
-const compactCurrency = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", notation: "compact", maximumFractionDigits: 1 });
 const percent = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 1 });
 const dateFormatter = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
 const monthFormatter = new Intl.DateTimeFormat("pt-BR", { month: "short", year: "2-digit", timeZone: "UTC" });
 const categoryPalette = ["#5d8f45", "#e08b3e", "#4b7d73", "#8866b3", "#cf6f63", "#4c78a8"];
 
-const brl = (cents: number) => currency.format(cents / 100);
-const compactBrl = (cents: number) => compactCurrency.format(cents / 100);
+const brl = (cents: number) => formatFinancialCents(cents);
+const compactBrl = (cents: number) => formatFinancialCents(cents, { compact: true });
 const safePercent = (value: number | null) => value === null || !Number.isFinite(value) ? null : `${percent.format(Math.abs(value))}%`;
 const dateLabel = (value: string) => dateFormatter.format(new Date(`${value}T00:00:00Z`));
 const monthLabel = (value: string) => monthFormatter.format(new Date(`${value}-01T00:00:00Z`)).replace(" de ", " ");
@@ -140,7 +139,7 @@ export function FinanceDashboard({ onNavigate }: { onNavigate: (intent: Dashboar
       <div className="grid min-w-0 gap-5 xl:grid-cols-[1.35fr_.85fr]">
         <article className="min-w-0 rounded-[24px] border bg-white p-4 sm:p-6">
           <SectionHeading title="Evolução financeira" description="Entradas, despesas e resultado ao longo do período" />
-          {hasTimeline ? <div className="mt-5 h-72 min-w-0 sm:h-80"><ResponsiveContainer width="100%" height="100%"><LineChart data={data.timeline} margin={{ top: 8, right: 6, left: -10, bottom: 0 }}><CartesianGrid stroke="#e8eeeb" strokeDasharray="4 4" vertical={false} /><XAxis dataKey="month" tickFormatter={monthLabel} axisLine={false} tickLine={false} fontSize={11} /><YAxis tickFormatter={(value) => compactBrl(Number(value))} axisLine={false} tickLine={false} fontSize={11} width={72} /><Tooltip labelFormatter={(value) => monthLabel(String(value))} formatter={(value, name) => [brl(Number(value)), String(name)]} contentStyle={{ borderRadius: 14, borderColor: "#dfe7e4" }} /><Line type="monotone" dataKey="incomeCents" name="Entradas" stroke="#6b9d48" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="expenseCents" name="Despesas" stroke="#dc8335" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="resultCents" name="Resultado" stroke="#4d766e" strokeWidth={2.5} dot={{ r: 3 }} /></LineChart></ResponsiveContainer></div> : <EmptyBlock icon={ChartNoAxesCombined} title="Ainda não há evolução suficiente" text="Precisamos de mais de um ponto no tempo para desenhar esta comparação." />}
+          {hasTimeline ? <div className="mt-5 h-72 min-w-0 sm:h-80"><ResponsiveContainer width="100%" height="100%"><LineChart data={data.timeline} margin={{ top: 8, right: 6, left: -10, bottom: 0 }}><CartesianGrid stroke="var(--border)" strokeDasharray="4 4" vertical={false} /><XAxis dataKey="month" tickFormatter={monthLabel} axisLine={false} tickLine={false} fontSize={11} tick={{ fill: "var(--muted-foreground)" }} /><YAxis tickFormatter={(value) => compactBrl(Number(value))} axisLine={false} tickLine={false} fontSize={11} width={72} tick={{ fill: "var(--muted-foreground)" }} /><Tooltip labelFormatter={(value) => monthLabel(String(value))} formatter={(value, name) => [brl(Number(value)), String(name)]} contentStyle={{ borderRadius: 14, borderColor: "var(--border)", background: "var(--popover)", color: "var(--popover-foreground)" }} /><Line type="monotone" dataKey="incomeCents" name="Entradas" stroke="#6b9d48" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="expenseCents" name="Despesas" stroke="#dc8335" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="resultCents" name="Resultado" stroke="#4d766e" strokeWidth={2.5} dot={{ r: 3 }} /></LineChart></ResponsiveContainer></div> : <EmptyBlock icon={ChartNoAxesCombined} title="Ainda não há evolução suficiente" text="Precisamos de mais de um ponto no tempo para desenhar esta comparação." />}
         </article>
 
         <article className="min-w-0 rounded-[24px] border bg-white p-4 sm:p-6">
@@ -152,7 +151,7 @@ export function FinanceDashboard({ onNavigate }: { onNavigate: (intent: Dashboar
       <div className="grid min-w-0 gap-5 xl:grid-cols-[1.15fr_.85fr]">
         <article className="min-w-0 rounded-[24px] border bg-white p-4 sm:p-6">
           <SectionHeading title="Para onde foi o dinheiro?" description="Categorias que mais pesaram no período" />
-          {categories.length ? <div className="mt-4 grid min-w-0 gap-4 md:grid-cols-[220px_1fr] md:items-center"><div className="h-52 min-w-0"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={categories} dataKey="currentCents" nameKey="name" innerRadius={52} outerRadius={82} paddingAngle={3}>{categories.map((item, index) => <Cell key={`${item.id ?? "none"}-${item.name}`} fill={item.color || categoryPalette[index % categoryPalette.length]} />)}</Pie><Tooltip formatter={(value) => brl(Number(value))} contentStyle={{ borderRadius: 14, borderColor: "#dfe7e4" }} /></PieChart></ResponsiveContainer></div><div className="space-y-1">{categories.map((item, index) => <BreakdownRow key={`${item.id ?? "none"}-${item.name}`} item={item} color={item.color || categoryPalette[index % categoryPalette.length]} onClick={item.id ? () => openCategory(item) : undefined} />)}</div></div> : <EmptyBlock icon={Tags} title="Ainda não há despesas neste período" text="Registre uma despesa para visualizar como o dinheiro está distribuído." />}
+          {categories.length ? <div className="mt-4 grid min-w-0 gap-4 md:grid-cols-[220px_1fr] md:items-center"><div className="h-52 min-w-0"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={categories} dataKey="currentCents" nameKey="name" innerRadius={52} outerRadius={82} paddingAngle={3}>{categories.map((item, index) => <Cell key={`${item.id ?? "none"}-${item.name}`} fill={item.color || categoryPalette[index % categoryPalette.length]} />)}</Pie><Tooltip formatter={(value) => brl(Number(value))} contentStyle={{ borderRadius: 14, borderColor: "var(--border)", background: "var(--popover)", color: "var(--popover-foreground)" }} /></PieChart></ResponsiveContainer></div><div className="space-y-1">{categories.map((item, index) => <BreakdownRow key={`${item.id ?? "none"}-${item.name}`} item={item} color={item.color || categoryPalette[index % categoryPalette.length]} onClick={item.id ? () => openCategory(item) : undefined} />)}</div></div> : <EmptyBlock icon={Tags} title="Ainda não há despesas neste período" text="Registre uma despesa para visualizar como o dinheiro está distribuído." />}
         </article>
 
         <article className="min-w-0 rounded-[24px] border bg-white p-4 sm:p-6">

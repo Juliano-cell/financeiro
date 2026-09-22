@@ -2,6 +2,7 @@ import Link from "next/link";
 import { CircleDollarSign, LockKeyhole, UsersRound, WalletCards } from "lucide-react";
 import { getCurrentUser } from "./auth";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/app/theme-toggle";
 
 export const dynamic = "force-dynamic";
 
@@ -11,7 +12,7 @@ export default async function Home() {
     <main className="min-h-screen bg-[#f4f6f5] text-[#132b27]">
       <header className="mx-auto flex max-w-6xl items-center justify-between px-5 py-6">
         <div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#123a33] text-[#b9f47a]"><CircleDollarSign className="h-6 w-6" /></span><div><p className="font-semibold">Nossa Casa</p><p className="text-sm text-[#6e817d]">Finanças da família</p></div></div>
-        <div className="flex items-center gap-2">{user ? <Button asChild><Link href="/app">Abrir painel</Link></Button> : <><Button variant="ghost" asChild><Link href="/entrar">Entrar</Link></Button><Button asChild><Link href="/criar-conta">Criar conta</Link></Button></>}</div>
+        <div className="flex items-center gap-2"><ThemeToggle />{user ? <Button asChild><Link href="/app">Abrir painel</Link></Button> : <><Button variant="ghost" asChild><Link href="/entrar">Entrar</Link></Button><Button asChild><Link href="/criar-conta">Criar conta</Link></Button></>}</div>
       </header>
       <section className="mx-auto grid max-w-6xl items-center gap-10 px-5 pb-16 pt-8 lg:grid-cols-[1.08fr_.92fr] lg:pt-20">
         <div><p className="text-sm font-semibold uppercase tracking-[.16em] text-[#568237]">Organização compartilhada</p><h1 className="mt-4 max-w-3xl text-5xl font-semibold tracking-[-.055em] sm:text-6xl">A vida financeira da família, clara para todos.</h1><p className="mt-6 max-w-xl text-lg leading-8 text-[#617570]">Contas, lançamentos e saldos em um só lugar. Cada família mantém seus dados separados e cada pessoa acessa com sua própria conta.</p><div className="mt-8 flex flex-wrap gap-3">{user ? <Button size="lg" asChild><Link href="/app">Continuar como {user.name.split(" ")[0]}</Link></Button> : <><Button size="lg" asChild><Link href="/criar-conta">Criar minha conta</Link></Button><Button size="lg" variant="outline" asChild><Link href="/entrar">Já tenho conta</Link></Button></>}<Button size="lg" variant="ghost" asChild><Link href="/esqueci-senha">Esqueci minha senha</Link></Button></div></div>

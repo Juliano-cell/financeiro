@@ -12,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { initializeReportFromDashboard, type DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import type { AnalyticsBreakdown, AnalyticsComparison, AnalyticsDetail, AnalyticsResponse, AnalyticsTrend } from "@/lib/finance-analytics-types";
 import { applyReportCategoryFilter, applyReportSubcategoryFilter, reportMovementMode } from "@/lib/finance-ui-rules.mjs";
+import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 
 type ReportAccount = { id: string; name: string; isActive: boolean };
 type ReportSubcategory = { id: string; name: string; categoryId: string };
@@ -21,15 +22,13 @@ type ReportType = "all" | "income" | "expense";
 type ReportFilters = { type: ReportType; accountId: string; categoryId: string; subcategoryId: string; responsibleUserId: string };
 
 const emptyFilters: ReportFilters = { type: "all", accountId: "", categoryId: "", subcategoryId: "", responsibleUserId: "" };
-const currency = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
-const compactCurrency = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", notation: "compact", maximumFractionDigits: 1 });
 const percent = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 1 });
 const dateFormatter = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
 const monthFormatter = new Intl.DateTimeFormat("pt-BR", { month: "short", year: "2-digit", timeZone: "UTC" });
 
 const finite = (value: number) => Number.isFinite(value) ? value : 0;
-const brl = (cents: number) => currency.format(finite(cents) / 100);
-const compactBrl = (cents: number) => compactCurrency.format(finite(cents) / 100);
+const brl = (cents: number) => formatFinancialCents(finite(cents));
+const compactBrl = (cents: number) => formatFinancialCents(finite(cents), { compact: true });
 const formatPercent = (value: number | null) => value === null || !Number.isFinite(value) ? null : `${percent.format(Math.abs(value))}%`;
 const dateLabel = (value: string) => dateFormatter.format(new Date(`${value}T00:00:00Z`));
 const monthLabel = (value: string) => monthFormatter.format(new Date(`${value}-01T00:00:00Z`)).replace(" de ", " ");
@@ -181,7 +180,7 @@ export function FinanceReports({ accounts, categories, members, refreshKey, navi
       <div className="grid min-w-0 gap-5 xl:grid-cols-[1.35fr_.65fr]">
         <article className="min-w-0 rounded-[24px] border bg-white p-4 sm:p-6">
           <SectionHeading title="Evolução financeira" description="Entradas, despesas e resultado no período filtrado" />
-          {data.timeline.length > 1 ? <div className="mt-5 h-72 min-w-0 sm:h-80"><ResponsiveContainer width="100%" height="100%"><LineChart data={data.timeline} margin={{ top: 8, right: 6, left: -10, bottom: 0 }}><CartesianGrid stroke="#e8eeeb" strokeDasharray="4 4" vertical={false} /><XAxis dataKey="month" tickFormatter={monthLabel} axisLine={false} tickLine={false} fontSize={11} minTickGap={18} /><YAxis tickFormatter={(value) => compactBrl(Number(value))} axisLine={false} tickLine={false} fontSize={11} width={72} /><Tooltip labelFormatter={(value) => monthLabel(String(value))} formatter={(value, name) => [brl(Number(value)), String(name)]} contentStyle={{ borderRadius: 14, borderColor: "#dfe7e4" }} /><Line type="monotone" dataKey="incomeCents" name="Entradas" stroke="#6b9d48" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="expenseCents" name="Despesas" stroke="#dc8335" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="resultCents" name="Resultado" stroke="#4d766e" strokeWidth={2.5} dot={{ r: 3 }} /></LineChart></ResponsiveContainer></div> : <EmptyBlock icon={BarChart3} title="Sem evolução suficiente" text="Amplie o período para visualizar a evolução ao longo dos meses." />}
+          {data.timeline.length > 1 ? <div className="mt-5 h-72 min-w-0 sm:h-80"><ResponsiveContainer width="100%" height="100%"><LineChart data={data.timeline} margin={{ top: 8, right: 6, left: -10, bottom: 0 }}><CartesianGrid stroke="var(--border)" strokeDasharray="4 4" vertical={false} /><XAxis dataKey="month" tickFormatter={monthLabel} axisLine={false} tickLine={false} fontSize={11} minTickGap={18} tick={{ fill: "var(--muted-foreground)" }} /><YAxis tickFormatter={(value) => compactBrl(Number(value))} axisLine={false} tickLine={false} fontSize={11} width={72} tick={{ fill: "var(--muted-foreground)" }} /><Tooltip labelFormatter={(value) => monthLabel(String(value))} formatter={(value, name) => [brl(Number(value)), String(name)]} contentStyle={{ borderRadius: 14, borderColor: "var(--border)", background: "var(--popover)", color: "var(--popover-foreground)" }} /><Line type="monotone" dataKey="incomeCents" name="Entradas" stroke="#6b9d48" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="expenseCents" name="Despesas" stroke="#dc8335" strokeWidth={2.5} dot={{ r: 3 }} /><Line type="monotone" dataKey="resultCents" name="Resultado" stroke="#4d766e" strokeWidth={2.5} dot={{ r: 3 }} /></LineChart></ResponsiveContainer></div> : <EmptyBlock icon={BarChart3} title="Sem evolução suficiente" text="Amplie o período para visualizar a evolução ao longo dos meses." />}
         </article>
         <article className="rounded-[24px] border bg-white p-4 sm:p-6">
           <SectionHeading title="Comparativos" description="Destaques fornecidos pelo analytics" />

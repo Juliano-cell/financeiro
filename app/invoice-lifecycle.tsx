@@ -11,12 +11,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { buildInvoicePayment, buildInvoiceReversal, createFinancialRefreshController, cycleStatusLabel, invoiceErrorMessage, invoiceHistoryEvents, invoiceToday, paymentStatusLabel, submitInvoiceOperation } from "@/lib/invoice-ui-rules.mjs";
 import { advancedApi, AdvancedApiError } from "@/app/advanced-finance";
 import { InvoiceDetailDialog } from "@/app/invoice-detail-dialog";
+import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 
 export type CanonicalInvoice = { id: string; cardId: string; referenceMonth: string; dueDate: string; invoiceTotalCents: number; paidCents: number; remainingCents: number; paymentStatus: "unpaid" | "partial" | "settled"; cycleStatus: "open" | "closed" | "unknown"; closesOn: string | null; installments: Array<{ id: string }> };
 type Account = { id: string; name: string; currentBalanceCents: number; isActive: boolean };
 type History = { payments: Array<{ id: string; accountId: string; amountCents: number; paidAt: string }>; operations: Array<{ id: string; kind: string; accountId: string; amountCents: number; occurredOn: string; reversedPaymentId: string | null }> };
 type Event = ReturnType<typeof invoiceHistoryEvents>[number];
-const money = (value: number) => Number.isSafeInteger(value) ? new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value / 100) : "Valor indisponível";
+const money = (value: number) => formatFinancialCents(value);
 const dateLabel = (value: string) => new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
 export type FinancialController = ReturnType<typeof createFinancialRefreshController>;
 export type FinancialRefresh = () => Promise<{ success: boolean; generation?: number; startedAt?: number }>;

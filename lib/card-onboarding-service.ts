@@ -1,4 +1,4 @@
-import { addMonths, daysInMonth } from "./finance-rules.mjs";
+import { addMonths, dateForDayOfMonth } from "./finance-rules.mjs";
 import { resolveOpeningBalanceBreakdown } from "./card-opening-balance.mjs";
 import { canInvoiceReceivePurchase, conservativeLegacyInvoiceSnapshot, invoiceCivilDate, invoiceClosesOn, type InvoiceContext } from "./invoice-service";
 
@@ -120,7 +120,7 @@ function assertMoney(value: number, { zero = false }: { zero?: boolean } = {}) {
 }
 
 function dueDate(referenceMonth: string, dueDay: number) {
-  return `${referenceMonth}-${String(Math.min(dueDay, daysInMonth(referenceMonth))).padStart(2, "0")}`;
+  return dateForDayOfMonth(referenceMonth, dueDay);
 }
 
 function onboardingMonthBounds(today: string) {

@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { buildExistingInstallmentPayload, canIdentifyOpeningBalance, createOnboardingAttemptRegistry, friendlyOnboardingError, initialExistingInstallmentMode, nextOriginalInstallments, parseExistingInstallmentSuccessResponse, referenceMonthOptions } from "@/lib/card-onboarding-ui-rules.mjs";
+import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: { id: string; name: string; categoryId: string; isActive?: boolean }[] };
 type Card = { id: string; name: string };
@@ -15,7 +16,7 @@ type Mode = "included" | "additional";
 type OpeningContext = { initialReferenceMonth: string; initialInvoiceOriginalCents: number; initialStateInstallmentsCents: number; openingOriginalCents: number; allocatedCents: number; openingResidualCents: number; invoiceTotalCents: number; identifiedCents: number };
 
 const attempts = createOnboardingAttemptRegistry();
-const money = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
+const money = (cents: number) => formatFinancialCents(cents);
 const emptyDraft = (referenceMonth: string): Draft => ({ description: "", installmentAmount: "", originalInstallmentCount: "", firstOriginalInstallmentNumber: "", firstReferenceMonth: referenceMonth, categoryId: "", subcategoryId: "", originalTotal: "", originalPurchaseDate: "", notes: "" });
 
 async function request(payload: Record<string, unknown>) {

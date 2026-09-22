@@ -25,14 +25,14 @@ const primitiveUrl = `data:text/javascript,${encodeURIComponent(primitives)}`;
 const apiUrl = `data:text/javascript,${encodeURIComponent("export class AdvancedApiError extends Error {} export async function advancedApi(){throw new Error('transport not enabled in render test')} ")}`;
 let compiledDetail = ts.transpileModule(detailSource, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiledDetail = compiledDetail.replace(/from "([^"]+)"/gu, (_, specifier) => {
-  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : import.meta.resolve(specifier);
+  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier.startsWith("@/lib/") ? new URL(`../lib/${specifier.slice(6)}`, import.meta.url).href : import.meta.resolve(specifier);
   return `from ${JSON.stringify(url)}`;
 });
 const detailUrl = `data:text/javascript,${encodeURIComponent(compiledDetail)}`;
 const { InvoiceDetailItems, loadInvoiceDetail, parseInvoiceDetailPayload } = await import(detailUrl);
 let compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiled = compiled.replace(/from "([^"]+)"/gu, (_, specifier) => {
-  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/app/advanced-finance" ? apiUrl : specifier === "@/app/card-onboarding-dialog" ? "data:text/javascript,export function CardOnboardingAction(){return null}" : specifier === "@/app/invoice-detail-dialog" ? detailUrl : specifier === "@/lib/invoice-ui-rules.mjs" ? new URL("../lib/invoice-ui-rules.mjs", import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
+  const url = specifier.startsWith("@/components/") ? primitiveUrl : specifier === "@/app/advanced-finance" ? apiUrl : specifier === "@/app/card-onboarding-dialog" ? "data:text/javascript,export function CardOnboardingAction(){return null}" : specifier === "@/app/invoice-detail-dialog" ? detailUrl : specifier.startsWith("@/lib/") ? new URL(`../lib/${specifier.slice(6)}`, import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
   return `from ${JSON.stringify(url)}`;
 });
 const { InvoiceLifecycle, InvoiceOperationDialog } = await import(`data:text/javascript,${encodeURIComponent(compiled)}`);
@@ -394,6 +394,25 @@ function hookHarness(transport = async () => ({})) {
       if (name === "@/lib/invoice-ui-rules.mjs") return invoiceRules;
       if (name === "@/lib/finance-ui-rules.mjs") return classificationRules;
       if (name === "@/lib/bill-ui-rules.mjs") return billRules;
+      if (name === "@/lib/ui-preferences.mjs") {
+        return {
+          formatFinancialCents: (cents) =>
+            new Intl.NumberFormat("pt-BR", {
+              style: "currency",
+              currency: "BRL",
+            }).format(cents / 100),
+        };
+      }
+      if (name === "@/app/ui-preferences") {
+        return {
+          useUiPreferences: () => ({
+            theme: "light",
+            valuesHidden: false,
+            toggleTheme() {},
+            toggleFinancialValues() {},
+          }),
+        };
+      }
       if (name === "@/app/advanced-finance") return advancedExports ?? { advancedApi: transport, AdvancedApiError: ApiError, AdvancedFinanceView: "AdvancedFinanceView", MonthNavigator: "MonthNavigator" };
       if (name === "@/app/invoice-detail-dialog") return invoiceDetail;
       if (name === "@/app/invoice-lifecycle") return lifecycle;

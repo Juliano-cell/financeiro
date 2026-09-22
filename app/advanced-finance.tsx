@@ -15,6 +15,7 @@ import { activeSubcategories, changeTransactionCategory, transactionClassificati
 import { InvoiceLifecycle, type CanonicalInvoice, type FinancialController, type FinancialRefresh } from "@/app/invoice-lifecycle";
 import { CardOnboardingAction } from "@/app/card-onboarding-dialog";
 import { CardExistingInstallmentAction } from "@/app/card-existing-installment-dialog";
+import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 
 export type AdvancedView = "cards" | "installments" | "bills" | "simulator" | "settings";
 type Account = { id: string; name: string; currentBalanceCents: number; isActive: boolean };
@@ -28,7 +29,7 @@ type BillStatusFilter = "pending" | "paid" | "cancelled" | "all";
 type NotificationPreference = { exists: boolean; channel: "telegram"; enabled: boolean; billDueTomorrow: boolean; billDueToday: boolean; billOverdue: boolean; preferredLocalTime: string; timezone: "America/Sao_Paulo" };
 export type AdvancedSnapshot = { selectedMonth: string; cards: Card[]; invoices: Invoice[]; installments: Installment[]; bills: Bill[]; notificationSettings: { enabled: boolean; offsets: number[] }; summary: { availableCents: number; incomeCents: number; expenseCents: number; paidBillsCents: number; pendingBillsCents: number; cardCents: number; installmentCents: number; commitmentsCents: number; projectedCents: number } };
 
-const brl = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
+const brl = (cents: number) => formatFinancialCents(cents);
 const monthLabel = (month: string) => new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(`${month}-01T00:00:00Z`));
 const addMonth = (month: string, amount: number) => { const [year, value] = month.split("-").map(Number); const date = new Date(Date.UTC(year, value - 1 + amount, 1)); return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`; };
 const cents = (value: FormDataEntryValue | null) => { const normalized = String(value ?? "").trim().replace(/\./g, "").replace(",", "."); return Math.round(Number(normalized) * 100); };

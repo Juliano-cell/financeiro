@@ -1,4 +1,4 @@
-import { addMonths } from "./finance-rules.mjs";
+import { addMonths, dateForDayOfMonth } from "./finance-rules.mjs";
 
 type BillContext = {
   d1: D1Database;
@@ -187,9 +187,7 @@ function requestedIdsCte(ids: string[]) {
 }
 
 function dueDateWithDay(dueDate: string, dayOfMonth: number) {
-  const month = dueDate.slice(0, 7);
-  const lastDay = new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate();
-  return `${month}-${String(Math.min(dayOfMonth, lastDay)).padStart(2, "0")}`;
+  return dateForDayOfMonth(dueDate.slice(0, 7), dayOfMonth);
 }
 
 function recurrenceDateConflict() {
@@ -309,8 +307,7 @@ export async function createBill(input: CreateBillInput, context: BillContext) {
   const occurrences: Array<{ id: string; dueDate: string }> = [];
   for (let index = 0; index < maxMonths; index++) {
     const dueMonth = addMonths(input.dueDate.slice(0, 7), index);
-    const dueDay = Math.min(Number(input.dueDate.slice(8)), new Date(Date.UTC(Number(dueMonth.slice(0, 4)), Number(dueMonth.slice(5, 7)), 0)).getUTCDate());
-    const dueDate = `${dueMonth}-${String(dueDay).padStart(2, "0")}`;
+    const dueDate = dateForDayOfMonth(dueMonth, Number(input.dueDate.slice(8)));
     if (recurrenceEndDate && dueDate > recurrenceEndDate) break;
     occurrences.push({ id: uid("bill"), dueDate });
   }
