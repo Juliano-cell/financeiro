@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { BarChart3, Bell, CalendarClock, ChevronRight, CircleDollarSign, CreditCard, Eye, EyeOff, Home, Landmark, LayoutDashboard, Menu, Moon, Pencil, Plus, ReceiptText, Search, Settings2, Sparkles, Sun, Tags, Trash2, Users, Wallet, X } from "lucide-react";
+import { BarChart3, Bell, CalendarClock, ChevronRight, CircleDollarSign, CreditCard, Eye, EyeOff, Home, Landmark, LayoutDashboard, Menu, Pencil, Plus, ReceiptText, Search, Settings2, Sparkles, Tags, Trash2, Users, Wallet, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -21,6 +21,7 @@ import { activeSubcategories, changeTransactionCategory, changeTransactionType, 
 import { createFinancialRefreshController } from "@/lib/invoice-ui-rules.mjs";
 import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 import { useUiPreferences } from "@/app/ui-preferences";
+import { ThemeToggle } from "@/app/theme-toggle";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
@@ -55,7 +56,7 @@ async function signOut() {
 }
 
 export function FinanceApp() {
-  const { theme, valuesHidden, toggleTheme, toggleFinancialValues } = useUiPreferences();
+  const { valuesHidden, toggleFinancialValues } = useUiPreferences();
   const [data, setData] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<View>("dashboard");
@@ -141,7 +142,7 @@ export function FinanceApp() {
       <section className="min-w-0 pb-[var(--mobile-nav-offset)] lg:pl-[248px] lg:pb-0">
         <header className="flex min-h-[72px] items-center justify-between border-b border-[#dce4e1] bg-[#f4f6f5]/92 px-4 py-3 backdrop-blur md:px-8 lg:sticky lg:top-0 lg:z-20">
           <div className="flex min-w-0 items-center gap-2"><button className="rounded-xl p-2 lg:hidden" onClick={() => setMobileOpen(true)} aria-label="Abrir menu"><Menu className="h-5 w-5" /></button><div className="min-w-0"><p className="truncate text-xs font-semibold uppercase tracking-[0.12em] text-[#6c817c]">{fullToday}</p><h1 className="truncate text-xl font-semibold tracking-tight">{title}</h1></div></div>
-          <div className="flex items-center gap-2"><TooltipProvider><Tooltip><TooltipTrigger asChild><button type="button" onClick={toggleFinancialValues} className="rounded-xl border border-[#d9e2df] bg-white p-2.5" aria-label={valuesHidden ? "Exibir valores financeiros" : "Ocultar valores financeiros"} aria-pressed={valuesHidden}>{valuesHidden ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></TooltipTrigger><TooltipContent>{valuesHidden ? "Exibir valores" : "Ocultar valores"}</TooltipContent></Tooltip><Tooltip><TooltipTrigger asChild><button type="button" onClick={toggleTheme} className="rounded-xl border border-[#d9e2df] bg-white p-2.5" aria-label={theme === "dark" ? "Ativar tema claro" : "Ativar tema escuro"} aria-pressed={theme === "dark"}>{theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button></TooltipTrigger><TooltipContent>{theme === "dark" ? "Tema claro" : "Tema escuro"}</TooltipContent></Tooltip></TooltipProvider><button onClick={() => view === "transactions" ? undefined : navigate("transactions")} className="hidden rounded-xl border border-[#d9e2df] bg-white p-2.5 sm:block" aria-label="Pesquisar movimentações"><Search className="h-4 w-4" /></button><button onClick={() => toast.info("Os alertas financeiros serão ativados na Fase 4.")} className="hidden rounded-xl border border-[#d9e2df] bg-white p-2.5 sm:block" aria-label="Notificações"><Bell className="h-4 w-4" /></button><Button onClick={() => openTransaction()} className="rounded-xl bg-[#0d2925] text-white hover:bg-[#173c35]"><Plus className="h-4 w-4" /><span className="hidden sm:inline">Novo lançamento</span><span className="sm:hidden">Novo</span></Button></div>
+          <div className="flex items-center gap-2"><TooltipProvider><Tooltip><TooltipTrigger asChild><button type="button" onClick={toggleFinancialValues} className="rounded-xl border border-[#d9e2df] bg-white p-2.5" aria-label={valuesHidden ? "Exibir valores financeiros" : "Ocultar valores financeiros"} aria-pressed={valuesHidden}>{valuesHidden ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></TooltipTrigger><TooltipContent>{valuesHidden ? "Exibir valores" : "Ocultar valores"}</TooltipContent></Tooltip></TooltipProvider><ThemeToggle /><button onClick={() => view === "transactions" ? undefined : navigate("transactions")} className="hidden rounded-xl border border-[#d9e2df] bg-white p-2.5 sm:block" aria-label="Pesquisar movimentações"><Search className="h-4 w-4" /></button><button onClick={() => toast.info("Os alertas financeiros serão ativados na Fase 4.")} className="hidden rounded-xl border border-[#d9e2df] bg-white p-2.5 sm:block" aria-label="Notificações"><Bell className="h-4 w-4" /></button><Button onClick={() => openTransaction()} className="rounded-xl bg-[#0d2925] text-white hover:bg-[#173c35]"><Plus className="h-4 w-4" /><span className="hidden sm:inline">Novo lançamento</span><span className="sm:hidden">Novo</span></Button></div>
         </header>
         <div className="mx-auto max-w-[1460px] p-4 md:p-8">
           {(view === "transactions" || advancedViews.includes(view as AdvancedView)) && <div className="mb-6 flex justify-end"><MonthNavigator month={selectedMonth} onChange={setSelectedMonth} /></div>}

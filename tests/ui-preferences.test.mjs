@@ -43,6 +43,8 @@ test("tema cobre raiz, autenticação, modal, inputs e estados disabled", () => 
   assert.match(styles, /input:disabled/u);
   assert.match(read("../app/auth-shell.tsx"), /ThemeToggle/u);
   assert.match(read("../app/page.tsx"), /ThemeToggle/u);
+  assert.match(provider, /themeReady/u);
+  assert.match(provider, /useSyncExternalStore\(subscribeToMount, mountedClientSnapshot, mountedServerSnapshot\)/u);
   assert.match(themeToggle, /aria-label=\{dark \? "Ativar tema claro" : "Ativar tema escuro"\}/u);
 });
 
@@ -62,7 +64,7 @@ test("cabeçalho expõe controles acessíveis de olho e sol/lua", () => {
   assert.match(financeApp, /Ocultar valores financeiros/u);
   assert.match(financeApp, /Exibir valores financeiros/u);
   assert.match(financeApp, /aria-pressed=\{valuesHidden\}/u);
-  assert.match(financeApp, /toggleTheme/u);
+  assert.match(financeApp, /ThemeToggle/u);
   assert.match(financeApp, /TooltipContent/u);
 });
 
