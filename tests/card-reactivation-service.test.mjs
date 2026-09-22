@@ -53,7 +53,7 @@ const snapshot = (db) => Object.fromEntries(financialTables.map((table) => [tabl
 
 test("ativo → inativo → reativado preserva todos os fatos financeiros", async (t) => {
   const f = setup(t);
-  await configureCardCurrentState({ cardId: "card-a", initialReferenceMonth: "2026-10", declaredCurrentInvoiceTotalCents: 140000, idempotencyKey: "initial", commitments: [{ description: "Anterior", installmentAmountCents: 10000, firstOriginalInstallmentNumber: 10, originalInstallmentCount: 12 }] }, f.context);
+  await configureCardCurrentState({ cardId: "card-a", initialReferenceMonth: "2026-10", declaredCurrentInvoiceTotalCents: 140000, expectedCardUpdatedAt: AT, expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false, idempotencyKey: "initial", commitments: [{ description: "Anterior", installmentAmountCents: 10000, firstOriginalInstallmentNumber: 10, originalInstallmentCount: 12 }] }, f.context);
   const before = snapshot(f.db);
   const deactivated = await deactivateCard("card-a", f.context); assert.equal(deactivated.inactivated, true); assert.equal(f.db.prepare("SELECT is_active FROM credit_cards WHERE id='card-a'").get().is_active, 0);
   const result = await reactivateCard("card-a", f.context); assert.equal(result.reactivated, true); assert.equal(result.replayed, false); assert.equal(f.db.prepare("SELECT is_active FROM credit_cards WHERE id='card-a'").get().is_active, 1);

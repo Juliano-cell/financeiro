@@ -31,7 +31,7 @@ const loaderSource = `
 `;
 register(`data:text/javascript,${encodeURIComponent(loaderSource)}`, import.meta.url);
 
-const { configureCardCurrentState, getCardOnboardingEligibility, CardOnboardingError } = await import("../lib/card-onboarding-service.ts?tests");
+const { configureCardCurrentState, getCardOnboardingEligibility, getCardOnboardingPreview, CardOnboardingError } = await import("../lib/card-onboarding-service.ts?tests");
 const { getInvoiceState, payInvoiceResidual, reverseInvoicePayment } = await import("../lib/invoice-service.ts?onboarding-tests");
 const { getInvoiceDetail } = await import("../lib/invoice-detail-service.ts?onboarding-tests");
 const { createCardPurchase } = await import("../lib/finance-service.ts?onboarding-tests");
@@ -106,6 +106,10 @@ const openingOnly = {
   cardId: "card-a",
   initialReferenceMonth: "2026-10",
   declaredCurrentInvoiceTotalCents: 140000,
+  expectedCardUpdatedAt: AT,
+  expectedClosesOn: "2026-10-05",
+  expectedDueOn: "2026-10-12",
+  closedCycleConfirmed: false,
   idempotencyKey: "opening-only",
   commitments: [],
 };
@@ -232,6 +236,51 @@ test("analytics ignora opening balance e inclui somente competências importadas
   assert.equal(events.reduce((sum, row) => sum + row.amount_cents, 0), 60000);
 });
 
+test("preview autoritativo sugere sem selecionar e aceita competência histórica/futura no range seguro", async (t) => {
+  const f = setup(t);
+  const preview = await getCardOnboardingPreview("card-a", "2024-09", f.context);
+  assert.equal(preview.eligible, true);
+  assert.equal(preview.today, "2026-09-18");
+  assert.equal(preview.minimumReferenceMonth, "2024-09");
+  assert.equal(preview.maximumReferenceMonth, "2027-09");
+  assert.equal(preview.suggestedReferenceMonth, "2026-10");
+  assert.deepEqual(preview.cycles.find((cycle) => cycle.referenceMonth === "2024-09"), {
+    referenceMonth: "2024-09", closesOn: "2024-09-05", dueOn: "2024-09-12",
+    state: "closed", requiresClosedCycleConfirmation: true,
+  });
+  assert.equal((await getCardOnboardingPreview("card-a", "2027-09", f.context)).eligible, true);
+  await assert.rejects(getCardOnboardingPreview("card-a", "2024-08", f.context), isCode("CARD_ONBOARDING_REFERENCE_RANGE"));
+  await assert.rejects(getCardOnboardingPreview("card-a", "2027-10", f.context), isCode("CARD_ONBOARDING_REFERENCE_RANGE"));
+});
+
+test("preview respeita a meia-noite civil de São Paulo e exige confirmação para ciclo fechado", async (t) => {
+  const before = setup(t);
+  const openPreview = await getCardOnboardingPreview("card-a", "2026-09", { ...before.context, timestamp: "2026-09-06T02:30:00.000Z" });
+  assert.equal(openPreview.today, "2026-09-05");
+  assert.equal(openPreview.cycles.find((cycle) => cycle.referenceMonth === "2026-09")?.state, "open");
+
+  const after = setup(t);
+  const closedPreview = await getCardOnboardingPreview("card-a", "2026-09", { ...after.context, timestamp: "2026-09-06T03:30:00.000Z" });
+  const closed = closedPreview.cycles.find((cycle) => cycle.referenceMonth === "2026-09");
+  assert.equal(closedPreview.today, "2026-09-06");
+  assert.equal(closed?.state, "closed");
+  await assert.rejects(configureCardCurrentState({
+    ...openingOnly, initialReferenceMonth: "2026-09", expectedClosesOn: "2026-09-05", expectedDueOn: "2026-09-12",
+    closedCycleConfirmed: false, idempotencyKey: "closed-without-confirmation",
+  }, { ...after.context, timestamp: "2026-09-06T03:30:00.000Z" }), isCode("CARD_ONBOARDING_CLOSED_CONFIRMATION_REQUIRED"));
+});
+
+test("POST rejeita preview forjado ou obsoleto antes de gravar", async (t) => {
+  const forged = setup(t);
+  await assert.rejects(configureCardCurrentState({ ...openingOnly, expectedClosesOn: "2026-10-06" }, forged.context), isCode("CARD_ONBOARDING_PREVIEW_STALE"));
+  assert.equal(forged.db.prepare("SELECT COUNT(*) n FROM card_import_batches").get().n, 0);
+
+  const stale = setup(t);
+  stale.db.prepare("UPDATE credit_cards SET updated_at=? WHERE id='card-a'").run("2026-09-18T13:00:00.000Z");
+  await assert.rejects(configureCardCurrentState(openingOnly, stale.context), isCode("CARD_ONBOARDING_PREVIEW_STALE"));
+  assert.equal(stale.db.prepare("SELECT COUNT(*) n FROM card_import_batches").get().n, 0);
+});
+
 test("calendário canônico cobre dezembro→janeiro, fevereiro normal/bissexto e dia 31", async (t) => {
   const f = setup(t);
   const cases = [
@@ -242,7 +291,7 @@ test("calendário canônico cobre dezembro→janeiro, fevereiro normal/bissexto 
   for (const item of cases) {
     seedHousehold(f.db, item.suffix, { closingDay: 31, dueDay: 31 });
     const context = { d1: f.d1, householdId: `h${item.suffix}`, userId: `u${item.suffix}`, timestamp: item.timestamp };
-    await configureCardCurrentState({ cardId: `card-${item.suffix}`, initialReferenceMonth: item.initial, declaredCurrentInvoiceTotalCents: 100, idempotencyKey: `calendar-${item.suffix}`, commitments: [{ description: "Calendar", installmentAmountCents: 100, firstOriginalInstallmentNumber: 1, originalInstallmentCount: 2 }] }, context);
+    await configureCardCurrentState({ cardId: `card-${item.suffix}`, initialReferenceMonth: item.initial, declaredCurrentInvoiceTotalCents: 100, expectedCardUpdatedAt: AT, expectedClosesOn: item.closes[0], expectedDueOn: item.dueDates[0], closedCycleConfirmed: false, idempotencyKey: `calendar-${item.suffix}`, commitments: [{ description: "Calendar", installmentAmountCents: 100, firstOriginalInstallmentNumber: 1, originalInstallmentCount: 2 }] }, context);
     const rows = f.db.prepare("SELECT reference_month,due_date,closes_on FROM card_invoices WHERE household_id=? ORDER BY reference_month").all(`h${item.suffix}`);
     assert.deepEqual(rows.map((row) => row.reference_month), item.months);
     assert.deepEqual(rows.map((row) => row.due_date), item.dueDates);
@@ -252,7 +301,7 @@ test("calendário canônico cobre dezembro→janeiro, fevereiro normal/bissexto 
 
 test("closing_day 31 e due_day 28 preservam regra de mês anterior", async (t) => {
   const f = setup(t, { closingDay: 31, dueDay: 28 });
-  const result = await configureCardCurrentState({ ...openingOnly, initialReferenceMonth: "2026-10", declaredCurrentInvoiceTotalCents: 1, idempotencyKey: "days", commitments: [{ description: "One", installmentAmountCents: 1, firstOriginalInstallmentNumber: 1, originalInstallmentCount: 1 }] }, f.context);
+  const result = await configureCardCurrentState({ ...openingOnly, initialReferenceMonth: "2026-10", declaredCurrentInvoiceTotalCents: 1, expectedClosesOn: "2026-09-30", expectedDueOn: "2026-10-28", idempotencyKey: "days", commitments: [{ description: "One", installmentAmountCents: 1, firstOriginalInstallmentNumber: 1, originalInstallmentCount: 1 }] }, f.context);
   const invoice = f.db.prepare("SELECT due_date,closes_on FROM card_invoices WHERE id=?").get(result.invoiceId);
   assert.deepEqual({ ...invoice }, { due_date: "2026-10-28", closes_on: "2026-09-30" });
 });
@@ -376,12 +425,13 @@ test("detalhe read-only e invoices legadas sem adjustment permanecem coerentes",
   assert.equal(detail.active.items[0].installmentAmountCents, 10000);
   assert.equal(detail.active.items[0].installmentNumber, 5);
   assert.equal(detail.active.items[0].installmentCount, 10);
+  assert.deepEqual(detail.openingBalance, { originalCents: 130000, allocatedCents: 0, residualCents: 130000, identifiedCents: 0 });
   const importedInvoices = f.db.prepare("SELECT id, reference_month FROM card_invoices WHERE household_id='ha' ORDER BY reference_month").all();
   const nextDetail = await getInvoiceDetail({ invoiceId: importedInvoices.find((item) => item.reference_month === "2026-11").id }, f.context);
   const lastDetail = await getInvoiceDetail({ invoiceId: importedInvoices.find((item) => item.reference_month === "2027-03").id }, f.context);
   assert.deepEqual([nextDetail.active.items[0].installmentNumber, nextDetail.active.items[0].installmentCount], [6, 10]);
   assert.deepEqual([lastDetail.active.items[0].installmentNumber, lastDetail.active.items[0].installmentCount], [10, 10]);
-  assert.deepEqual(detail.adjustments, [{ adjustmentId: detail.adjustments[0].adjustmentId, itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 130000, status: "active", includedInTotal: true }]);
+  assert.deepEqual(detail.adjustments, [{ adjustmentId: detail.adjustments[0].adjustmentId, itemType: "opening_balance", description: "Saldo inicial ainda não identificado", amountCents: 130000, status: "active", includedInTotal: true }]);
   assert.equal(detail.active.items.reduce((sum, item) => sum + item.installmentAmountCents, 0) + detail.adjustments.reduce((sum, item) => sum + item.amountCents, 0), detail.invoice.invoiceTotalCents);
 
   seedHousehold(f.db, "legacy");

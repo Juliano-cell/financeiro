@@ -75,42 +75,42 @@ test("detalhamento mostra valor da parcela, numeração, classificação e cance
 test("detalhamento importado apresenta o total histórico recebido do metadata", () => {
   const page = { page: 1, pageSize: 10, totalItems: 1, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
   const imported = { installmentId: "imported-installment", purchaseId: "imported-purchase", purchaseDate: "2026-09-19", description: "Compra teste antiga", categoryId: null, categoryName: null, subcategoryId: null, subcategoryName: null, installmentAmountCents: 6000, installmentNumber: 5, installmentCount: 10, purchaseTotalCents: 60000, origin: "system", status: "pending", includedInTotal: true };
-  const detail = { invoice: { ...invoice, invoiceTotalCents: 10000, paidCents: 0, remainingCents: 10000, paymentStatus: "unpaid" }, adjustments: [{ adjustmentId: "opening", itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 4000, status: "active", includedInTotal: true }], active: { ...page, items: [imported] }, cancelled: { ...page, totalItems: 0, items: [] } };
+  const detail = { invoice: { ...invoice, invoiceTotalCents: 10000, paidCents: 0, remainingCents: 10000, paymentStatus: "unpaid" }, adjustments: [{ adjustmentId: "opening", itemType: "opening_balance", description: "Saldo inicial ainda não identificado", amountCents: 4000, status: "active", includedInTotal: true }], active: { ...page, items: [imported] }, cancelled: { ...page, totalItems: 0, items: [] } };
   const html = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail, onActivePage() {}, onCancelledPage() {} }));
-  for (const expected of ["Compra teste antiga", "R$ 60,00", "Parcela 5/10", "Valor original da compra: R$ 600,00", "Saldo anterior à implantação", "R$ 40,00"]) assert.ok(html.includes(expected), expected);
+  for (const expected of ["Compra teste antiga", "R$ 60,00", "Parcela 5/10", "Valor original da compra: R$ 600,00", "Saldo inicial ainda não identificado", "R$ 40,00"]) assert.ok(html.includes(expected), expected);
   assert.doesNotMatch(html, /Valor original da compra: R\$ 360,00/u);
 });
 
 test("detalhamento exibe opening balance separado e reconciliável em todas as páginas", () => {
-  const adjustment = { adjustmentId: "opening", itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 130000, status: "active", includedInTotal: true };
+  const adjustment = { adjustmentId: "opening", itemType: "opening_balance", description: "Saldo inicial ainda não identificado", amountCents: 130000, status: "active", includedInTotal: true };
   const installment = { installmentId: "part", purchaseId: "purchase", purchaseDate: "2026-09-18", description: "Compra importada", categoryId: null, categoryName: null, subcategoryId: null, subcategoryName: null, installmentAmountCents: 10000, installmentNumber: 1, installmentCount: 1, purchaseTotalCents: 10000, origin: "system", status: "pending", includedInTotal: true };
   const page = { items: [installment], page: 1, pageSize: 10, totalItems: 1, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
   const cancelled = { items: [], page: 1, pageSize: 10, totalItems: 0, totalPages: 1, hasPreviousPage: false, hasNextPage: false };
   const detail = { invoice: { ...invoice, invoiceTotalCents: 140000, paidCents: 0, remainingCents: 140000, paymentStatus: "unpaid" }, adjustments: [adjustment], active: page, cancelled };
   const html = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail, onActivePage() {}, onCancelledPage() {} }));
-  for (const expected of ["Saldo anterior à implantação", "Saldo inicial da fatura", "R$ 1.300,00", "Compra importada", "R$ 100,00", "2 item(ns)"]) assert.ok(html.includes(expected), expected);
-  assert.doesNotMatch(html, /Parcela[^<]*Saldo anterior/u);
+  for (const expected of ["Saldo inicial ainda não identificado", "Saldo inicial da fatura", "R$ 1.300,00", "Compra importada", "R$ 100,00", "2 item(ns)"]) assert.ok(html.includes(expected), expected);
+  assert.doesNotMatch(html, /Parcela[^<]*Saldo inicial ainda/u);
 
   const openingOnly = { ...detail, invoice: { ...detail.invoice, invoiceTotalCents: 140000 }, adjustments: [{ ...adjustment, amountCents: 140000 }], active: { ...page, items: [], totalItems: 0 } };
   const openingHtml = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail: openingOnly, onActivePage() {}, onCancelledPage() {} }));
-  assert.ok(openingHtml.includes("Saldo anterior à implantação"));
+  assert.ok(openingHtml.includes("Saldo inicial ainda não identificado"));
   assert.ok(openingHtml.includes("R$ 1.400,00"));
   assert.ok(openingHtml.includes("1 item(ns)"));
   assert.doesNotMatch(openingHtml, /Nenhum item ativo/u);
 
   const fiftyInstallments = { ...detail, active: { items: Array.from({ length: 10 }, (_, index) => ({ ...installment, installmentId: `part-${index + 1}` })), page: 1, pageSize: 10, totalItems: 50, totalPages: 5, hasPreviousPage: false, hasNextPage: true } };
   const fiftyHtml = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail: fiftyInstallments, onActivePage() {}, onCancelledPage() {} }));
-  assert.ok(fiftyHtml.includes("Saldo anterior à implantação"));
+  assert.ok(fiftyHtml.includes("Saldo inicial ainda não identificado"));
   assert.ok(fiftyHtml.includes("51 item(ns)"));
 
   const secondPage = { ...detail, active: { items: [{ ...installment, installmentId: "part-51" }], page: 6, pageSize: 10, totalItems: 51, totalPages: 6, hasPreviousPage: true, hasNextPage: false } };
   const pageTwoHtml = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail: secondPage, onActivePage() {}, onCancelledPage() {} }));
-  assert.ok(pageTwoHtml.includes("Saldo anterior à implantação"));
+  assert.ok(pageTwoHtml.includes("Saldo inicial ainda não identificado"));
   assert.ok(pageTwoHtml.includes("Página 6 de 6"));
   assert.ok(pageTwoHtml.includes("52 item(ns)"));
 
   const legacyHtml = renderToStaticMarkup(createElement(InvoiceDetailItems, { detail: { ...detail, adjustments: [] }, onActivePage() {}, onCancelledPage() {} }));
-  assert.doesNotMatch(legacyHtml, /Saldo anterior à implantação|Saldo inicial da fatura/u);
+  assert.doesNotMatch(legacyHtml, /Saldo inicial ainda não identificado|Saldo inicial da fatura/u);
 });
 
 test("detalhamento possui paginação responsiva sem householdId no cliente", () => {
@@ -128,6 +128,9 @@ const validDetail = { invoice: { ...invoice, cardName: "Cartão de teste" }, adj
 
 test("validação runtime aceita contrato válido e rejeita estruturas financeiras incompletas", async () => {
   assert.deepEqual(parseInvoiceDetailPayload(validDetail), validDetail);
+  const withOpening = { ...validDetail, openingBalance: { originalCents: 140000, allocatedCents: 10000, residualCents: 130000, identifiedCents: 10000 }, adjustments: [{ adjustmentId: "opening", itemType: "opening_balance", description: "Saldo inicial ainda não identificado", amountCents: 130000, status: "active", includedInTotal: true }] };
+  assert.deepEqual(parseInvoiceDetailPayload(withOpening), withOpening);
+  assert.equal(parseInvoiceDetailPayload({ ...withOpening, openingBalance: { ...withOpening.openingBalance, identifiedCents: 11000 } }), null);
   const withoutInvoice = { active: validDetail.active, cancelled: validDetail.cancelled };
   const withoutTotal = structuredClone(validDetail); delete withoutTotal.invoice.invoiceTotalCents;
   const stringTotal = structuredClone(validDetail); stringTotal.invoice.invoiceTotalCents = "11200";
@@ -139,8 +142,8 @@ test("validação runtime aceita contrato válido e rejeita estruturas financeir
   const invalidInstallment = structuredClone(validDetail); invalidInstallment.active.items[0].installmentNumber = 2;
   const invalidNull = structuredClone(validDetail); invalidNull.invoice.dueDate = null;
   const withoutAdjustments = structuredClone(validDetail); delete withoutAdjustments.adjustments;
-  const invalidAdjustment = structuredClone(validDetail); invalidAdjustment.adjustments = [{ adjustmentId: "a", itemType: "purchase", description: "Saldo anterior à implantação", amountCents: 100, status: "active", includedInTotal: true }];
-  const voidAdjustment = structuredClone(validDetail); voidAdjustment.adjustments = [{ adjustmentId: "a", itemType: "opening_balance", description: "Saldo anterior à implantação", amountCents: 100, status: "voided", includedInTotal: false }];
+  const invalidAdjustment = structuredClone(validDetail); invalidAdjustment.adjustments = [{ adjustmentId: "a", itemType: "purchase", description: "Saldo inicial ainda não identificado", amountCents: 100, status: "active", includedInTotal: true }];
+  const voidAdjustment = structuredClone(validDetail); voidAdjustment.adjustments = [{ adjustmentId: "a", itemType: "opening_balance", description: "Saldo inicial ainda não identificado", amountCents: 100, status: "voided", includedInTotal: false }];
   const invalidPayloads = [{}, withoutInvoice, withoutTotal, stringTotal, unsafeTotal, withoutItems, incompleteItem, unknownStatus, invalidPage, invalidInstallment, invalidNull, withoutAdjustments, invalidAdjustment, voidAdjustment];
   const originalFetch = globalThis.fetch;
   try {

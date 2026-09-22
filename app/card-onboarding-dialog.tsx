@@ -1,20 +1,24 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { buildOnboardingPayload, canAddOnboardingCommitment, createOnboardingAttemptRegistry, friendlyOnboardingError, MAX_ONBOARDING_COMMITMENTS, nextOriginalInstallments, parseOnboardingSuccessResponse, referenceMonthOptions, validateInstallmentDraft } from "@/lib/card-onboarding-ui-rules.mjs";
+import { buildOnboardingPayload, canAddOnboardingCommitment, createOnboardingAttemptRegistry, friendlyOnboardingError, MAX_ONBOARDING_COMMITMENTS, nextOriginalInstallments, parseOnboardingPreviewResponse, parseOnboardingSuccessResponse, validateInstallmentDraft } from "@/lib/card-onboarding-ui-rules.mjs";
 
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: { id: string; name: string; categoryId: string; isActive?: boolean }[] };
 type Card = { id: string; name: string };
 type InstallmentDraft = { id: string; description: string; originalTotal: string; originalInstallmentCount: string; currentInstallmentNumber: string; installmentAmount: string; originalPurchaseDate: string; categoryId: string; subcategoryId: string; notes: string };
 type Eligibility = "loading" | "eligible" | "ineligible" | "error";
 type Success = { declaredCurrentInvoiceTotalCents: number; openingBalanceCents: number; importedPurchaseCount: number; importedInstallmentCount: number };
+type Cycle = { referenceMonth: string; closesOn: string; dueOn: string; state: "open" | "closed" | "future"; requiresClosedCycleConfirmation: boolean };
+type Preview = { cardUpdatedAt: string; minimumReferenceMonth: string; maximumReferenceMonth: string; suggestedReferenceMonth: string; cycles: Cycle[] };
 
 const money = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
+const date = (value: string) => new Intl.DateTimeFormat("pt-BR", { timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`));
+const month = (value: string) => new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(`${value}-01T00:00:00Z`));
 const newInstallment = (): InstallmentDraft => ({ id: crypto.randomUUID(), description: "", originalTotal: "", originalInstallmentCount: "", currentInstallmentNumber: "", installmentAmount: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" });
 const onboardingAttempts = createOnboardingAttemptRegistry();
 
@@ -27,12 +31,15 @@ async function onboardingRequest(url: string, init?: RequestInit) {
 }
 
 export function CardOnboardingAction({ card, categories, onChanged }: { card: Card; categories: Category[]; onChanged: () => Promise<void> }) {
-  const months = useMemo(() => referenceMonthOptions(), []);
   const [eligibility, setEligibility] = useState<Eligibility>("loading");
   const [eligibilityVersion, setEligibilityVersion] = useState(0);
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState<"invoice" | "installments" | "review" | "success">("invoice");
-  const [referenceMonth, setReferenceMonth] = useState(months[0]?.value ?? "");
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [selectedCycle, setSelectedCycle] = useState<Cycle | null>(null);
+  const [otherReferenceMonth, setOtherReferenceMonth] = useState("");
+  const [previewing, setPreviewing] = useState(false);
+  const [closedCycleConfirmed, setClosedCycleConfirmed] = useState(false);
   const [invoiceTotal, setInvoiceTotal] = useState("");
   const [hasInstallments, setHasInstallments] = useState<boolean | null>(null);
   const [installments, setInstallments] = useState<InstallmentDraft[]>([]);
@@ -47,8 +54,10 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
     const controller = new AbortController();
     onboardingRequest(`/api/finance/card-onboarding?cardId=${encodeURIComponent(card.id)}`, { signal: controller.signal })
       .then((body) => {
-        const eligible = body.eligible === true;
+        const parsed = parseOnboardingPreviewResponse(body, card.id);
+        const eligible = parsed !== null;
         if (!eligible) attempt.resolve();
+        if (parsed) { setPreview(parsed); setSelectedCycle(null); setClosedCycleConfirmed(false); }
         setEligibility(eligible ? "eligible" : "ineligible");
       })
       .catch((caught) => { if (caught?.name !== "AbortError") setEligibility("error"); });
@@ -56,15 +65,34 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
   }, [attempt, card.id, eligibilityVersion]);
 
   const reset = () => {
-    setStep("invoice"); setReferenceMonth(months[0]?.value ?? ""); setInvoiceTotal(""); setHasInstallments(null); setInstallments([]); setError(""); setSuccess(null); setSubmitting(false); submittingRef.current = false; attempt.clearPrepared();
+    setStep("invoice"); setSelectedCycle(null); setOtherReferenceMonth(""); setClosedCycleConfirmed(false); setInvoiceTotal(""); setHasInstallments(null); setInstallments([]); setError(""); setSuccess(null); setSubmitting(false); submittingRef.current = false; attempt.clearPrepared();
   };
   const close = () => { setOpen(false); reset(); };
   const updateInstallment = (id: string, changes: Partial<InstallmentDraft>) => setInstallments((current) => current.map((item) => item.id === id ? { ...item, ...changes } : item));
-  const draft = { cardId: card.id, referenceMonth, invoiceTotal, hasInstallments: hasInstallments === true, installments };
+  const draft = { cardId: card.id, referenceMonth: selectedCycle?.referenceMonth ?? "", invoiceTotal,
+    expectedCardUpdatedAt: preview?.cardUpdatedAt ?? "", expectedClosesOn: selectedCycle?.closesOn ?? "",
+    expectedDueOn: selectedCycle?.dueOn ?? "", requiresClosedCycleConfirmation: selectedCycle?.requiresClosedCycleConfirmation ?? false,
+    closedCycleConfirmed, hasInstallments: hasInstallments === true, installments };
   const parsed = buildOnboardingPayload(draft);
 
+  const chooseCycle = (cycle: Cycle) => { setSelectedCycle(cycle); setClosedCycleConfirmed(false); setError(""); };
+  const previewOtherMonth = async () => {
+    if (!preview || otherReferenceMonth < preview.minimumReferenceMonth || otherReferenceMonth > preview.maximumReferenceMonth) {
+      setError(`Escolha uma competência entre ${preview?.minimumReferenceMonth ?? "o limite mínimo"} e ${preview?.maximumReferenceMonth ?? "o limite máximo"}.`); return;
+    }
+    setPreviewing(true); setError("");
+    try {
+      const body = await onboardingRequest(`/api/finance/card-onboarding?cardId=${encodeURIComponent(card.id)}&referenceMonth=${encodeURIComponent(otherReferenceMonth)}`);
+      const latest = parseOnboardingPreviewResponse(body, card.id);
+      const cycle = latest?.cycles.find((item: Cycle) => item.referenceMonth === otherReferenceMonth);
+      if (!latest || !cycle) throw new Error("Prévia inválida.");
+      setPreview(latest); chooseCycle(cycle);
+    } catch (caught) { setError(caught instanceof Error ? caught.message : "Não foi possível calcular essa fatura."); }
+    finally { setPreviewing(false); }
+  };
+
   const continueFromInvoice = () => {
-    if (!referenceMonth || !months.some((item) => item.value === referenceMonth)) { setError("Selecione uma competência disponível."); return; }
+    if (!selectedCycle) { setError("Escolha explicitamente a primeira fatura que você quer acompanhar."); return; }
     if (!buildOnboardingPayload({ ...draft, hasInstallments: false, installments: [] }).valid) { setError("Informe um total de fatura válido."); return; }
     if (hasInstallments === null) { setError("Informe se existem compras parceladas em andamento."); return; }
     setError("");
@@ -125,7 +153,12 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
         <DialogHeader><DialogTitle>Configurar situação atual · {card.name}</DialogTitle><DialogDescription id="card-onboarding-description">Configuração inicial para trazer a fatura e os parcelamentos que já existiam.</DialogDescription></DialogHeader>
 
         {step === "invoice" && <div className="grid gap-5">
-          <div className="grid gap-2"><Label htmlFor="onboarding-month">Competência da fatura</Label><select id="onboarding-month" className="min-h-11 rounded-md border px-3 capitalize" value={referenceMonth} onChange={(event) => setReferenceMonth(event.target.value)}>{months.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></div>
+          <fieldset className="grid gap-3"><legend className="font-semibold">Qual é a primeira fatura que você quer acompanhar?</legend>
+            <p className="text-sm text-[#52645f]">A sugestão ajuda na escolha, mas nenhuma fatura é selecionada automaticamente.</p>
+            {preview?.cycles.filter((cycle, index, cycles) => cycles.findIndex((item) => item.referenceMonth === cycle.referenceMonth) === index).map((cycle) => <button key={cycle.referenceMonth} type="button" aria-pressed={selectedCycle?.referenceMonth === cycle.referenceMonth} onClick={() => chooseCycle(cycle)} className={`rounded-xl border p-4 text-left ${selectedCycle?.referenceMonth === cycle.referenceMonth ? "border-[#166a5a] bg-[#eef8f5]" : "bg-white"}`}><span className="flex flex-wrap items-center justify-between gap-2"><strong className="capitalize">Fatura de {month(cycle.referenceMonth)}</strong>{preview.suggestedReferenceMonth === cycle.referenceMonth && <span className="rounded-full bg-[#e1f1ec] px-2 py-1 text-xs">Sugestão</span>}</span><span className="mt-2 block text-sm">Fecha em {date(cycle.closesOn)} · vence em {date(cycle.dueOn)}</span><span className="mt-1 block text-xs text-[#52645f]">{cycle.state === "closed" ? "Ciclo fechado" : cycle.state === "future" ? "Ciclo futuro" : "Ciclo aberto"}</span></button>)}
+            <div className="grid gap-2 rounded-xl border p-4 sm:grid-cols-[1fr_auto] sm:items-end"><div className="grid gap-2"><Label htmlFor="onboarding-other-month">Outra competência</Label><Input id="onboarding-other-month" type="month" min={preview?.minimumReferenceMonth} max={preview?.maximumReferenceMonth} value={otherReferenceMonth} onChange={(event) => setOtherReferenceMonth(event.target.value)} /></div><Button type="button" variant="outline" disabled={previewing || !otherReferenceMonth} onClick={previewOtherMonth}>{previewing ? "Calculando…" : "Calcular datas"}</Button></div>
+          </fieldset>
+          {selectedCycle?.requiresClosedCycleConfirmation && <label className="flex items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm"><input className="mt-1" type="checkbox" checked={closedCycleConfirmed} onChange={(event) => setClosedCycleConfirmed(event.target.checked)} /><span>Confirmo que desejo iniciar o acompanhamento pela fatura {selectedCycle.referenceMonth.split("-").reverse().join("/")}, cujo ciclo já fechou.</span></label>}
           <div className="grid gap-2"><Label htmlFor="onboarding-total">Valor total atual da fatura</Label><Input id="onboarding-total" inputMode="decimal" placeholder="1.400,00" value={invoiceTotal} onChange={(event) => setInvoiceTotal(event.target.value)} aria-describedby="onboarding-total-help" /><p id="onboarding-total-help" className="text-xs text-[#71837e]">Digite o total em reais, incluindo compras anteriores ao sistema.</p></div>
           <fieldset className="grid gap-2"><legend className="font-medium">Essa fatura possui compras parceladas que continuarão nos próximos meses?</legend><label className="flex min-h-11 items-center gap-2 rounded-md border px-3"><input type="radio" name="has-installments" checked={hasInstallments === true} onChange={() => setHasInstallments(true)} /> Sim</label><label className="flex min-h-11 items-center gap-2 rounded-md border px-3"><input type="radio" name="has-installments" checked={hasInstallments === false} onChange={() => setHasInstallments(false)} /> Não</label></fieldset>
           <DialogFooter><Button variant="outline" onClick={close}>Cancelar</Button><Button onClick={continueFromInvoice}>Continuar</Button></DialogFooter>
@@ -156,10 +189,11 @@ export function CardOnboardingAction({ card, categories, onChanged }: { card: Ca
         </div>}
 
         {step === "review" && parsed.valid && parsed.preview && parsed.payload && <div className="grid gap-5">
-          <div className="grid gap-2 rounded-xl border bg-[#f7faf9] p-4"><ReviewLine label="Fatura atual" value={money(parsed.preview.declaredCurrentInvoiceTotalCents)} /><ReviewLine label="Parcelamentos informados nesta fatura" value={money(parsed.preview.currentInstallmentsCents)} /><ReviewLine label="Saldo anterior à implantação" value={money(parsed.preview.openingBalanceCents)} /></div>
+          <div className="grid gap-2 rounded-xl border bg-[#f7faf9] p-4"><ReviewLine label="Competência" value={parsed.payload.referenceMonth.split("-").reverse().join("/")} /><ReviewLine label="Fechamento" value={date(parsed.payload.expectedClosesOn)} /><ReviewLine label="Vencimento" value={date(parsed.payload.expectedDueOn)} /><ReviewLine label="Total da fatura" value={money(parsed.preview.declaredCurrentInvoiceTotalCents)} /><ReviewLine label="Parcelamentos informados nesta fatura" value={money(parsed.preview.currentInstallmentsCents)} /><ReviewLine label="Saldo inicial ainda não identificado" value={money(parsed.preview.openingBalanceCents)} /></div>
           {parsed.preview.openingBalanceCents < 0 && <p className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800" role="alert">As parcelas atuais superam o total informado da fatura.</p>}
           {parsed.payload.existingInstallments.length > 0 && <div className="grid gap-3"><h3 className="font-semibold">Parcelamentos</h3>{parsed.payload.existingInstallments.map((item, index) => <div key={`${item.description}-${index}`} className="rounded-xl border p-4"><p className="font-medium">{item.description}</p><p className="text-sm">Parcela {item.currentInstallmentNumber} de {item.originalInstallmentCount} · {money(Number(item.installmentAmountCents))} por parcela</p>{nextOriginalInstallments(Number(item.currentInstallmentNumber), Number(item.originalInstallmentCount)).length > 0 && <p className="mt-1 text-xs text-[#71837e]">Próximas: {nextOriginalInstallments(Number(item.currentInstallmentNumber), Number(item.originalInstallmentCount)).map((value) => `${value}/${item.originalInstallmentCount}`).join(", ")}</p>}</div>)}</div>}
-          <p className="text-sm text-[#52645f]">Saldo anterior à implantação é a parte da fatura atual que já existia antes do sistema e não foi detalhada como compra parcelada. Ele compõe a fatura, mas não vira compra fictícia, renda ou nova despesa categorizada. Esta é somente uma prévia; o backend continua sendo a autoridade financeira final.</p>
+          <p className="rounded-xl border p-4 text-sm font-medium">Você está informando que {money(parsed.preview.declaredCurrentInvoiceTotalCents)} é o total da fatura {parsed.payload.referenceMonth.split("-").reverse().join("/")}, que fecha em {date(parsed.payload.expectedClosesOn)} e vence em {date(parsed.payload.expectedDueOn)}.</p>
+          <p className="text-sm text-[#52645f]">Saldo inicial ainda não identificado é a parte da fatura que já existia antes do sistema e ainda não foi detalhada. Esta é somente uma prévia; o backend continua sendo a autoridade financeira e calendárica final.</p>
           <DialogFooter><Button variant="outline" disabled={submitting} onClick={() => setStep(hasInstallments ? "installments" : "invoice")}>Alterar</Button><Button disabled={submitting || parsed.preview.openingBalanceCents < 0} onClick={confirm}>{submitting ? "Configurando…" : "Confirmar situação atual"}</Button></DialogFooter>
         </div>}
 

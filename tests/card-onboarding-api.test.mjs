@@ -111,6 +111,10 @@ const validPayload = {
   cardId: "card-a",
   referenceMonth: "2026-09",
   declaredCurrentInvoiceTotalCents: 140000,
+  expectedCardUpdatedAt: AT,
+  expectedClosesOn: "2026-09-05",
+  expectedDueOn: "2026-09-12",
+  closedCycleConfirmed: true,
   idempotencyKey: "configure-card-a",
   existingInstallments: [],
 };
@@ -130,6 +134,8 @@ async function eligibility(query = "cardId=card-a") {
 const existingInstallmentPayload = {
   cardId: "card-a",
   firstReferenceMonth: "2026-10",
+  mode: "additional",
+  expectedOpeningResidualCents: 140000,
   idempotencyKey: "existing-card-a",
   description: "Compra lembrada depois",
   installmentAmountCents: 10000,
@@ -315,7 +321,7 @@ test("categoria de outro household é rejeitada sem escrita", async (t) => {
 });
 
 test("GET informa elegibilidade mínima de cartão local", async (t) => {
-  setup(t); const result = await eligibility(); assert.equal(result.status, 200); assert.deepEqual(result.body, { cardId: "card-a", eligible: true }); assert.equal(result.headers.get("cache-control"), "private, no-store");
+  setup(t); const result = await eligibility(); assert.equal(result.status, 200); assert.equal(result.body.cardId, "card-a"); assert.equal(result.body.eligible, true); assert.equal(result.body.cardUpdatedAt, AT); assert.equal(result.body.suggestedReferenceMonth, "2026-10"); assert.ok(result.body.cycles.some((cycle) => cycle.referenceMonth === "2026-09" && cycle.state === "closed")); assert.ok(result.body.cycles.some((cycle) => cycle.referenceMonth === "2026-10" && cycle.closesOn === "2026-10-05" && cycle.dueOn === "2026-10-12")); assert.equal(result.headers.get("cache-control"), "private, no-store");
 });
 
 test("GET não revela card de outro household", async (t) => {
@@ -340,7 +346,7 @@ test("parcelamento complementar sem sessão e membership inativa são rejeitados
 
 test("API adiciona parcelamento complementar após onboarding e não expõe dados internos", async (t) => {
   const f = setup(t);
-  assert.equal((await post({ ...validPayload, referenceMonth: "2026-10" })).status, 201);
+  assert.equal((await post({ ...validPayload, referenceMonth: "2026-10", expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false })).status, 201);
   const result = await postExisting();
   assert.equal(result.status, 201); assert.equal(result.headers.get("cache-control"), "private, no-store");
   assert.equal(result.body.importedInstallmentCount, 3); assert.equal(result.body.replayed, false);
@@ -349,7 +355,7 @@ test("API adiciona parcelamento complementar após onboarding e não expõe dado
 });
 
 test("API complementar mantém idempotência e isolamento de household", async (t) => {
-  const f = setup(t); await post({ ...validPayload, referenceMonth: "2026-10" });
+  const f = setup(t); await post({ ...validPayload, referenceMonth: "2026-10", expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false });
   const first = await postExisting(); const replay = await postExisting();
   assert.equal(first.status, 201); assert.equal(replay.status, 201); assert.equal(replay.body.batchId, first.body.batchId); assert.equal(replay.body.replayed, true);
   const conflict = await postExisting({ ...existingInstallmentPayload, description: "Payload diferente" }); assert.equal(conflict.status, 409);

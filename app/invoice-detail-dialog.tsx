@@ -54,12 +54,19 @@ function validPage(value: unknown, cancelled: boolean): value is InvoiceDetailPa
 
 function validAdjustment(value: unknown): value is InvoiceDetailAdjustment {
   return record(value) && text(value.adjustmentId) && value.itemType === "opening_balance"
-    && value.description === "Saldo anterior à implantação" && safeInteger(value.amountCents, 1)
+    && value.description === "Saldo inicial ainda não identificado" && safeInteger(value.amountCents, 1)
     && value.status === "active" && value.includedInTotal === true;
 }
 
+function validOpeningBalance(value: unknown) {
+  if (value === null || value === undefined) return true;
+  if (!record(value) || !safeInteger(value.originalCents) || !safeInteger(value.allocatedCents)
+    || !safeInteger(value.residualCents) || !safeInteger(value.identifiedCents)) return false;
+  return Number(value.allocatedCents) + Number(value.residualCents) === Number(value.originalCents);
+}
+
 export function parseInvoiceDetailPayload(value: unknown): InvoiceDetailResponse | null {
-  if (!record(value) || !record(value.invoice) || !Array.isArray(value.adjustments)
+  if (!record(value) || !record(value.invoice) || !validOpeningBalance(value.openingBalance) || !Array.isArray(value.adjustments)
     || !value.adjustments.every(validAdjustment) || !validPage(value.active, false) || !validPage(value.cancelled, true)) return null;
   const invoice = value.invoice;
   if (!text(invoice.id) || !text(invoice.cardId) || !text(invoice.cardName) || !referenceMonth(invoice.referenceMonth)
@@ -70,6 +77,8 @@ export function parseInvoiceDetailPayload(value: unknown): InvoiceDetailResponse
   const remaining = Math.max(Number(invoice.invoiceTotalCents) - Number(invoice.paidCents), 0);
   const paymentStatus = remaining === 0 ? "settled" : Number(invoice.paidCents) === 0 ? "unpaid" : "partial";
   if (Number(invoice.remainingCents) !== remaining || invoice.paymentStatus !== paymentStatus) return null;
+  if (record(value.openingBalance)
+    && Number(value.openingBalance.identifiedCents) !== Number(value.openingBalance.allocatedCents)) return null;
   return value as unknown as InvoiceDetailResponse;
 }
 
@@ -124,6 +133,7 @@ function PageControls({ value, onChange }: { value: InvoiceDetailPage; onChange:
 export function InvoiceDetailItems({ detail, onActivePage, onCancelledPage }: { detail: InvoiceDetailResponse; onActivePage: (page: number) => void; onCancelledPage: (page: number) => void }) {
   const activeComponentCount = detail.active.totalItems + detail.adjustments.length;
   return <div className="grid gap-5">
+    {detail.openingBalance && detail.openingBalance.residualCents > 0 && <section className="grid gap-2 rounded-xl border bg-[#f7faf9] p-4" aria-label="Composição do saldo inicial"><ReviewValue label="Lançamentos identificados" value={money(detail.openingBalance.identifiedCents)} /><ReviewValue label="Saldo inicial ainda não identificado" value={money(detail.openingBalance.residualCents)} /></section>}
     <section aria-labelledby="active-invoice-items"><div className="flex flex-wrap items-center justify-between gap-2"><h3 id="active-invoice-items" className="font-semibold">Itens da fatura</h3><span className="text-sm text-[#71837e]">{activeComponentCount} item(ns)</span></div>
       {detail.adjustments.length > 0 && <ul className="mt-3 grid gap-3">{detail.adjustments.map((adjustment) => <Adjustment key={adjustment.adjustmentId} adjustment={adjustment} />)}</ul>}
       {detail.active.items.length ? <ul className="mt-3 grid gap-3">{detail.active.items.map((item) => <Item key={item.installmentId} item={item} />)}</ul> : detail.adjustments.length === 0 ? <p className="mt-3 rounded-xl bg-[#f6f8f7] p-4 text-sm text-[#71837e]">Nenhum item ativo nesta fatura.</p> : null}
@@ -134,6 +144,10 @@ export function InvoiceDetailItems({ detail, onActivePage, onCancelledPage }: { 
       <PageControls value={detail.cancelled} onChange={onCancelledPage} />
     </section>}
   </div>;
+}
+
+function ReviewValue({ label, value }: { label: string; value: string }) {
+  return <div className="flex flex-wrap justify-between gap-2 text-sm"><span className="text-[#52645f]">{label}</span><strong>{value}</strong></div>;
 }
 
 type InvoiceSummary = {

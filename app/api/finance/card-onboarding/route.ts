@@ -8,7 +8,7 @@ import { householdMembers } from "@/db/schema";
 import {
   CardOnboardingError,
   configureCardCurrentState,
-  getCardOnboardingEligibility,
+  getCardOnboardingPreview,
 } from "@/lib/card-onboarding-service";
 
 export const dynamic = "force-dynamic";
@@ -52,11 +52,15 @@ const onboardingSchema = z.object({
   cardId: identifier,
   referenceMonth,
   declaredCurrentInvoiceTotalCents: z.number().int().safe().min(0).max(100_000_000_000),
+  expectedCardUpdatedAt: z.string().min(1).max(100),
+  expectedClosesOn: z.string().date(),
+  expectedDueOn: z.string().date(),
+  closedCycleConfirmed: z.boolean(),
   idempotencyKey: operationKey,
   existingInstallments: z.array(existingInstallmentSchema).max(50).default([]),
 }).strict();
 
-const eligibilityQuerySchema = z.object({ cardId: identifier }).strict();
+const eligibilityQuerySchema = z.object({ cardId: identifier, referenceMonth: referenceMonth.optional() }).strict();
 
 async function identity() {
   const user = await getCurrentUser();
@@ -117,13 +121,13 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const raw = Object.fromEntries(url.searchParams);
     const parsed = eligibilityQuerySchema.parse(raw);
-    const result = await getCardOnboardingEligibility(parsed.cardId, current);
+    const result = await getCardOnboardingPreview(parsed.cardId, parsed.referenceMonth ?? null, current);
     if (!result.eligible && result.reason === "not_found") {
       return NextResponse.json({ error: "Cartão não encontrado.", code: "CARD_ONBOARDING_CARD_NOT_FOUND" }, { status: 404, headers: privateHeaders });
     }
     return NextResponse.json(
       result.eligible
-        ? { cardId: parsed.cardId, eligible: true }
+        ? { cardId: parsed.cardId, ...result }
         : { cardId: parsed.cardId, eligible: false, reasonCode: result.reason },
       { headers: privateHeaders },
     );
@@ -145,6 +149,10 @@ export async function POST(request: Request) {
       cardId: parsed.cardId,
       initialReferenceMonth: parsed.referenceMonth,
       declaredCurrentInvoiceTotalCents: parsed.declaredCurrentInvoiceTotalCents,
+      expectedCardUpdatedAt: parsed.expectedCardUpdatedAt,
+      expectedClosesOn: parsed.expectedClosesOn,
+      expectedDueOn: parsed.expectedDueOn,
+      closedCycleConfirmed: parsed.closedCycleConfirmed,
       idempotencyKey: parsed.idempotencyKey,
       commitments: parsed.existingInstallments.map((installment) => ({
         description: installment.description,

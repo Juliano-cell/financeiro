@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,6 +11,8 @@ import { buildExistingInstallmentPayload, createOnboardingAttemptRegistry, frien
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; isActive: boolean; subcategories: { id: string; name: string; categoryId: string; isActive?: boolean }[] };
 type Card = { id: string; name: string };
 type Draft = { description: string; installmentAmount: string; originalInstallmentCount: string; firstOriginalInstallmentNumber: string; firstReferenceMonth: string; categoryId: string; subcategoryId: string; originalTotal: string; originalPurchaseDate: string; notes: string };
+type Mode = "included" | "additional";
+type OpeningContext = { initialReferenceMonth: string; openingOriginalCents: number; allocatedCents: number; openingResidualCents: number; invoiceTotalCents: number; identifiedInstallmentsCents: number };
 
 const attempts = createOnboardingAttemptRegistry();
 const money = (cents: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100);
@@ -24,23 +26,48 @@ async function request(payload: Record<string, unknown>) {
   return body;
 }
 
-export function CardExistingInstallmentAction({ card, categories, onChanged }: { card: Card; categories: Category[]; onChanged: () => Promise<void> }) {
+async function loadContext(cardId: string, signal?: AbortSignal) {
+  const response = await fetch(`/api/finance/card-existing-installments?cardId=${encodeURIComponent(cardId)}`, { cache: "no-store", signal });
+  const body = await response.json() as OpeningContext & { error?: string };
+  if (!response.ok) throw Object.assign(new Error(body.error ?? "Não foi possível carregar o saldo inicial."), { status: response.status });
+  return body;
+}
+
+export function CardExistingInstallmentAction({ card, categories, onChanged, defaultMode, triggerLabel }: { card: Card; categories: Category[]; onChanged: () => Promise<void>; defaultMode?: Mode; triggerLabel?: string }) {
   const months = useMemo(() => referenceMonthOptions(), []);
   const [open, setOpen] = useState(false);
+  const [opening, setOpening] = useState<OpeningContext | null>(null);
+  const [loadingContext, setLoadingContext] = useState(false);
+  const [mode, setMode] = useState<Mode | "">(defaultMode ?? "");
   const [step, setStep] = useState<"form" | "review" | "success">("form");
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(months[0]?.value ?? ""));
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [createdCount, setCreatedCount] = useState(0);
+  const [successSummary, setSuccessSummary] = useState<{ mode: Mode; residual: number; total: number } | null>(null);
   const submittingRef = useRef(false);
   const attempt = attempts.forCard(card.id);
   const expenseCategories = categories.filter((item) => item.isActive && (item.type === "expense" || item.type === "both"));
   const subcategories = expenseCategories.find((item) => item.id === draft.categoryId)?.subcategories.filter((item) => item.isActive !== false) ?? [];
-  const parsed = buildExistingInstallmentPayload({ cardId: card.id, ...draft });
+  const parsed = buildExistingInstallmentPayload({ cardId: card.id, ...draft, mode, expectedOpeningResidualCents: opening?.openingResidualCents });
+
+  useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController(); let active = true;
+    loadContext(card.id, controller.signal).then((value) => {
+      if (!active) return;
+      setOpening(value);
+      const selectedMode = defaultMode === "included" && value.openingResidualCents > 0 ? "included" : defaultMode ?? "";
+      setMode(selectedMode);
+      setDraft((current) => ({ ...current, firstReferenceMonth: selectedMode === "included" ? value.initialReferenceMonth : current.firstReferenceMonth || months[0]?.value || "" }));
+    }).catch((caught) => { if (active && caught?.name !== "AbortError") setError(caught instanceof Error ? caught.message : "Não foi possível carregar o saldo inicial."); })
+      .finally(() => { if (active) setLoadingContext(false); });
+    return () => { active = false; controller.abort(); };
+  }, [card.id, defaultMode, months, open]);
 
   const update = (changes: Partial<Draft>) => setDraft((current) => ({ ...current, ...changes }));
   const reset = () => {
-    setStep("form"); setDraft(emptyDraft(months[0]?.value ?? "")); setError(""); setSubmitting(false); setCreatedCount(0); submittingRef.current = false; attempt.clearPrepared();
+    setStep("form"); setDraft(emptyDraft(months[0]?.value ?? "")); setMode(defaultMode ?? ""); setOpening(null); setLoadingContext(false); setError(""); setSubmitting(false); setCreatedCount(0); setSuccessSummary(null); submittingRef.current = false; attempt.clearPrepared();
   };
   const close = () => { setOpen(false); reset(); };
   const review = () => {
@@ -59,7 +86,7 @@ export function CardExistingInstallmentAction({ card, categories, onChanged }: {
       const body = await request({ ...parsed.payload, idempotencyKey: prepared.key });
       const result = parseExistingInstallmentSuccessResponse(body, card.id);
       if (!result) throw Object.assign(new Error("Resposta financeira inválida."), { status: 502 });
-      attempt.resolve(); setCreatedCount(result.importedInstallmentCount); setStep("success");
+      attempt.resolve(); setCreatedCount(result.importedInstallmentCount); setSuccessSummary({ mode: result.mode, residual: result.openingResidualCents, total: result.invoiceTotalCents }); setStep("success");
       try { await onChanged(); } catch { setError("O parcelamento foi criado, mas a tela não pôde ser atualizada. Recarregue a página."); }
     } catch (caught) {
       const status = typeof caught === "object" && caught && "status" in caught ? Number(caught.status) : 500;
@@ -70,17 +97,18 @@ export function CardExistingInstallmentAction({ card, categories, onChanged }: {
   };
 
   return <>
-    <Button type="button" variant="outline" onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Adicionar parcelamento existente</Button>
-    <Dialog open={open} onOpenChange={(value) => { if (!value && !submitting) close(); else if (value) setOpen(true); }}>
+    <Button type="button" variant="outline" onClick={() => { setLoadingContext(true); setOpen(true); }}><Plus className="h-4 w-4" /> {triggerLabel ?? "Adicionar parcelamento existente"}</Button>
+    <Dialog open={open} onOpenChange={(value) => { if (!value && !submitting) close(); else if (value) { setLoadingContext(true); setOpen(true); } }}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl" aria-describedby="existing-installment-description">
         <DialogHeader><DialogTitle>Adicionar parcelamento existente · {card.name}</DialogTitle><DialogDescription id="existing-installment-description">Cadastre somente as parcelas que ainda precisam ser acompanhadas.</DialogDescription></DialogHeader>
 
         {step === "form" && <div className="grid gap-4 sm:grid-cols-2">
+          <fieldset className="grid gap-2 sm:col-span-2" disabled={loadingContext}><legend className="font-semibold">Como este parcelamento entra na primeira fatura?</legend><label className="flex items-start gap-3 rounded-xl border p-3"><input className="mt-1" type="radio" name="existing-mode" checked={mode === "included"} disabled={!opening || opening.openingResidualCents === 0} onChange={() => { setMode("included"); if (opening) update({ firstReferenceMonth: opening.initialReferenceMonth }); }} /><span><strong className="block">Já está incluído na fatura inicial</strong><span className="text-sm text-[#52645f]">O total dessa fatura não muda. Vamos identificar parte do saldo inicial.</span></span></label><label className="flex items-start gap-3 rounded-xl border p-3"><input className="mt-1" type="radio" name="existing-mode" checked={mode === "additional"} onChange={() => { setMode("additional"); update({ firstReferenceMonth: months[0]?.value ?? "" }); }} /><span><strong className="block">É um novo valor</strong><span className="text-sm text-[#52645f]">Este valor ainda não fazia parte da fatura e será acrescentado.</span></span></label>{opening && opening.openingResidualCents > 0 && <p className="text-sm text-[#52645f]">Saldo inicial ainda não identificado: <strong>{money(opening.openingResidualCents)}</strong></p>}</fieldset>
           <TextField id="existing-description" label="Descrição" value={draft.description} onChange={(value) => update({ description: value })} />
           <TextField id="existing-installment-amount" label="Valor da parcela (R$)" value={draft.installmentAmount} onChange={(value) => update({ installmentAmount: value })} inputMode="decimal" />
           <TextField id="existing-total-count" label="Quantidade original de parcelas" value={draft.originalInstallmentCount} onChange={(value) => update({ originalInstallmentCount: value })} type="number" min="1" max="120" />
           <TextField id="existing-first-number" label="Primeira parcela ainda acompanhada" value={draft.firstOriginalInstallmentNumber} onChange={(value) => update({ firstOriginalInstallmentNumber: value })} type="number" min="1" max="120" />
-          <div className="grid gap-2"><Label htmlFor="existing-reference-month">Competência da primeira parcela</Label><select id="existing-reference-month" className="min-h-11 rounded-md border px-3 capitalize" value={draft.firstReferenceMonth} onChange={(event) => update({ firstReferenceMonth: event.target.value })}>{months.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></div>
+          <div className="grid gap-2"><Label htmlFor="existing-reference-month">Competência da primeira parcela</Label>{mode === "included" && opening ? <Input id="existing-reference-month" value={opening.initialReferenceMonth.split("-").reverse().join("/")} readOnly /> : <select id="existing-reference-month" className="min-h-11 rounded-md border px-3 capitalize" value={draft.firstReferenceMonth} onChange={(event) => update({ firstReferenceMonth: event.target.value })}>{months.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select>}</div>
           <TextField id="existing-original-total" label="Total original (R$) · opcional" value={draft.originalTotal} onChange={(value) => update({ originalTotal: value })} inputMode="decimal" />
           <TextField id="existing-original-date" label="Data original · opcional" value={draft.originalPurchaseDate} onChange={(value) => update({ originalPurchaseDate: value })} type="date" />
           <div className="grid gap-2"><Label htmlFor="existing-category">Categoria · opcional</Label><select id="existing-category" className="min-h-11 rounded-md border px-3" value={draft.categoryId} onChange={(event) => update({ categoryId: event.target.value, subcategoryId: "" })}><option value="">Sem categoria</option>{expenseCategories.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
@@ -92,11 +120,13 @@ export function CardExistingInstallmentAction({ card, categories, onChanged }: {
 
         {step === "review" && parsed.valid && parsed.payload && parsed.preview && <div className="grid gap-5">
           <div className="rounded-xl border bg-[#f7faf9] p-4"><p className="font-semibold">{parsed.payload.description}</p><p className="mt-1 text-sm">Parcela {parsed.payload.firstOriginalInstallmentNumber}/{parsed.payload.originalInstallmentCount} · {money(Number(parsed.payload.installmentAmountCents))}</p><p className="mt-1 text-sm">Serão criadas {parsed.preview.remainingInstallmentCount} parcelas, totalizando {money(parsed.preview.remainingTotalCents)}.</p>{nextOriginalInstallments(parsed.payload.firstOriginalInstallmentNumber, parsed.payload.originalInstallmentCount).length > 0 && <p className="mt-1 text-xs text-[#71837e]">Próximas: {nextOriginalInstallments(parsed.payload.firstOriginalInstallmentNumber, parsed.payload.originalInstallmentCount).map((value) => `${value}/${parsed.payload.originalInstallmentCount}`).join(", ")}</p>}</div>
+          {opening && parsed.payload.mode === "included" && <div className="grid gap-2 rounded-xl border p-4"><p className="font-semibold">O total da primeira fatura não muda.</p><SummaryLine label="Total da primeira fatura" before={opening.invoiceTotalCents} after={opening.invoiceTotalCents} /><SummaryLine label="Lançamentos identificados" before={opening.identifiedInstallmentsCents} after={opening.identifiedInstallmentsCents + Number(parsed.payload.installmentAmountCents)} /><SummaryLine label="Saldo inicial ainda não identificado" before={opening.openingResidualCents} after={opening.openingResidualCents - Number(parsed.payload.installmentAmountCents)} /></div>}
+          {parsed.payload.mode === "additional" && <p className="rounded-xl border p-4 text-sm">Este é um novo valor. A primeira parcela de {money(Number(parsed.payload.installmentAmountCents))} será acrescentada à fatura selecionada.</p>}
           <p className="text-sm text-[#52645f]">A primeira parcela entrará em {parsed.payload.firstReferenceMonth.split("-").reverse().join("/")}. Faturas existentes serão reutilizadas; as demais serão criadas somente quando necessárias.</p>
           <DialogFooter><Button variant="outline" disabled={submitting} onClick={() => setStep("form")}>Alterar</Button><Button disabled={submitting} onClick={confirm}>{submitting ? "Adicionando…" : "Confirmar parcelamento"}</Button></DialogFooter>
         </div>}
 
-        {step === "success" && <div className="grid gap-5"><div className="rounded-xl border border-emerald-300 bg-emerald-50 p-4" role="status"><p className="font-semibold text-emerald-900">Parcelamento existente adicionado.</p><p className="mt-1 text-sm text-emerald-800">{createdCount} parcelas remanescentes foram registradas.</p></div><DialogFooter><Button onClick={close}>Concluir</Button></DialogFooter></div>}
+        {step === "success" && <div className="grid gap-5"><div className="rounded-xl border border-emerald-300 bg-emerald-50 p-4" role="status"><p className="font-semibold text-emerald-900">Parcelamento existente adicionado.</p><p className="mt-1 text-sm text-emerald-800">{createdCount} parcelas remanescentes foram registradas.</p>{successSummary?.mode === "included" && <p className="mt-1 text-sm text-emerald-800">O total da primeira fatura permaneceu em {money(successSummary.total)}. Restam {money(successSummary.residual)} sem identificação.</p>}</div><DialogFooter><Button onClick={close}>Concluir</Button></DialogFooter></div>}
         {error && <p className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800" role="alert">{error}</p>}
       </DialogContent>
     </Dialog>
@@ -105,4 +135,8 @@ export function CardExistingInstallmentAction({ card, categories, onChanged }: {
 
 function TextField({ id, label, value, onChange, ...props }: { id: string; label: string; value: string; onChange: (value: string) => void; type?: string; inputMode?: "decimal" | "numeric"; min?: string; max?: string }) {
   return <div className="grid gap-2"><Label htmlFor={id}>{label}</Label><Input id={id} value={value} onChange={(event) => onChange(event.target.value)} {...props} /></div>;
+}
+
+function SummaryLine({ label, before, after }: { label: string; before: number; after: number }) {
+  return <div className="grid grid-cols-[1fr_auto_auto] gap-3 text-sm"><span>{label}</span><span className="text-[#71837e]">{money(before)}</span><strong>→ {money(after)}</strong></div>;
 }

@@ -32,10 +32,17 @@ export type InvoiceDetailPage = {
 export type InvoiceDetailAdjustment = {
   adjustmentId: string;
   itemType: "opening_balance";
-  description: "Saldo anterior à implantação";
+  description: "Saldo inicial ainda não identificado";
   amountCents: number;
   status: "active";
   includedInTotal: true;
+};
+
+export type InvoiceOpeningBalanceBreakdown = {
+  originalCents: number;
+  allocatedCents: number;
+  residualCents: number;
+  identifiedCents: number;
 };
 
 export type InvoiceDetailResponse = {
@@ -52,6 +59,7 @@ export type InvoiceDetailResponse = {
     cycleStatus: "open" | "closed" | "unknown";
     paymentStatus: "unpaid" | "partial" | "settled";
   };
+  openingBalance: InvoiceOpeningBalanceBreakdown | null;
   adjustments: InvoiceDetailAdjustment[];
   active: InvoiceDetailPage;
   cancelled: InvoiceDetailPage;

@@ -18,14 +18,22 @@ export type ConfigureCardCurrentStateInput = {
   cardId: string;
   initialReferenceMonth: string;
   declaredCurrentInvoiceTotalCents: number;
+  expectedCardUpdatedAt: string;
+  expectedClosesOn: string;
+  expectedDueOn: string;
+  closedCycleConfirmed: boolean;
   idempotencyKey: string;
   operationId?: string;
   commitments?: ImportedCardCommitmentInput[];
 };
 
+export type ExistingInstallmentMode = "included" | "additional";
+
 export type AddExistingCardInstallmentInput = {
   cardId: string;
   firstReferenceMonth: string;
+  mode: ExistingInstallmentMode;
+  expectedOpeningResidualCents: number;
   idempotencyKey: string;
   operationId?: string;
   commitment: Omit<ImportedCardCommitmentInput, "firstReferenceMonth">;
@@ -79,6 +87,8 @@ export class CardOnboardingError extends Error {
 const uid = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 const at = (context: InvoiceContext) => context.timestamp ?? new Date().toISOString();
 const MAX_MONEY_CENTS = 100_000_000_000;
+export const CARD_ONBOARDING_PAST_MONTH_LIMIT = 24;
+export const CARD_ONBOARDING_FUTURE_MONTH_LIMIT = 12;
 
 function assertIdentifier(value: string) {
   if (typeof value !== "string" || value.length > 200 || !value.replace(/[\p{White_Space}\p{Cc}\p{Cf}]/gu, "")) {
@@ -110,6 +120,30 @@ function assertMoney(value: number, { zero = false }: { zero?: boolean } = {}) {
 
 function dueDate(referenceMonth: string, dueDay: number) {
   return `${referenceMonth}-${String(Math.min(dueDay, daysInMonth(referenceMonth))).padStart(2, "0")}`;
+}
+
+function onboardingMonthBounds(today: string) {
+  const current = today.slice(0, 7);
+  return {
+    current,
+    minimum: addMonths(current, -CARD_ONBOARDING_PAST_MONTH_LIMIT),
+    maximum: addMonths(current, CARD_ONBOARDING_FUTURE_MONTH_LIMIT),
+  };
+}
+
+function assertOnboardingReferenceMonth(referenceMonth: string, today: string) {
+  const bounds = onboardingMonthBounds(today);
+  if (referenceMonth < bounds.minimum || referenceMonth > bounds.maximum) {
+    throw new CardOnboardingError(`A competência deve estar entre ${bounds.minimum} e ${bounds.maximum}.`, 400, "CARD_ONBOARDING_REFERENCE_RANGE");
+  }
+  return bounds;
+}
+
+function cyclePreview(referenceMonth: string, card: CardSnapshot, today: string) {
+  const closesOn = invoiceClosesOn(referenceMonth, card.closing_day, card.due_day);
+  const dueOn = dueDate(referenceMonth, card.due_day);
+  const state = today > closesOn ? "closed" as const : referenceMonth > today.slice(0, 7) ? "future" as const : "open" as const;
+  return { referenceMonth, closesOn, dueOn, state, requiresClosedCycleConfirmation: state === "closed" };
 }
 
 async function sha256(value: unknown) {
@@ -242,10 +276,12 @@ function appendImportedCommitmentStatements(input: {
   timestamp: string;
   today: string;
   requireOpenCycle: boolean;
+  allowClosedReferenceMonth?: string | null;
   invoiceCoordinates?: ReadonlyMap<string, { dueDate: string; closesOn: string }>;
 }) {
-  const { d1, statements, commitment, batchId, importKind, card, context, timestamp, today, requireOpenCycle, invoiceCoordinates } = input;
+  const { d1, statements, commitment, batchId, importKind, card, context, timestamp, today, requireOpenCycle, allowClosedReferenceMonth = null, invoiceCoordinates } = input;
   const purchaseId = uid("purchase");
+  let firstInstallmentId = "";
   statements.push(d1.prepare(`INSERT INTO card_purchases
       (id, household_id, card_id, description, total_cents, purchase_date, installment_count,
        category_id, subcategory_id, notes, status, created_by_user_id, origin, created_at, updated_at)
@@ -271,6 +307,8 @@ function appendImportedCommitmentStatements(input: {
     const coordinates = invoiceCoordinates?.get(referenceMonth);
     const installmentDueDate = coordinates?.dueDate ?? dueDate(referenceMonth, card.due_day);
     const closesOn = coordinates?.closesOn ?? invoiceClosesOn(referenceMonth, card.closing_day, card.due_day);
+    const installmentId = uid("installment");
+    if (index === 0) firstInstallmentId = installmentId;
     statements.push(d1.prepare(`INSERT INTO card_installments
         (id, household_id, purchase_id, invoice_id, installment_number, installment_count,
          amount_cents, status, created_at, updated_at)
@@ -281,13 +319,13 @@ function appendImportedCommitmentStatements(input: {
         AND i.reference_month = ? AND i.due_date = ? AND i.closes_on = ?
       INNER JOIN credit_cards c ON c.household_id = b.household_id AND c.id = b.card_id
       WHERE b.id = ? AND b.household_id = ? AND b.status = 'pending' AND b.import_kind = ?
-        AND (? = 0 OR (i.status <> 'closed' AND i.closes_on >= ?))
+        AND (? = 0 OR i.reference_month = ? OR (i.status <> 'closed' AND i.closes_on >= ?))
         AND c.is_active = 1 AND c.closing_day = ? AND c.due_day = ? AND c.updated_at = ?
         AND EXISTS (SELECT 1 FROM household_members m
           WHERE m.household_id = b.household_id AND m.user_id = b.created_by_user_id AND m.status = 'active')`)
-      .bind(uid("installment"), index + 1, commitment.remainingInstallmentCount, commitment.installmentAmountCents,
+      .bind(installmentId, index + 1, commitment.remainingInstallmentCount, commitment.installmentAmountCents,
         timestamp, timestamp, purchaseId, referenceMonth, installmentDueDate, closesOn,
-        batchId, context.householdId, importKind, requireOpenCycle ? 1 : 0, today,
+        batchId, context.householdId, importKind, requireOpenCycle ? 1 : 0, allowClosedReferenceMonth, today,
         card.closing_day, card.due_day, card.updated_at));
   }
 
@@ -301,6 +339,7 @@ function appendImportedCommitmentStatements(input: {
     .bind(uid("purchase_import_metadata"), commitment.firstOriginalInstallmentNumber,
       commitment.originalInstallmentCount, commitment.originalTotalCents, commitment.originalPurchaseDate,
       timestamp, purchaseId, batchId, context.householdId, importKind));
+  return { purchaseId, firstInstallmentId };
 }
 
 async function cardSnapshot(cardId: string, context: InvoiceContext) {
@@ -335,18 +374,137 @@ export async function getCardOnboardingEligibility(cardId: string, context: Invo
   return { eligible: true as const };
 }
 
+export async function getCardOnboardingPreview(cardId: string, selectedReferenceMonth: string | null, context: InvoiceContext) {
+  assertIdentifier(cardId);
+  if (selectedReferenceMonth !== null) assertReferenceMonth(selectedReferenceMonth);
+  await authorize(context);
+  const card = await cardSnapshot(cardId, context);
+  if (!card) return { eligible: false as const, reason: "not_found" as const };
+  if (!card.is_active) return { eligible: false as const, reason: "inactive" as const };
+  if (card.has_activity) return { eligible: false as const, reason: "existing_activity" as const };
+  const today = invoiceCivilDate(at(context));
+  const bounds = onboardingMonthBounds(today);
+  if (selectedReferenceMonth !== null) assertOnboardingReferenceMonth(selectedReferenceMonth, today);
+  let suggestedReferenceMonth = bounds.current;
+  while (cyclePreview(suggestedReferenceMonth, card, today).state === "closed" && suggestedReferenceMonth < bounds.maximum) {
+    suggestedReferenceMonth = addMonths(suggestedReferenceMonth, 1);
+  }
+  const referenceMonths = [...new Set([
+    bounds.current,
+    addMonths(bounds.current, 1),
+    suggestedReferenceMonth,
+    ...(selectedReferenceMonth === null ? [] : [selectedReferenceMonth]),
+  ])].sort();
+  return {
+    eligible: true as const,
+    cardUpdatedAt: card.updated_at,
+    today,
+    minimumReferenceMonth: bounds.minimum,
+    maximumReferenceMonth: bounds.maximum,
+    suggestedReferenceMonth,
+    cycles: referenceMonths.map((referenceMonth) => cyclePreview(referenceMonth, card, today)),
+  };
+}
+
+type OpeningBalanceContextRow = {
+  initial_batch_id: string;
+  initial_reference_month: string;
+  opening_balance_cents: number;
+  invoice_id: string;
+  due_date: string;
+  closes_on: string | null;
+  invoice_status: string;
+  adjustment_id: string | null;
+  adjustment_amount_cents: number | null;
+  allocated_cents: number;
+  invoice_total_cents: number;
+};
+
+async function openingBalanceContext(cardId: string, context: InvoiceContext) {
+  const row = await context.d1.prepare(`SELECT b.id AS initial_batch_id,
+      b.initial_reference_month, b.opening_balance_cents, i.id AS invoice_id,
+      i.due_date, i.closes_on, i.status AS invoice_status,
+      a.id AS adjustment_id, a.amount_cents AS adjustment_amount_cents,
+      COALESCE((SELECT SUM(o.amount_cents) FROM card_opening_balance_allocations o
+        WHERE o.household_id = b.household_id AND o.opening_adjustment_id = a.id), 0) AS allocated_cents,
+      COALESCE((SELECT SUM(s.amount_cents) FROM card_installments s
+        WHERE s.household_id = i.household_id AND s.invoice_id = i.id AND s.status <> 'cancelled'), 0)
+      + COALESCE(a.amount_cents, 0)
+      - COALESCE((SELECT SUM(o.amount_cents) FROM card_opening_balance_allocations o
+        WHERE o.household_id = i.household_id AND o.invoice_id = i.id), 0) AS invoice_total_cents
+    FROM card_import_batches b
+    INNER JOIN card_invoices i ON i.household_id = b.household_id AND i.card_id = b.card_id
+      AND i.reference_month = b.initial_reference_month
+    LEFT JOIN card_invoice_adjustments a ON a.household_id = b.household_id AND a.invoice_id = i.id
+      AND a.import_batch_id = b.id AND a.kind = 'opening_balance' AND a.status = 'active'
+    WHERE b.household_id = ? AND b.card_id = ? AND b.import_kind = 'initial_state' AND b.status = 'completed'
+    LIMIT 1`).bind(context.householdId, cardId).first<OpeningBalanceContextRow>();
+  if (!row) return null;
+  const values = [row.opening_balance_cents, row.allocated_cents, row.invoice_total_cents];
+  if (!values.every((value) => Number.isSafeInteger(value) && value >= 0)
+    || row.allocated_cents > row.opening_balance_cents
+    || (row.opening_balance_cents === 0 && (row.adjustment_id !== null || row.adjustment_amount_cents !== null))
+    || (row.opening_balance_cents > 0 && (row.adjustment_id === null || row.adjustment_amount_cents !== row.opening_balance_cents))) {
+    throw new CardOnboardingError("O saldo inicial do cartão está inconsistente.", 409, "CARD_IMPORT_OPENING_INCONSISTENT");
+  }
+  const openingResidualCents = row.opening_balance_cents - row.allocated_cents;
+  return {
+    initialBatchId: row.initial_batch_id,
+    initialReferenceMonth: row.initial_reference_month,
+    invoiceId: row.invoice_id,
+    dueOn: row.due_date,
+    closesOn: row.closes_on,
+    invoiceStatus: row.invoice_status,
+    openingAdjustmentId: row.adjustment_id,
+    openingOriginalCents: row.opening_balance_cents,
+    allocatedCents: row.allocated_cents,
+    openingResidualCents,
+    invoiceTotalCents: row.invoice_total_cents,
+    identifiedInstallmentsCents: row.allocated_cents,
+  };
+}
+
+export async function getExistingCardInstallmentContext(cardId: string, context: InvoiceContext) {
+  assertIdentifier(cardId);
+  await authorize(context);
+  const card = await cardSnapshot(cardId, context);
+  if (!card || !card.is_active) throw new CardOnboardingError("Cartão inválido.", 404, "CARD_IMPORT_CARD_NOT_FOUND");
+  const opening = await openingBalanceContext(cardId, context);
+  if (!opening) throw new CardOnboardingError("Conclua a configuração inicial antes de adicionar outro parcelamento.", 409, "CARD_IMPORT_INITIAL_REQUIRED");
+  return { cardId, ...opening };
+}
+
+async function existingInstallmentResultFromReceipt(receipt: BatchReceipt, context: InvoiceContext, replayed: boolean) {
+  const base = await resultFromReceipt(receipt, context, replayed);
+  const allocation = await context.d1.prepare(`SELECT amount_cents FROM card_opening_balance_allocations
+    WHERE household_id = ? AND source_import_batch_id = ? LIMIT 1`)
+    .bind(context.householdId, receipt.id).first<{ amount_cents: number }>();
+  const opening = await openingBalanceContext(receipt.card_id, context);
+  if (!opening) throw new CardOnboardingError("A importação está inconsistente.", 409, "CARD_IMPORT_OPENING_INCONSISTENT");
+  return {
+    ...base,
+    mode: allocation ? "included" as const : "additional" as const,
+    allocatedAmountCents: allocation?.amount_cents ?? 0,
+    openingOriginalCents: opening.openingOriginalCents,
+    openingAllocatedCents: opening.allocatedCents,
+    openingResidualCents: opening.openingResidualCents,
+    invoiceTotalCents: opening.invoiceTotalCents,
+  };
+}
+
 export async function configureCardCurrentState(input: ConfigureCardCurrentStateInput, context: InvoiceContext) {
   assertIdentifier(input.cardId);
   assertIdentifier(input.idempotencyKey);
   if (input.operationId !== undefined) assertIdentifier(input.operationId);
   assertReferenceMonth(input.initialReferenceMonth);
+  assertIdentifier(input.expectedCardUpdatedAt);
+  if (!isCivilDate(input.expectedClosesOn) || !isCivilDate(input.expectedDueOn) || typeof input.closedCycleConfirmed !== "boolean") {
+    throw new CardOnboardingError("A confirmação do ciclo da fatura é inválida.", 400, "CARD_ONBOARDING_PREVIEW_INVALID");
+  }
   assertMoney(input.declaredCurrentInvoiceTotalCents, { zero: true });
   const timestamp = at(context);
   const today = invoiceCivilDate(timestamp);
-  const currentMonth = today.slice(0, 7);
-  if (input.initialReferenceMonth < currentMonth || input.initialReferenceMonth > addMonths(currentMonth, 1)) {
-    throw new CardOnboardingError("A competência inicial deve ser a atual ou a próxima.");
-  }
+  assertOnboardingReferenceMonth(input.initialReferenceMonth, today);
   await authorize(context);
   const normalized = normalizeCommitments(input, today);
   await validateClassifications(normalized.commitments, context);
@@ -355,6 +513,10 @@ export async function configureCardCurrentState(input: ConfigureCardCurrentState
     cardId: input.cardId,
     initialReferenceMonth: input.initialReferenceMonth,
     declaredCurrentInvoiceTotalCents: input.declaredCurrentInvoiceTotalCents,
+    expectedCardUpdatedAt: input.expectedCardUpdatedAt,
+    expectedClosesOn: input.expectedClosesOn,
+    expectedDueOn: input.expectedDueOn,
+    closedCycleConfirmed: input.closedCycleConfirmed,
     operationId: input.operationId ?? null,
     commitments: normalized.commitments.map((commitment) => ({
       description: commitment.description,
@@ -379,6 +541,15 @@ export async function configureCardCurrentState(input: ConfigureCardCurrentState
   if (!card || !card.is_active) throw new CardOnboardingError("Cartão inválido.", 404, "CARD_ONBOARDING_CARD_NOT_FOUND");
   if (card.has_activity) {
     throw new CardOnboardingError("Este cartão já possui atividade financeira e não pode receber uma importação inicial.", 409, "CARD_ONBOARDING_INELIGIBLE");
+  }
+  const authoritativeCycle = cyclePreview(input.initialReferenceMonth, card, today);
+  if (card.updated_at !== input.expectedCardUpdatedAt
+    || authoritativeCycle.closesOn !== input.expectedClosesOn
+    || authoritativeCycle.dueOn !== input.expectedDueOn) {
+    throw new CardOnboardingError("Os dados do cartão ou do ciclo mudaram. Atualize a prévia e confirme novamente.", 409, "CARD_ONBOARDING_PREVIEW_STALE");
+  }
+  if (authoritativeCycle.requiresClosedCycleConfirmation && !input.closedCycleConfirmed) {
+    throw new CardOnboardingError("Confirme explicitamente que deseja iniciar por uma fatura cujo ciclo já fechou.", 409, "CARD_ONBOARDING_CLOSED_CONFIRMATION_REQUIRED");
   }
 
   const importedCurrentCents = normalized.commitments.reduce((sum, commitment) => (
@@ -544,7 +715,9 @@ async function invoiceAdmission(referenceMonth: string, card: CardSnapshot, toda
       COALESCE((SELECT SUM(s.amount_cents) FROM card_installments s
         WHERE s.household_id = i.household_id AND s.invoice_id = i.id AND s.status <> 'cancelled'), 0)
       + COALESCE((SELECT SUM(a.amount_cents) FROM card_invoice_adjustments a
-        WHERE a.household_id = i.household_id AND a.invoice_id = i.id AND a.status = 'active'), 0) AS total_cents
+        WHERE a.household_id = i.household_id AND a.invoice_id = i.id AND a.status = 'active'), 0)
+      - COALESCE((SELECT SUM(o.amount_cents) FROM card_opening_balance_allocations o
+        WHERE o.household_id = i.household_id AND o.invoice_id = i.id), 0) AS total_cents
     FROM card_invoices i
     WHERE i.household_id = ? AND i.card_id = ? AND i.reference_month = ? LIMIT 1`)
     .bind(context.householdId, card.id, referenceMonth)
@@ -581,10 +754,12 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
   assertIdentifier(input.idempotencyKey);
   if (input.operationId !== undefined) assertIdentifier(input.operationId);
   assertReferenceMonth(input.firstReferenceMonth);
+  if (input.mode !== "included" && input.mode !== "additional") throw new CardOnboardingError("Escolha como o parcelamento entra na primeira fatura.", 400, "CARD_IMPORT_MODE");
+  assertMoney(input.expectedOpeningResidualCents, { zero: true });
   const timestamp = at(context);
   const today = invoiceCivilDate(timestamp);
   const currentMonth = today.slice(0, 7);
-  if (input.firstReferenceMonth < currentMonth || input.firstReferenceMonth > addMonths(currentMonth, 1)) {
+  if (input.mode === "additional" && (input.firstReferenceMonth < currentMonth || input.firstReferenceMonth > addMonths(currentMonth, 1))) {
     throw new CardOnboardingError("A primeira parcela deve entrar na fatura atual ou na próxima.", 400, "CARD_IMPORT_REFERENCE_MONTH");
   }
   await authorize(context);
@@ -592,6 +767,10 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
     cardId: input.cardId,
     initialReferenceMonth: input.firstReferenceMonth,
     declaredCurrentInvoiceTotalCents: 0,
+    expectedCardUpdatedAt: "normalization-only",
+    expectedClosesOn: `${input.firstReferenceMonth}-01`,
+    expectedDueOn: `${input.firstReferenceMonth}-01`,
+    closedCycleConfirmed: false,
     idempotencyKey: input.idempotencyKey,
     operationId: input.operationId,
     commitments: [{ ...input.commitment, firstReferenceMonth: input.firstReferenceMonth }],
@@ -602,6 +781,8 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
     importKind: "existing_installments",
     cardId: input.cardId,
     firstReferenceMonth: input.firstReferenceMonth,
+    mode: input.mode,
+    expectedOpeningResidualCents: input.expectedOpeningResidualCents,
     operationId: input.operationId ?? null,
     commitment: {
       description: commitment.description,
@@ -618,24 +799,47 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
   const existing = await findReceipt(input.idempotencyKey, context);
   if (existing) {
     assertReceipt(existing, fingerprint, "existing_installments");
-    return resultFromReceipt(existing, context, true);
+    return existingInstallmentResultFromReceipt(existing, context, true);
   }
 
   const card = await cardSnapshot(input.cardId, context);
   if (!card || !card.is_active) throw new CardOnboardingError("Cartão inválido.", 404, "CARD_IMPORT_CARD_NOT_FOUND");
-  const initialBatch = await context.d1.prepare(`SELECT 1 FROM card_import_batches
-    WHERE household_id = ? AND card_id = ? AND import_kind = 'initial_state' AND status = 'completed' LIMIT 1`)
-    .bind(context.householdId, card.id).first();
-  if (!initialBatch) throw new CardOnboardingError("Conclua a configuração inicial antes de adicionar outro parcelamento.", 409, "CARD_IMPORT_INITIAL_REQUIRED");
+  const opening = await openingBalanceContext(card.id, context);
+  if (!opening) throw new CardOnboardingError("Conclua a configuração inicial antes de adicionar outro parcelamento.", 409, "CARD_IMPORT_INITIAL_REQUIRED");
+  if (opening.openingResidualCents !== input.expectedOpeningResidualCents) {
+    throw new CardOnboardingError("O saldo inicial mudou. Atualize a prévia e tente novamente.", 409, "CARD_IMPORT_RESIDUAL_STALE");
+  }
+  if (input.mode === "included") {
+    if (input.firstReferenceMonth !== opening.initialReferenceMonth) {
+      throw new CardOnboardingError("Um parcelamento já incluído deve começar na fatura inicial.", 409, "CARD_IMPORT_INITIAL_REFERENCE_REQUIRED");
+    }
+    if (!opening.openingAdjustmentId || opening.openingResidualCents === 0) {
+      throw new CardOnboardingError("Não existe saldo inicial pendente de identificação.", 409, "CARD_IMPORT_NO_OPENING_RESIDUAL");
+    }
+    if (commitment.installmentAmountCents > opening.openingResidualCents) {
+      throw new CardOnboardingError("O valor da parcela supera o saldo inicial ainda não identificado.", 409, "CARD_IMPORT_ALLOCATION_EXCEEDS_RESIDUAL");
+    }
+    if (!opening.closesOn) throw new CardOnboardingError("A fatura inicial não possui ciclo confiável.", 409, "CARD_IMPORT_OPENING_INCONSISTENT");
+  }
 
   const admissions = new Map<string, InvoiceAdmission>();
   for (let index = 0; index < commitment.remainingInstallmentCount; index += 1) {
     const referenceMonth = addMonths(commitment.firstReferenceMonth, index);
-    admissions.set(referenceMonth, await invoiceAdmission(referenceMonth, card, today, context));
+    if (input.mode === "included" && index === 0) {
+      admissions.set(referenceMonth, {
+        id: opening.invoiceId,
+        dueDate: opening.dueOn,
+        closesOn: opening.closesOn!,
+        totalCents: opening.invoiceTotalCents,
+        legacySnapshot: false,
+      });
+    } else admissions.set(referenceMonth, await invoiceAdmission(referenceMonth, card, today, context));
   }
   const firstAdmission = admissions.get(input.firstReferenceMonth)!;
-  const declaredInvoiceTotalCents = firstAdmission.totalCents + commitment.installmentAmountCents;
-  assertMoney(declaredInvoiceTotalCents);
+  const declaredInvoiceTotalCents = input.mode === "included"
+    ? firstAdmission.totalCents
+    : firstAdmission.totalCents + commitment.installmentAmountCents;
+  assertMoney(declaredInvoiceTotalCents, { zero: true });
 
   const batchId = input.operationId ?? uid("card_import");
   const d1 = context.d1;
@@ -687,10 +891,39 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
         batchId, context.householdId, card.closing_day, card.due_day, card.updated_at));
   }
 
-  appendImportedCommitmentStatements({
+  const imported = appendImportedCommitmentStatements({
     d1, statements, commitment, batchId, importKind: "existing_installments", card, context, timestamp, today,
-    requireOpenCycle: true, invoiceCoordinates: admissions,
+    requireOpenCycle: true,
+    allowClosedReferenceMonth: input.mode === "included" ? opening.initialReferenceMonth : null,
+    invoiceCoordinates: admissions,
   });
+
+  if (input.mode === "included") {
+    statements.push(d1.prepare(`INSERT INTO card_opening_balance_allocations
+        (id, household_id, opening_adjustment_id, initial_import_batch_id, source_import_batch_id,
+         invoice_id, purchase_id, installment_id, amount_cents, created_by_user_id, created_at)
+      SELECT ?, source.household_id, a.id, initial.id, source.id, i.id, p.id, s.id,
+        CASE WHEN ? = a.amount_cents - COALESCE((SELECT SUM(current.amount_cents)
+          FROM card_opening_balance_allocations current
+          WHERE current.household_id = a.household_id AND current.opening_adjustment_id = a.id), 0)
+          THEN s.amount_cents ELSE -1 END,
+        source.created_by_user_id, ?
+      FROM card_import_batches source
+      INNER JOIN card_import_batches initial ON initial.household_id = source.household_id
+        AND initial.id = ? AND initial.import_kind = 'initial_state' AND initial.status = 'completed'
+      INNER JOIN card_invoice_adjustments a ON a.household_id = initial.household_id
+        AND a.import_batch_id = initial.id AND a.kind = 'opening_balance' AND a.status = 'active'
+      INNER JOIN card_invoices i ON i.household_id = initial.household_id AND i.id = ?
+        AND i.card_id = initial.card_id AND i.reference_month = initial.initial_reference_month
+      INNER JOIN card_purchases p ON p.household_id = source.household_id AND p.id = ? AND p.card_id = source.card_id
+      INNER JOIN card_installments s ON s.household_id = source.household_id AND s.id = ?
+        AND s.purchase_id = p.id AND s.invoice_id = i.id AND s.installment_number = 1
+      WHERE source.id = ? AND source.household_id = ? AND source.status = 'pending'
+        AND source.import_kind = 'existing_installments' AND source.card_id = initial.card_id`)
+      .bind(uid("opening_allocation"), input.expectedOpeningResidualCents, timestamp,
+        opening.initialBatchId, opening.invoiceId, imported.purchaseId, imported.firstInstallmentId,
+        batchId, context.householdId));
+  }
 
   statements.push(d1.prepare(`UPDATE card_import_batches
     SET status = CASE WHEN
@@ -703,7 +936,7 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
       AND EXISTS (SELECT 1 FROM card_invoices i
         WHERE i.household_id = card_import_batches.household_id AND i.card_id = card_import_batches.card_id
           AND i.reference_month = card_import_batches.initial_reference_month
-          AND i.due_date = ? AND i.closes_on = ? AND i.status <> 'closed')
+          AND i.due_date = ? AND i.closes_on = ? AND (? = 1 OR i.status <> 'closed'))
       AND (SELECT COUNT(*) FROM card_purchase_import_metadata m
         WHERE m.household_id = card_import_batches.household_id AND m.import_batch_id = card_import_batches.id) = 1
       AND (SELECT COUNT(*) FROM card_installments s
@@ -713,6 +946,8 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
           = card_import_batches.imported_installment_count
       AND NOT EXISTS (SELECT 1 FROM card_invoice_adjustments a
         WHERE a.household_id = card_import_batches.household_id AND a.import_batch_id = card_import_batches.id)
+      AND (SELECT COUNT(*) FROM card_opening_balance_allocations o
+        WHERE o.household_id = card_import_batches.household_id AND o.source_import_batch_id = card_import_batches.id) = ?
       AND EXISTS (SELECT 1 FROM card_invoices i
         WHERE i.household_id = card_import_batches.household_id AND i.card_id = card_import_batches.card_id
           AND i.reference_month = card_import_batches.initial_reference_month
@@ -720,24 +955,31 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
             WHERE s.household_id = i.household_id AND s.invoice_id = i.id AND s.status <> 'cancelled'), 0)
           + COALESCE((SELECT SUM(a.amount_cents) FROM card_invoice_adjustments a
             WHERE a.household_id = i.household_id AND a.invoice_id = i.id AND a.status = 'active'), 0)
+          - COALESCE((SELECT SUM(o.amount_cents) FROM card_opening_balance_allocations o
+            WHERE o.household_id = i.household_id AND o.invoice_id = i.id), 0)
             = card_import_batches.declared_invoice_total_cents)
     THEN 'completed' ELSE NULL END,
     completed_at = ?
     WHERE id = ? AND household_id = ?`).bind(
     context.userId, card.closing_day, card.due_day, card.updated_at,
-    firstAdmission.dueDate, firstAdmission.closesOn, timestamp, batchId, context.householdId,
+    firstAdmission.dueDate, firstAdmission.closesOn, input.mode === "included" ? 1 : 0,
+    input.mode === "included" ? 1 : 0, timestamp, batchId, context.householdId,
   ));
   statements.push(d1.prepare(`INSERT INTO audit_logs
       (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at)
     SELECT 'card_import_audit:' || b.id, b.household_id, b.created_by_user_id,
       'add_existing_installments', 'card_import_batch', b.id, NULL,
       json_object('cardId', b.card_id, 'firstReferenceMonth', b.initial_reference_month,
+        'mode', ?, 'openingResidualBeforeCents', ?,
+        'openingResidualAfterCents', ? - CASE WHEN ? = 'included' THEN ? ELSE 0 END,
         'importedPurchaseCount', b.imported_purchase_count,
         'importedInstallmentCount', b.imported_installment_count), ?
     FROM card_import_batches b
     WHERE b.id = ? AND b.household_id = ? AND b.status = 'completed'
       AND b.import_kind = 'existing_installments'
-    ON CONFLICT(id) DO NOTHING`).bind(timestamp, batchId, context.householdId));
+    ON CONFLICT(id) DO NOTHING`).bind(input.mode, input.expectedOpeningResidualCents,
+      input.expectedOpeningResidualCents, input.mode, commitment.installmentAmountCents,
+      timestamp, batchId, context.householdId));
 
   let results: D1Result<unknown>[];
   try {
@@ -746,13 +988,16 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
     const raced = await findReceipt(input.idempotencyKey, context);
     if (raced) {
       assertReceipt(raced, fingerprint, "existing_installments");
-      return resultFromReceipt(raced, context, true);
+      return existingInstallmentResultFromReceipt(raced, context, true);
     }
     const message = error instanceof Error ? error.message : String(error);
     if (/card_import_batches_pending_card_unique|card import batch financial identity cannot be replaced|UNIQUE constraint failed: card_import_batches\.household_id, card_import_batches\.card_id/iu.test(message)) {
       throw new CardOnboardingError("Outra importação deste cartão está em andamento. Atualize e tente novamente.", 409, "CARD_IMPORT_CONCURRENT");
     }
-    if (/FOREIGN KEY constraint failed|card import|card installment purchase and invoice|NOT NULL constraint failed: card_import_batches\.status/iu.test(message)) {
+    if (/opening balance allocation exceeds residual|card_opening_balance_allocations_installment_unique|UNIQUE constraint failed: card_opening_balance_allocations|card_import_batches_pending_card_unique/iu.test(message)) {
+      throw new CardOnboardingError("O saldo inicial ou outra importação mudou durante a confirmação. Atualize e tente novamente.", 409, "CARD_IMPORT_CONCURRENT");
+    }
+    if (/FOREIGN KEY constraint failed|card import|card installment purchase and invoice|opening balance allocation|NOT NULL constraint failed: card_import_batches\.status/iu.test(message)) {
       throw new CardOnboardingError("Os dados do cartão ou das faturas mudaram durante a importação. Atualize e tente novamente.", 409, "CARD_IMPORT_CONFLICT");
     }
     throw error;
@@ -760,5 +1005,5 @@ export async function addExistingCardInstallment(input: AddExistingCardInstallme
   const completed = await findReceipt(input.idempotencyKey, context);
   if (!completed) throw new CardOnboardingError("A importação não pôde ser concluída.", 409, "CARD_IMPORT_CONFLICT");
   assertReceipt(completed, fingerprint, "existing_installments");
-  return resultFromReceipt(completed, context, (results[0]?.meta.changes ?? 0) === 0);
+  return existingInstallmentResultFromReceipt(completed, context, (results[0]?.meta.changes ?? 0) === 0);
 }

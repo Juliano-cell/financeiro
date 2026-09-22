@@ -4,7 +4,7 @@ import { and, asc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { bills, cardImportBatches, cardInstallments, cardInvoices, cardPurchaseImportMetadata, cardPurchases, creditCards, householdMembers, notificationPreferences, transactions } from "@/db/schema";
+import { bills, cardImportBatches, cardInstallments, cardInvoiceAdjustments, cardInvoices, cardOpeningBalanceAllocations, cardPurchaseImportMetadata, cardPurchases, creditCards, householdMembers, notificationPreferences, transactions } from "@/db/schema";
 import { BillServiceError, cancelBillOccurrence, cancelRecurringBillSeries, createBill, payBill, undoBillPayment, updateBillOccurrence, updateRecurringBillSeries } from "@/lib/bill-service";
 import { addMonths, buildInstallmentPlan, simulatePurchase } from "@/lib/finance-rules.mjs";
 import { createCardPurchase, FinanceValidationError } from "@/lib/finance-service";
@@ -63,13 +63,15 @@ export async function GET(request: Request) {
   const selectedMonth = new URL(request.url).searchParams.get("month") ?? today.slice(0, 7);
   if (!monthSchema.safeParse(selectedMonth).success) return NextResponse.json({ error: "Mês inválido." }, { status: 400 });
   const { db, d1, householdId } = current;
-  const [cardRows, purchaseRows, invoiceRows, installmentRows, importMetadataRows, importBatchRows, billRows, transactionRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
+  const [cardRows, purchaseRows, invoiceRows, installmentRows, importMetadataRows, importBatchRows, adjustmentRows, allocationRows, billRows, transactionRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
     db.select().from(creditCards).where(eq(creditCards.householdId, householdId)).orderBy(asc(creditCards.name)),
     db.select().from(cardPurchases).where(eq(cardPurchases.householdId, householdId)),
     db.select().from(cardInvoices).where(eq(cardInvoices.householdId, householdId)),
     db.select().from(cardInstallments).where(eq(cardInstallments.householdId, householdId)),
     db.select().from(cardPurchaseImportMetadata).where(eq(cardPurchaseImportMetadata.householdId, householdId)),
     db.select().from(cardImportBatches).where(eq(cardImportBatches.householdId, householdId)),
+    db.select().from(cardInvoiceAdjustments).where(eq(cardInvoiceAdjustments.householdId, householdId)),
+    db.select().from(cardOpeningBalanceAllocations).where(eq(cardOpeningBalanceAllocations.householdId, householdId)),
     db.select().from(bills).where(eq(bills.householdId, householdId)).orderBy(asc(bills.dueDate)),
     db.select().from(transactions).where(eq(transactions.householdId, householdId)),
     db.select().from(notificationPreferences).where(eq(notificationPreferences.householdId, householdId)),
@@ -95,12 +97,20 @@ export async function GET(request: Request) {
   const invoices = invoiceRows.map((invoice) => {
     const parts = installments.filter((item) => item.invoiceId === invoice.id && item.status !== "cancelled");
     const state = stateById.get(invoice.id)!;
-    return { ...invoice, ...state, totalCents: state.invoiceTotalCents, installments: parts };
+    const openingAdjustment = adjustmentRows.find((item) => item.invoiceId === invoice.id && item.status === "active");
+    const allocatedCents = openingAdjustment ? allocationRows.filter((item) => item.openingAdjustmentId === openingAdjustment.id).reduce((sum, item) => sum + item.amountCents, 0) : 0;
+    const residualCents = openingAdjustment ? openingAdjustment.amountCents - allocatedCents : 0;
+    const openingBalance = openingAdjustment ? { originalCents: openingAdjustment.amountCents, allocatedCents, residualCents, identifiedCents: allocatedCents } : null;
+    return { ...invoice, ...state, totalCents: state.invoiceTotalCents, installments: parts, openingBalance };
   });
+  if (invoices.some((invoice) => invoice.openingBalance && invoice.openingBalance.residualCents < 0)) {
+    return NextResponse.json({ error: "Não foi possível exibir as faturas porque o saldo inicial está inconsistente." }, { status: 409, headers: privateHeaders });
+  }
   const cards = cardRows.map((card) => {
     const activeParts = installments.filter((item) => item.card?.id === card.id && item.status !== "cancelled" && (stateById.get(item.invoiceId)?.remainingCents ?? 0) > 0 && item.purchase?.status === "active");
     const usedCents = invoiceStates.filter((invoice) => invoice.cardId === card.id).reduce((sum, invoice) => sum + invoice.remainingCents, 0);
-    return { ...card, usedCents, availableCents: card.limitCents - usedCents, currentInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === selectedMonth)?.remainingCents ?? 0, nextInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === addMonths(selectedMonth, 1))?.remainingCents ?? 0, installmentPurchaseCount: new Set(activeParts.filter((item) => item.installmentCount > 1).map((item) => item.purchaseId)).size, hasCompletedInitialImport: importBatchRows.some((batch) => batch.cardId === card.id && batch.importKind === "initial_state" && batch.status === "completed") };
+    const openingInvoice = invoices.find((item) => item.cardId === card.id && item.openingBalance !== null);
+    return { ...card, usedCents, availableCents: card.limitCents - usedCents, currentInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === selectedMonth)?.remainingCents ?? 0, nextInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === addMonths(selectedMonth, 1))?.remainingCents ?? 0, installmentPurchaseCount: new Set(activeParts.filter((item) => item.installmentCount > 1).map((item) => item.purchaseId)).size, hasCompletedInitialImport: importBatchRows.some((batch) => batch.cardId === card.id && batch.importKind === "initial_state" && batch.status === "completed"), openingResidualCents: openingInvoice?.openingBalance?.residualCents ?? 0 };
   });
   const availableCents = balanceRows.filter((item) => item.isActive).reduce((sum, item) => sum + item.currentBalanceCents, 0);
   const monthTransactions = transactionRows.filter((item) => item.status === "confirmed" && item.transactionDate.startsWith(selectedMonth));

@@ -17,7 +17,9 @@ register(`data:text/javascript,${encodeURIComponent(`
 `)}`, import.meta.url);
 
 const { addExistingCardInstallment, configureCardCurrentState, CardOnboardingError } = await import("../lib/card-onboarding-service.ts?existing-installments-tests");
+const { getInvoiceState } = await import("../lib/invoice-service.ts?existing-installments-tests");
 const { resolveInstallmentDisplay } = await import("../lib/card-onboarding-ui-rules.mjs?existing-installments-tests");
+const { FINANCIAL_EVENTS_CTE } = await import("../lib/finance-analytics.mjs?existing-installments-tests");
 const migrations = readdirSync(new URL("../drizzle", import.meta.url)).filter((name) => name.endsWith(".sql")).sort();
 const AT = "2026-09-18T12:00:00.000Z";
 
@@ -68,11 +70,12 @@ function setup(t) {
   return { db, d1, context };
 }
 
-const initial = { cardId: "card-a", initialReferenceMonth: "2026-10", declaredCurrentInvoiceTotalCents: 140000, idempotencyKey: "initial", commitments: [] };
+const initial = { cardId: "card-a", initialReferenceMonth: "2026-10", declaredCurrentInvoiceTotalCents: 140000, expectedCardUpdatedAt: AT, expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false, idempotencyKey: "initial", commitments: [] };
 const supplemental = {
-  cardId: "card-a", firstReferenceMonth: "2026-10", idempotencyKey: "supplemental-1",
+  cardId: "card-a", firstReferenceMonth: "2026-10", mode: "additional", expectedOpeningResidualCents: 140000, idempotencyKey: "supplemental-1",
   commitment: { description: "Compra esquecida", installmentAmountCents: 10000, originalInstallmentCount: 12, firstOriginalInstallmentNumber: 10, originalTotalCents: 120000, originalPurchaseDate: "2025-11-10", categoryId: "category-a", subcategoryId: "subcategory-a", notes: "Importada depois" },
 };
+const included = { ...supplemental, mode: "included", idempotencyKey: "included-1" };
 
 async function configured(t) { const fixture = setup(t); await configureCardCurrentState(initial, fixture.context); return fixture; }
 const count = (db, table) => db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
@@ -89,6 +92,7 @@ test("primeiro parcelamento complementar cria somente 10/12–12/12 e preserva o
   assert.deepEqual(physical.map((part) => resolveInstallmentDisplay({ physicalNumber: part.n, physicalCount: part.c, origin: "system", metadataValid: true, firstOriginalNumber: metadata.first, originalCount: metadata.total })), [{ installmentNumber: 10, installmentCount: 12 }, { installmentNumber: 11, installmentCount: 12 }, { installmentNumber: 12, installmentCount: 12 }]);
   assert.deepEqual(f.db.prepare("SELECT id, amount_cents FROM card_invoice_adjustments").get(), beforeAdjustment);
   assert.equal(count(f.db, "card_invoice_adjustments"), 1);
+  assert.equal(count(f.db, "card_opening_balance_allocations"), 0);
 });
 
 test("segundo e terceiro batches complementares são permitidos e segundo initial_state continua proibido", async (t) => {
@@ -157,4 +161,123 @@ test("ciclo fechado rejeita e falha intermediária reverte tudo", async (t) => {
   failed.d1.beforeStatement = (_statement, index) => { if (index === 4) throw new Error("forced intermediate failure"); };
   await assert.rejects(addExistingCardInstallment(supplemental, failed.context), /forced intermediate failure/iu);
   assert.deepEqual(Object.fromEntries(Object.keys(before).map((table) => [table, count(failed.db, table)])), before);
+});
+
+test("identificação parcial reduz somente o residual e mantém o total da primeira fatura", async (t) => {
+  const f = await configured(t);
+  const invoiceId = f.db.prepare("SELECT id FROM card_invoices WHERE reference_month='2026-10'").get().id;
+  const beforeState = await getInvoiceState(invoiceId, f.context);
+  const result = await addExistingCardInstallment(included, f.context);
+  const afterState = await getInvoiceState(invoiceId, f.context);
+  assert.equal(result.mode, "included");
+  assert.equal(result.allocatedAmountCents, 10000);
+  assert.equal(result.openingOriginalCents, 140000);
+  assert.equal(result.openingResidualCents, 130000);
+  assert.equal(result.invoiceTotalCents, 140000);
+  assert.deepEqual({ ...f.db.prepare("SELECT invoice_id,amount_cents FROM card_opening_balance_allocations").get() }, { invoice_id: invoiceId, amount_cents: 10000 });
+  assert.equal(f.db.prepare("SELECT SUM(amount_cents) n FROM card_installments WHERE invoice_id=?").get(invoiceId).n, 10000);
+  assert.equal(f.db.prepare("SELECT SUM(amount_cents) n FROM card_installments s JOIN card_invoices i ON i.id=s.invoice_id WHERE i.reference_month IN ('2026-11','2026-12')").get().n, 20000);
+  assert.deepEqual({ total: afterState.invoiceTotalCents, paid: afterState.paidCents, remaining: afterState.remainingCents }, { total: beforeState.invoiceTotalCents, paid: beforeState.paidCents, remaining: beforeState.remainingCents });
+  assert.equal(500000 - afterState.remainingCents, 500000 - beforeState.remainingCents);
+  const events = f.db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT competence_month,amount_cents FROM financial_events ORDER BY competence_month`).all("ha", "ha");
+  assert.deepEqual(events.map((row) => ({ ...row })), [
+    { competence_month: "2026-10", amount_cents: 10000 },
+    { competence_month: "2026-11", amount_cents: 10000 },
+    { competence_month: "2026-12", amount_cents: 10000 },
+  ]);
+});
+
+test("identificação total zera o residual sem alterar opening original", async (t) => {
+  const f = await configured(t);
+  const result = await addExistingCardInstallment({ ...included, idempotencyKey: "included-total", commitment: { ...included.commitment, installmentAmountCents: 140000, originalInstallmentCount: 1, firstOriginalInstallmentNumber: 1, originalTotalCents: 140000 } }, f.context);
+  assert.equal(result.openingResidualCents, 0);
+  assert.equal(result.invoiceTotalCents, 140000);
+  assert.equal(f.db.prepare("SELECT amount_cents FROM card_invoice_adjustments").get().amount_cents, 140000);
+});
+
+test("identificação acima do residual, residual zero e competência diferente são rejeitados sem escrita", async (t) => {
+  const f = await configured(t);
+  const before = count(f.db, "card_import_batches");
+  await assert.rejects(addExistingCardInstallment({ ...included, commitment: { ...included.commitment, installmentAmountCents: 140001 } }, f.context), (error) => error.code === "CARD_IMPORT_ALLOCATION_EXCEEDS_RESIDUAL");
+  await assert.rejects(addExistingCardInstallment({ ...included, firstReferenceMonth: "2026-11" }, f.context), (error) => error.code === "CARD_IMPORT_INITIAL_REFERENCE_REQUIRED");
+  assert.equal(count(f.db, "card_import_batches"), before);
+
+  const zero = setup(t);
+  await configureCardCurrentState({ ...initial, idempotencyKey: "zero-initial", declaredCurrentInvoiceTotalCents: 0 }, zero.context);
+  await assert.rejects(addExistingCardInstallment({ ...included, idempotencyKey: "zero-identify", expectedOpeningResidualCents: 0 }, zero.context), (error) => error.code === "CARD_IMPORT_NO_OPENING_RESIDUAL");
+});
+
+test("múltiplas identificações usam residual esperado e fingerprint inclui o modo", async (t) => {
+  const f = await configured(t);
+  const first = await addExistingCardInstallment(included, f.context);
+  const replay = await addExistingCardInstallment(included, f.context);
+  assert.equal(replay.batchId, first.batchId); assert.equal(replay.replayed, true);
+  await assert.rejects(addExistingCardInstallment({ ...included, mode: "additional" }, f.context), (error) => error.code === "CARD_ONBOARDING_IDEMPOTENCY_CONFLICT");
+  const second = await addExistingCardInstallment({ ...included, idempotencyKey: "included-2", expectedOpeningResidualCents: 130000, commitment: { ...included.commitment, description: "Segunda identificação" } }, f.context);
+  assert.equal(second.openingResidualCents, 120000);
+  assert.equal(count(f.db, "card_opening_balance_allocations"), 2);
+  const audit = JSON.parse(f.db.prepare("SELECT new_data FROM audit_logs WHERE entity_id=?").get(second.batchId).new_data);
+  assert.deepEqual({ mode: audit.mode, before: audit.openingResidualBeforeCents, after: audit.openingResidualAfterCents }, { mode: "included", before: 130000, after: 120000 });
+});
+
+test("identificação atravessa dezembro para janeiro sem alterar a competência inicial", async (t) => {
+  const f = await configured(t);
+  const result = await addExistingCardInstallment({
+    ...included, idempotencyKey: "included-year-crossing",
+    commitment: { ...included.commitment, originalInstallmentCount: 15, firstOriginalInstallmentNumber: 10, originalTotalCents: 150000 },
+  }, f.context);
+  assert.equal(result.invoiceTotalCents, 140000);
+  assert.deepEqual(f.db.prepare("SELECT reference_month FROM card_invoices ORDER BY reference_month").all().map((row) => row.reference_month), ["2026-10", "2026-11", "2026-12", "2027-01", "2027-02", "2027-03"]);
+});
+
+test("fatura inicial fechada aceita reclassificação, mas futura incompatível reverte tudo", async (t) => {
+  const closedInitial = await configured(t);
+  closedInitial.db.exec("UPDATE card_invoices SET status='closed' WHERE reference_month='2026-10'");
+  const result = await addExistingCardInstallment(included, closedInitial.context);
+  assert.equal(result.invoiceTotalCents, 140000);
+
+  const futureClosed = await configured(t);
+  futureClosed.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run("future-closed", "ha", "card-a", "2026-11", "2026-11-12", "2026-11-05", "closed", AT, AT);
+  const before = Object.fromEntries(["card_import_batches", "card_purchases", "card_installments", "card_opening_balance_allocations"].map((table) => [table, count(futureClosed.db, table)]));
+  await assert.rejects(addExistingCardInstallment(included, futureClosed.context), (error) => error.code === "CARD_IMPORT_INVOICE_CLOSED");
+  assert.deepEqual(Object.fromEntries(Object.keys(before).map((table) => [table, count(futureClosed.db, table)])), before);
+});
+
+test("disputa concorrente do mesmo residual permite no máximo uma conclusão", async (t) => {
+  const f = await configured(t);
+  const large = { ...included, commitment: { ...included.commitment, installmentAmountCents: 100000, originalInstallmentCount: 1, firstOriginalInstallmentNumber: 1, originalTotalCents: 100000 } };
+  const outcomes = await Promise.allSettled([
+    addExistingCardInstallment({ ...large, idempotencyKey: "race-included-a" }, f.context),
+    addExistingCardInstallment({ ...large, idempotencyKey: "race-included-b" }, f.context),
+  ]);
+  assert.equal(outcomes.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(outcomes.filter((item) => item.status === "rejected").length, 1);
+  assert.equal(f.db.prepare("SELECT SUM(amount_cents) n FROM card_opening_balance_allocations").get().n, 100000);
+});
+
+test("initial state, adjustment e invoice inicial ausentes falham fechados", async (t) => {
+  const missingInitial = setup(t);
+  await assert.rejects(addExistingCardInstallment(included, missingInitial.context), (error) => error.code === "CARD_IMPORT_INITIAL_REQUIRED");
+
+  const inconsistentAdjustment = await configured(t);
+  inconsistentAdjustment.db.exec("DROP TRIGGER card_invoice_adjustments_identity_update; DROP TRIGGER card_invoice_adjustments_completed_batch_update");
+  inconsistentAdjustment.db.exec("UPDATE card_invoice_adjustments SET amount_cents=139999");
+  await assert.rejects(addExistingCardInstallment(included, inconsistentAdjustment.context), (error) => error.code === "CARD_IMPORT_OPENING_INCONSISTENT");
+
+  const missingInvoice = await configured(t);
+  const savedInvoice = missingInvoice.db.prepare("SELECT * FROM card_invoices").get();
+  missingInvoice.db.exec("PRAGMA foreign_keys=OFF; DELETE FROM card_invoices; PRAGMA foreign_keys=ON");
+  await assert.rejects(addExistingCardInstallment(included, missingInvoice.context), (error) => error.code === "CARD_IMPORT_INITIAL_REQUIRED");
+  missingInvoice.db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run(savedInvoice.id, savedInvoice.household_id, savedInvoice.card_id, savedInvoice.reference_month, savedInvoice.due_date, savedInvoice.closes_on, savedInvoice.status, savedInvoice.created_at, savedInvoice.updated_at);
+});
+
+test("falha tardia após preparar allocation reverte batch, compra, parcelas, allocation e auditoria", async (t) => {
+  const f = await configured(t);
+  const tables = ["card_import_batches", "card_purchases", "card_installments", "card_opening_balance_allocations", "audit_logs"];
+  const before = Object.fromEntries(tables.map((table) => [table, count(f.db, table)]));
+  f.d1.beforeStatement = (statement) => { if (statement.sql.includes("INSERT INTO audit_logs")) throw new Error("forced late audit failure"); };
+  await assert.rejects(addExistingCardInstallment(included, f.context), /forced late audit failure/iu);
+  assert.deepEqual(Object.fromEntries(tables.map((table) => [table, count(f.db, table)])), before);
 });

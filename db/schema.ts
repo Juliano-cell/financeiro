@@ -86,7 +86,7 @@ export const cardInvoices = sqliteTable("card_invoices", {
 
 export const cardInstallments = sqliteTable("card_installments", {
   id: text("id").primaryKey(), householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }), purchaseId: text("purchase_id").notNull(), invoiceId: text("invoice_id").notNull(), installmentNumber: integer("installment_number").notNull(), installmentCount: integer("installment_count").notNull(), amountCents: integer("amount_cents").notNull(), status: text("status", { enum: ["pending", "paid", "cancelled"] }).notNull().default("pending"), createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
-}, (table) => [uniqueIndex("card_installments_purchase_number_unique").on(table.purchaseId, table.installmentNumber), index("idx_card_installments_household_invoice").on(table.householdId, table.invoiceId), check("card_installments_count_check", sql`${table.installmentCount} between 1 and 120`), check("card_installments_number_check", sql`${table.installmentNumber} between 1 and ${table.installmentCount}`), check("card_installments_amount_check", sql`${table.amountCents} > 0`), check("card_installments_status_check", sql`${table.status} in ('pending','paid','cancelled')`), foreignKey({ columns: [table.householdId, table.purchaseId], foreignColumns: [cardPurchases.householdId, cardPurchases.id], name: "card_installments_household_purchase_fk" }).onDelete("cascade"), foreignKey({ columns: [table.householdId, table.invoiceId], foreignColumns: [cardInvoices.householdId, cardInvoices.id], name: "card_installments_household_invoice_fk" })]);
+}, (table) => [uniqueIndex("card_installments_purchase_number_unique").on(table.purchaseId, table.installmentNumber), unique("card_installments_household_id_unique").on(table.householdId, table.id), index("idx_card_installments_household_invoice").on(table.householdId, table.invoiceId), check("card_installments_count_check", sql`${table.installmentCount} between 1 and 120`), check("card_installments_number_check", sql`${table.installmentNumber} between 1 and ${table.installmentCount}`), check("card_installments_amount_check", sql`${table.amountCents} > 0`), check("card_installments_status_check", sql`${table.status} in ('pending','paid','cancelled')`), foreignKey({ columns: [table.householdId, table.purchaseId], foreignColumns: [cardPurchases.householdId, cardPurchases.id], name: "card_installments_household_purchase_fk" }).onDelete("cascade"), foreignKey({ columns: [table.householdId, table.invoiceId], foreignColumns: [cardInvoices.householdId, cardInvoices.id], name: "card_installments_household_invoice_fk" })]);
 
 export const cardImportBatches = sqliteTable("card_import_batches", {
   id: text("id").primaryKey(),
@@ -166,6 +166,34 @@ export const cardInvoiceAdjustments = sqliteTable("card_invoice_adjustments", {
   foreignKey({ columns: [table.householdId, table.invoiceId], foreignColumns: [cardInvoices.householdId, cardInvoices.id], name: "card_invoice_adjustments_household_invoice_fk" }),
   foreignKey({ columns: [table.householdId, table.importBatchId], foreignColumns: [cardImportBatches.householdId, cardImportBatches.id], name: "card_invoice_adjustments_household_batch_fk" }),
   foreignKey({ columns: [table.householdId, table.createdByUserId], foreignColumns: [householdMembers.householdId, householdMembers.userId], name: "card_invoice_adjustments_household_creator_fk" }),
+]);
+
+export const cardOpeningBalanceAllocations = sqliteTable("card_opening_balance_allocations", {
+  id: text("id").primaryKey(),
+  householdId: text("household_id").notNull().references(() => households.id, { onDelete: "cascade" }),
+  openingAdjustmentId: text("opening_adjustment_id").notNull(),
+  initialImportBatchId: text("initial_import_batch_id").notNull(),
+  sourceImportBatchId: text("source_import_batch_id").notNull(),
+  invoiceId: text("invoice_id").notNull(),
+  purchaseId: text("purchase_id").notNull(),
+  installmentId: text("installment_id").notNull(),
+  amountCents: integer("amount_cents").notNull(),
+  createdByUserId: text("created_by_user_id").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  unique("card_opening_balance_allocations_household_id_unique").on(table.householdId, table.id),
+  unique("card_opening_balance_allocations_installment_unique").on(table.householdId, table.installmentId),
+  index("idx_card_opening_allocations_adjustment").on(table.householdId, table.openingAdjustmentId),
+  index("idx_card_opening_allocations_source_batch").on(table.householdId, table.sourceImportBatchId),
+  check("card_opening_balance_allocations_identifiers_check", sql`length(trim(${table.id})) > 0 and length(trim(${table.householdId})) > 0 and length(trim(${table.openingAdjustmentId})) > 0 and length(trim(${table.initialImportBatchId})) > 0 and length(trim(${table.sourceImportBatchId})) > 0 and length(trim(${table.invoiceId})) > 0 and length(trim(${table.purchaseId})) > 0 and length(trim(${table.installmentId})) > 0 and length(trim(${table.createdByUserId})) > 0`),
+  check("card_opening_balance_allocations_amount_check", sql`typeof(${table.amountCents}) = 'integer' and ${table.amountCents} between 1 and 9007199254740991`),
+  foreignKey({ columns: [table.householdId, table.openingAdjustmentId], foreignColumns: [cardInvoiceAdjustments.householdId, cardInvoiceAdjustments.id], name: "card_opening_allocations_household_adjustment_fk" }),
+  foreignKey({ columns: [table.householdId, table.initialImportBatchId], foreignColumns: [cardImportBatches.householdId, cardImportBatches.id], name: "card_opening_allocations_household_initial_batch_fk" }),
+  foreignKey({ columns: [table.householdId, table.sourceImportBatchId], foreignColumns: [cardImportBatches.householdId, cardImportBatches.id], name: "card_opening_allocations_household_source_batch_fk" }),
+  foreignKey({ columns: [table.householdId, table.invoiceId], foreignColumns: [cardInvoices.householdId, cardInvoices.id], name: "card_opening_allocations_household_invoice_fk" }),
+  foreignKey({ columns: [table.householdId, table.purchaseId], foreignColumns: [cardPurchases.householdId, cardPurchases.id], name: "card_opening_allocations_household_purchase_fk" }),
+  foreignKey({ columns: [table.householdId, table.installmentId], foreignColumns: [cardInstallments.householdId, cardInstallments.id], name: "card_opening_allocations_household_installment_fk" }),
+  foreignKey({ columns: [table.householdId, table.createdByUserId], foreignColumns: [householdMembers.householdId, householdMembers.userId], name: "card_opening_allocations_household_creator_fk" }),
 ]);
 
 // Unicode White_Space, Cc and Cf characters; char() chunks stay below 127 arguments.

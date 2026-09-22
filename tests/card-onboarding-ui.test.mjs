@@ -13,6 +13,7 @@ import {
   nextOriginalInstallments,
   parseBrlCents,
   parseExistingInstallmentSuccessResponse,
+  parseOnboardingPreviewResponse,
   parseOnboardingSuccessResponse,
   referenceMonthOptions,
   resolveInstallmentDisplay,
@@ -27,7 +28,7 @@ const advancedRoute = readFileSync(new URL("../app/api/finance/advanced/route.ts
 const analytics = readFileSync(new URL("../lib/finance-analytics.mjs", import.meta.url), "utf8");
 
 const installment = (changes = {}) => ({ id: "draft-1", description: "Celular", originalTotal: "600,00", originalInstallmentCount: "10", currentInstallmentNumber: "5", installmentAmount: "60,00", originalPurchaseDate: "2026-05-10", categoryId: "", subcategoryId: "", notes: "", ...changes });
-const draft = (changes = {}) => ({ cardId: "card-a", referenceMonth: "2026-10", invoiceTotal: "1.400,00", hasInstallments: true, installments: [installment()], ...changes });
+const draft = (changes = {}) => ({ cardId: "card-a", referenceMonth: "2026-10", invoiceTotal: "1.400,00", expectedCardUpdatedAt: "2026-09-18T12:00:00.000Z", expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", requiresClosedCycleConfirmation: false, closedCycleConfirmed: false, hasInstallments: true, installments: [installment()], ...changes });
 
 test("botão de configuração está conectado à tela real de cartões", () => {
   assert.match(advanced, /CardOnboardingAction[^>]+card=\{card\}/u);
@@ -39,7 +40,23 @@ test("cartão inelegível não renderiza ação de onboarding", () => assert.mat
 test("fluxo abre em dialog identificado e acessível", () => assert.match(component, /Configurar situação atual · \{card\.name\}/u));
 test("cancelar fecha e limpa somente tentativa ainda não enviada", () => { assert.match(component, /const close = \(\) => \{ setOpen\(false\); reset\(\); \}/u); assert.match(component, /attempt\.clearPrepared\(\)/u); });
 
-test("competências mostram somente mês atual e seguinte em São Paulo", () => {
+test("competência começa sem seleção e sugestão visual não seleciona silenciosamente", () => {
+  assert.match(component, /useState<Cycle \| null>\(null\)/u);
+  assert.match(component, /setPreview\(parsed\); setSelectedCycle\(null\)/u);
+  assert.match(component, /Sugestão/u);
+  assert.doesNotMatch(component, /setSelectedCycle\([^)]*suggestedReferenceMonth/u);
+});
+
+test("preview de ciclo autoritativo exige contrato completo e confirmação explícita do fechado", () => {
+  const preview = { cardId: "card-a", eligible: true, cardUpdatedAt: "2026-09-18T12:00:00.000Z", today: "2026-09-18", minimumReferenceMonth: "2024-09", maximumReferenceMonth: "2027-09", suggestedReferenceMonth: "2026-10", cycles: [{ referenceMonth: "2026-09", closesOn: "2026-09-05", dueOn: "2026-09-12", state: "closed", requiresClosedCycleConfirmation: true }] };
+  const parsedPreview = structuredClone(preview); delete parsedPreview.eligible;
+  assert.deepEqual(parseOnboardingPreviewResponse(preview, "card-a"), parsedPreview);
+  assert.equal(parseOnboardingPreviewResponse({ ...preview, cycles: [{ ...preview.cycles[0], requiresClosedCycleConfirmation: false }] }, "card-a"), null);
+  assert.equal(buildOnboardingPayload(draft({ requiresClosedCycleConfirmation: true, closedCycleConfirmed: false })).valid, false);
+  assert.match(component, /Confirmo que desejo iniciar o acompanhamento/iu);
+});
+
+test("atalhos de competência mostram mês atual e seguinte em São Paulo", () => {
   const options = referenceMonthOptions(new Date("2026-10-31T23:30:00-03:00"));
   assert.deepEqual(options.map((item) => item.value), ["2026-10", "2026-11"]);
   assert.match(options[0].label, /outubro de 2026/iu);
@@ -161,16 +178,16 @@ test("metadata que excede total original falha fechada", () => assert.equal(reso
 test("Ver fatura usa metadata sem alterar ledger", () => { assert.match(detailService, /LEFT JOIN card_purchase_import_metadata/u); assert.match(detailService, /resolveInstallmentDisplay/u); });
 test("lista geral de parcelas também usa numeração original", () => { assert.match(advancedRoute, /cardPurchaseImportMetadata/u); assert.match(advancedRoute, /inconsistentInstallmentDisplay/u); });
 test("dashboard e relatórios também usam numeração original", () => { assert.match(analytics, /card_purchase_import_metadata/u); assert.match(analytics, /first_original_installment_number \+ ci\.installment_number - 1/u); });
-test("opening balance continua visível separadamente", () => assert.match(readFileSync(new URL("../app/invoice-detail-dialog.tsx", import.meta.url), "utf8"), /Saldo anterior à implantação/u));
+test("saldo inicial residual continua visível separadamente", () => assert.match(readFileSync(new URL("../app/invoice-detail-dialog.tsx", import.meta.url), "utf8"), /Saldo inicial ainda não identificado/u));
 test("paginação do detalhe permanece delegada ao contrato existente", () => { assert.match(detailService, /activePage/u); assert.match(detailService, /cancelledPage/u); assert.match(detailService, /pageSize/u); });
 
 test("payload complementar aceita total original opcional e calcula somente parcelas remanescentes", () => {
-  const result = buildExistingInstallmentPayload({ cardId: "card-a", firstReferenceMonth: "2026-10", description: "Compra antiga", installmentAmount: "100,00", originalInstallmentCount: "12", firstOriginalInstallmentNumber: "10", originalTotal: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" });
+  const result = buildExistingInstallmentPayload({ cardId: "card-a", firstReferenceMonth: "2026-10", mode: "additional", expectedOpeningResidualCents: 140000, description: "Compra antiga", installmentAmount: "100,00", originalInstallmentCount: "12", firstOriginalInstallmentNumber: "10", originalTotal: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" });
   assert.equal(result.valid, true); assert.equal(result.payload.originalTotalCents, null); assert.equal(result.preview.remainingInstallmentCount, 3); assert.equal(result.preview.remainingTotalCents, 30000);
 });
 test("payload complementar rejeita numeração fora do total", () => assert.equal(buildExistingInstallmentPayload({ cardId: "card-a", firstReferenceMonth: "2026-10", description: "Compra", installmentAmount: "10,00", originalInstallmentCount: "12", firstOriginalInstallmentNumber: "13", originalTotal: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" }).valid, false));
 test("resposta complementar exige contrato financeiro completo", () => {
-  const value = { cardId: "card-a", batchId: "batch", invoiceId: "invoice", firstReferenceMonth: "2026-10", importedPurchaseCount: 1, importedInstallmentCount: 3, status: "completed", replayed: false };
+  const value = { cardId: "card-a", batchId: "batch", invoiceId: "invoice", firstReferenceMonth: "2026-10", importedPurchaseCount: 1, importedInstallmentCount: 3, mode: "additional", allocatedAmountCents: 0, openingOriginalCents: 140000, openingAllocatedCents: 0, openingResidualCents: 140000, invoiceTotalCents: 150000, status: "completed", replayed: false };
   assert.deepEqual(parseExistingInstallmentSuccessResponse(value, "card-a"), value); assert.equal(parseExistingInstallmentSuccessResponse({ ...value, importedPurchaseCount: 2 }, "card-a"), null);
 });
 test("ação complementar está disponível somente no ramo de cartão ativo e possui revisão", () => {

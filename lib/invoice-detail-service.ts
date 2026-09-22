@@ -38,6 +38,7 @@ type AdjustmentRow = {
   adjustment_id: string;
   kind: "opening_balance";
   amount_cents: number;
+  allocated_cents: number;
   status: "active";
 };
 
@@ -93,16 +94,19 @@ function item(row: DetailRow): InvoiceDetailItem {
   };
 }
 
-function adjustment(row: AdjustmentRow): InvoiceDetailAdjustment {
+function adjustment(row: AdjustmentRow): InvoiceDetailAdjustment | null {
   if (!validIdentifier(row.adjustment_id) || row.kind !== "opening_balance" || row.status !== "active"
-    || !Number.isSafeInteger(row.amount_cents) || row.amount_cents <= 0) {
+    || !Number.isSafeInteger(row.amount_cents) || row.amount_cents <= 0
+    || !Number.isSafeInteger(row.allocated_cents) || row.allocated_cents < 0 || row.allocated_cents > row.amount_cents) {
     throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
   }
+  const residualCents = row.amount_cents - row.allocated_cents;
+  if (residualCents === 0) return null;
   return {
     adjustmentId: row.adjustment_id,
     itemType: "opening_balance",
-    description: "Saldo anterior à implantação",
-    amountCents: row.amount_cents,
+    description: "Saldo inicial ainda não identificado",
+    amountCents: residualCents,
     status: "active",
     includedInTotal: true,
   };
@@ -202,18 +206,23 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
   const [activeRows, cancelledRows, adjustmentRows] = await Promise.all([
     context.d1.prepare(`${ITEM_SELECT} AND s.status <> 'cancelled'${ITEM_ORDER}`).bind(context.householdId, parsed.invoiceId, parsed.pageSize, activeOffset).all<DetailRow>(),
     context.d1.prepare(`${ITEM_SELECT} AND s.status = 'cancelled'${ITEM_ORDER}`).bind(context.householdId, parsed.invoiceId, parsed.pageSize, cancelledOffset).all<DetailRow>(),
-    context.d1.prepare(`SELECT id AS adjustment_id, kind, amount_cents, status
-      FROM card_invoice_adjustments
-      WHERE household_id = ? AND invoice_id = ? AND status = 'active'
-      ORDER BY created_at, id`).bind(context.householdId, parsed.invoiceId).all<AdjustmentRow>(),
+    context.d1.prepare(`SELECT a.id AS adjustment_id, a.kind, a.amount_cents, a.status,
+        COALESCE((SELECT SUM(o.amount_cents) FROM card_opening_balance_allocations o
+          WHERE o.household_id = a.household_id AND o.opening_adjustment_id = a.id), 0) AS allocated_cents
+      FROM card_invoice_adjustments a
+      WHERE a.household_id = ? AND a.invoice_id = ? AND a.status = 'active'
+      ORDER BY a.created_at, a.id`).bind(context.householdId, parsed.invoiceId).all<AdjustmentRow>(),
   ]);
   if (activeRows.results.length !== expectedPageItems(parsed.activePage, parsed.pageSize, activeCount)
     || cancelledRows.results.length !== expectedPageItems(parsed.cancelledPage, parsed.pageSize, cancelledCount)) {
     throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
   }
-  const adjustments = adjustmentRows.results.map(adjustment);
+  const mappedAdjustments = adjustmentRows.results.map((row) => ({ row, adjustment: adjustment(row) }));
+  const adjustments = mappedAdjustments.flatMap((entry) => entry.adjustment ? [entry.adjustment] : []);
+  const openingRow = mappedAdjustments[0]?.row ?? null;
+  const openingResidualCents = openingRow ? openingRow.amount_cents - openingRow.allocated_cents : 0;
   const componentTotalCents = (counts?.active_total_cents ?? 0)
-    + adjustments.reduce((sum, row) => sum + row.amountCents, 0);
+    + openingResidualCents;
   if (!Number.isSafeInteger(componentTotalCents) || componentTotalCents !== state.invoiceTotalCents) {
     throw new InvoiceServiceError("Não foi possível exibir esta fatura porque os dados financeiros estão inconsistentes.", 409, "INVOICE_DETAIL_INCONSISTENT");
   }
@@ -232,6 +241,12 @@ export async function getInvoiceDetail(input: InvoiceDetailInput, context: Invoi
       cycleStatus: state.cycleStatus,
       paymentStatus: state.paymentStatus,
     },
+    openingBalance: openingRow ? {
+      originalCents: openingRow.amount_cents,
+      allocatedCents: openingRow.allocated_cents,
+      residualCents: openingResidualCents,
+      identifiedCents: openingRow.allocated_cents,
+    } : null,
     adjustments,
     active: page(activeRows.results, parsed.activePage, parsed.pageSize, activeCount),
     cancelled: page(cancelledRows.results, parsed.cancelledPage, parsed.pageSize, cancelledCount),

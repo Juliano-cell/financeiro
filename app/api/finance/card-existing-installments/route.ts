@@ -5,7 +5,7 @@ import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
 import { householdMembers } from "@/db/schema";
-import { addExistingCardInstallment, CardOnboardingError } from "@/lib/card-onboarding-service";
+import { addExistingCardInstallment, CardOnboardingError, getExistingCardInstallmentContext } from "@/lib/card-onboarding-service";
 
 export const dynamic = "force-dynamic";
 
@@ -17,6 +17,8 @@ const optionalId = identifier.nullable().optional();
 const payloadSchema = z.object({
   cardId: identifier,
   firstReferenceMonth: z.string().regex(/^\d{4}-(?:0[1-9]|1[0-2])$/u, "Competência inválida."),
+  mode: z.enum(["included", "additional"]),
+  expectedOpeningResidualCents: z.number().int().safe().min(0).max(100_000_000_000),
   idempotencyKey: z.string().min(1).max(200),
   description: z.string().trim().min(1).max(120),
   installmentAmountCents: money,
@@ -69,6 +71,16 @@ function errorResponse(error: unknown) {
   return NextResponse.json({ error: "Não foi possível adicionar o parcelamento existente.", code: "CARD_IMPORT_INTERNAL" }, { status: 500, headers: privateHeaders });
 }
 
+export async function GET(request: Request) {
+  try {
+    const current = await identity();
+    if (current.kind === "unauthenticated") return NextResponse.json({ error: "Não autenticado" }, { status: 401, headers: privateHeaders });
+    if (current.kind === "forbidden") return NextResponse.json({ error: "Não autorizado" }, { status: 403, headers: privateHeaders });
+    const parsed = z.object({ cardId: identifier }).strict().parse(Object.fromEntries(new URL(request.url).searchParams));
+    return NextResponse.json(await getExistingCardInstallmentContext(parsed.cardId, current), { headers: privateHeaders });
+  } catch (error) { return errorResponse(error); }
+}
+
 export async function POST(request: Request) {
   if (!isSameOriginRequest(request)) return NextResponse.json({ error: "Origem da solicitação inválida." }, { status: 403, headers: privateHeaders });
   try {
@@ -79,6 +91,8 @@ export async function POST(request: Request) {
     const result = await addExistingCardInstallment({
       cardId: parsed.cardId,
       firstReferenceMonth: parsed.firstReferenceMonth,
+      mode: parsed.mode,
+      expectedOpeningResidualCents: parsed.expectedOpeningResidualCents,
       idempotencyKey: parsed.idempotencyKey,
       commitment: {
         description: parsed.description,
@@ -99,6 +113,12 @@ export async function POST(request: Request) {
       firstReferenceMonth: result.initialReferenceMonth,
       importedPurchaseCount: result.importedPurchaseCount,
       importedInstallmentCount: result.importedInstallmentCount,
+      mode: result.mode,
+      allocatedAmountCents: result.allocatedAmountCents,
+      openingOriginalCents: result.openingOriginalCents,
+      openingAllocatedCents: result.openingAllocatedCents,
+      openingResidualCents: result.openingResidualCents,
+      invoiceTotalCents: result.invoiceTotalCents,
       status: "completed",
       replayed: result.replayed,
     }, { status: 201, headers: privateHeaders });

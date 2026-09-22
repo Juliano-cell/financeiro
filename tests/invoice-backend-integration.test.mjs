@@ -103,6 +103,10 @@ async function setupImported(t) {
     cardId: "carda",
     initialReferenceMonth: "2026-09",
     declaredCurrentInvoiceTotalCents: 10000,
+    expectedCardUpdatedAt: AT,
+    expectedClosesOn: "2026-09-17",
+    expectedDueOn: "2026-09-25",
+    closedCycleConfirmed: false,
     idempotencyKey: "invoice-detail-import",
     commitments: [{
       description: "Compra teste antiga",
