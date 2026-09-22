@@ -43,7 +43,9 @@ for (const configName of ["wrangler.production.jsonc", "wrangler.production.json
   });
 }
 
-test("não existe migration 0010", () => {
+test("0010 permanece restrita a parcelamentos de cartão e não altera notificações", () => {
   const names = readdirSync(new URL("../drizzle", import.meta.url));
-  assert.equal(names.some((name) => name.startsWith("0010")), false);
+  assert.deepEqual(names.filter((name) => name.startsWith("0010")), ["0010_existing_card_installments.sql"]);
+  const source = readFileSync(new URL("../drizzle/0010_existing_card_installments.sql", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /notification|cron|telegram/iu);
 });

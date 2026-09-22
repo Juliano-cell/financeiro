@@ -23,6 +23,7 @@ register(`data:text/javascript,${encodeURIComponent(`
 `)}`, import.meta.url);
 
 const route = await import("../app/api/finance/card-onboarding/route.ts?api-tests");
+const existingInstallmentRoute = await import("../app/api/finance/card-existing-installments/route.ts?api-tests");
 const COOKIE = "card-onboarding-api-session";
 const SESSION_ID = await digestToken(COOKIE);
 const AT = "2026-09-18T12:00:00.000Z";
@@ -123,6 +124,29 @@ async function post(payload = validPayload, options = {}) {
 
 async function eligibility(query = "cardId=card-a") {
   const response = await route.GET(new Request(`https://fixture.invalid/api/finance/card-onboarding?${query}`));
+  return { status: response.status, headers: response.headers, body: await response.json() };
+}
+
+const existingInstallmentPayload = {
+  cardId: "card-a",
+  firstReferenceMonth: "2026-10",
+  idempotencyKey: "existing-card-a",
+  description: "Compra lembrada depois",
+  installmentAmountCents: 10000,
+  originalInstallmentCount: 12,
+  firstOriginalInstallmentNumber: 10,
+  originalTotalCents: 120000,
+  originalPurchaseDate: "2025-11-10",
+  categoryId: "category-a",
+  subcategoryId: "subcategory-a",
+};
+
+async function postExisting(payload = existingInstallmentPayload, options = {}) {
+  const response = await existingInstallmentRoute.POST(new Request("https://fixture.invalid/api/finance/card-existing-installments", {
+    method: "POST",
+    headers: { origin: "https://fixture.invalid", "content-type": "application/json", ...options.headers },
+    body: options.raw ?? JSON.stringify(payload),
+  }));
   return { status: response.status, headers: response.headers, body: await response.json() };
 }
 
@@ -305,4 +329,30 @@ test("GET informa atividade existente sem dados financeiros", async (t) => {
 
 test("GET rejeita campos extras e membership inativa", async (t) => {
   const f = setup(t); assert.equal((await eligibility("cardId=card-a&householdId=hb")).status, 400); f.db.exec("UPDATE household_members SET status='inactive' WHERE id='ma'"); assert.equal((await eligibility()).status, 403);
+});
+
+test("parcelamento complementar sem sessão e membership inativa são rejeitados", async (t) => {
+  const f = setup(t); globalThis.__cardOnboardingApiCookie = undefined;
+  assert.equal((await postExisting()).status, 401);
+  globalThis.__cardOnboardingApiCookie = COOKIE; f.db.exec("UPDATE household_members SET status='inactive' WHERE id='ma'");
+  assert.equal((await postExisting()).status, 403); assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_import_batches").get().n, 0);
+});
+
+test("API adiciona parcelamento complementar após onboarding e não expõe dados internos", async (t) => {
+  const f = setup(t);
+  assert.equal((await post({ ...validPayload, referenceMonth: "2026-10" })).status, 201);
+  const result = await postExisting();
+  assert.equal(result.status, 201); assert.equal(result.headers.get("cache-control"), "private, no-store");
+  assert.equal(result.body.importedInstallmentCount, 3); assert.equal(result.body.replayed, false);
+  assert.doesNotMatch(JSON.stringify(result.body), /fingerprint|idempotency/iu);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_import_batches WHERE import_kind='existing_installments'").get().n, 1);
+});
+
+test("API complementar mantém idempotência e isolamento de household", async (t) => {
+  const f = setup(t); await post({ ...validPayload, referenceMonth: "2026-10" });
+  const first = await postExisting(); const replay = await postExisting();
+  assert.equal(first.status, 201); assert.equal(replay.status, 201); assert.equal(replay.body.batchId, first.body.batchId); assert.equal(replay.body.replayed, true);
+  const conflict = await postExisting({ ...existingInstallmentPayload, description: "Payload diferente" }); assert.equal(conflict.status, 409);
+  const foreign = await postExisting({ ...existingInstallmentPayload, cardId: "card-b", idempotencyKey: "foreign-key" }); assert.equal(foreign.status, 404);
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_import_batches WHERE import_kind='existing_installments'").get().n, 1);
 });

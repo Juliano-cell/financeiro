@@ -11,6 +11,7 @@ import { createCardPurchase, FinanceValidationError } from "@/lib/finance-servic
 import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
 import { cancelCardPurchase, getHouseholdInvoiceStates, getInvoicePaymentHistory, invoiceCivilDate, InvoiceServiceError, payInvoiceResidual, reverseInvoicePayment } from "@/lib/invoice-service";
 import { resolveInstallmentDisplay } from "@/lib/card-onboarding-ui-rules.mjs";
+import { CardServiceError, deactivateCard, reactivateCard } from "@/lib/card-service";
 
 export const dynamic = "force-dynamic";
 
@@ -99,7 +100,7 @@ export async function GET(request: Request) {
   const cards = cardRows.map((card) => {
     const activeParts = installments.filter((item) => item.card?.id === card.id && item.status !== "cancelled" && (stateById.get(item.invoiceId)?.remainingCents ?? 0) > 0 && item.purchase?.status === "active");
     const usedCents = invoiceStates.filter((invoice) => invoice.cardId === card.id).reduce((sum, invoice) => sum + invoice.remainingCents, 0);
-    return { ...card, usedCents, availableCents: card.limitCents - usedCents, currentInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === selectedMonth)?.remainingCents ?? 0, nextInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === addMonths(selectedMonth, 1))?.remainingCents ?? 0, installmentPurchaseCount: new Set(activeParts.filter((item) => item.installmentCount > 1).map((item) => item.purchaseId)).size };
+    return { ...card, usedCents, availableCents: card.limitCents - usedCents, currentInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === selectedMonth)?.remainingCents ?? 0, nextInvoiceCents: invoices.find((item) => item.cardId === card.id && item.referenceMonth === addMonths(selectedMonth, 1))?.remainingCents ?? 0, installmentPurchaseCount: new Set(activeParts.filter((item) => item.installmentCount > 1).map((item) => item.purchaseId)).size, hasCompletedInitialImport: importBatchRows.some((batch) => batch.cardId === card.id && batch.importKind === "initial_state" && batch.status === "completed") };
   });
   const availableCents = balanceRows.filter((item) => item.isActive).reduce((sum, item) => sum + item.currentBalanceCents, 0);
   const monthTransactions = transactionRows.filter((item) => item.status === "confirmed" && item.transactionDate.startsWith(selectedMonth));
@@ -128,10 +129,20 @@ export async function POST(request: Request) {
       if (action === "create_card") { const entityId = uid("card"); await db.insert(creditCards).values({ ...parsed, id: entityId, householdId, createdAt: timestamp, updatedAt: timestamp }); return NextResponse.json({ ok: true, id: entityId }); }
       const [owned] = await db.select().from(creditCards).where(and(eq(creditCards.id, parsed.id!), eq(creditCards.householdId, householdId))).limit(1);
       if (!owned) return NextResponse.json({ error: "Cartão não encontrado." }, { status: 404 });
-      const { id: entityId, ...changes } = parsed; await db.update(creditCards).set({ ...changes, updatedAt: timestamp }).where(and(eq(creditCards.id, entityId!), eq(creditCards.householdId, householdId))); return NextResponse.json({ ok: true });
+      const { id: entityId, ...changes } = parsed; await db.update(creditCards).set({ ...changes, isActive: owned.isActive, updatedAt: timestamp }).where(and(eq(creditCards.id, entityId!), eq(creditCards.householdId, householdId))); return NextResponse.json({ ok: true });
     }
     if (action === "update_notification_settings") {
       const parsed = z.object({ enabled: z.boolean(), offsets: z.array(z.union([z.literal(7), z.literal(3), z.literal(1), z.literal(0), z.literal(-1)])).max(5) }).parse(body); await db.insert(notificationPreferences).values({ householdId, enabled: parsed.enabled, offsetsJson: JSON.stringify([...new Set(parsed.offsets)]), updatedAt: timestamp }).onConflictDoUpdate({ target: notificationPreferences.householdId, set: { enabled: parsed.enabled, offsetsJson: JSON.stringify([...new Set(parsed.offsets)]), updatedAt: timestamp } }); return NextResponse.json({ ok: true });
+    }
+    if (action === "reactivate_card") {
+      const parsed = z.object({ id }).parse(body);
+      const result = await reactivateCard(parsed.id, { d1, householdId, userId: user.id, timestamp });
+      return NextResponse.json({ ok: true, ...result }, { headers: privateHeaders });
+    }
+    if (action === "deactivate_card") {
+      const parsed = z.object({ id }).parse(body);
+      const result = await deactivateCard(parsed.id, { d1, householdId, userId: user.id, timestamp });
+      return NextResponse.json({ ok: true, ...result }, { headers: privateHeaders });
     }
     if (action === "delete_card") {
       const parsed = z.object({ id }).parse(body); const [owned] = await db.select().from(creditCards).where(and(eq(creditCards.id, parsed.id), eq(creditCards.householdId, householdId))).limit(1); if (!owned) return NextResponse.json({ error: "Cartão não encontrado." }, { status: 404 });
@@ -226,6 +237,7 @@ export async function POST(request: Request) {
     if (error instanceof InvoiceServiceError) return NextResponse.json({ error: error.message, code: error.code }, { status: error.status, headers: privateHeaders });
     if (error instanceof BillServiceError) return NextResponse.json({ error: error.message, ...(error.code ? { code: error.code } : {}) }, { status: error.status });
     if (error instanceof FinanceValidationError) return NextResponse.json({ error: error.message }, { status: 400 });
+    if (error instanceof CardServiceError) return NextResponse.json({ error: error.message, code: error.code }, { status: error.status, headers: privateHeaders });
     if (error instanceof z.ZodError) return NextResponse.json({ error: error.issues[0]?.message ?? "Dados inválidos.", details: error.flatten() }, { status: 400 });
     console.error("advanced_finance_failed", error); return NextResponse.json({ error: "Não foi possível concluir a operação." }, { status: 500 });
   }

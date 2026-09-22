@@ -209,6 +209,13 @@ test("API sem sessão ou origem correta não permite escrever", async t => {
   const f = await setup(t); globalThis.__invoiceTestCookie = undefined; assert.equal((await pay(f)).status, 401);
   assert.equal((await advanced.POST(new Request("https://fixture.invalid/api/finance/advanced", { method: "POST", body: "{}" }))).status, 403);
 });
+test("reativação pela API rejeita sessão ausente e membership inativa sem alterar o cartão", async t => {
+  const f = await setup(t, "2026-09-16T12:00:00Z", false); f.db.exec("UPDATE credit_cards SET is_active=0 WHERE id='carda'");
+  globalThis.__invoiceTestCookie = undefined; assert.equal((await action("reactivate_card", { id: "carda" })).status, 401);
+  globalThis.__invoiceTestCookie = COOKIE; f.db.exec("UPDATE household_members SET status='inactive' WHERE id='ma'");
+  assert.equal((await action("reactivate_card", { id: "carda" })).status, 401);
+  assert.equal(f.db.prepare("SELECT is_active FROM credit_cards WHERE id='carda'").get().is_active, 0);
+});
 test("saldo deduz payment mesmo após reversal posterior", async t => {
   const f = await setup(t); const p = await pay(f); await reverse(p.body.paymentId); assert.equal(await balance("2026-09-30"), 50000);
 });
@@ -347,7 +354,7 @@ test("detalhe de importação falha fechado quando o total histórico está ause
 test("detalhe de importação falha fechado para metadata ligada a outro batch", async t => {
   const f = await setupImported(t);
   f.db.exec("DROP TRIGGER card_purchase_import_metadata_immutable_update");
-  f.db.exec("DROP INDEX card_import_batches_active_card_unique");
+  f.db.exec("DROP INDEX card_import_batches_initial_card_unique");
   f.db.exec("DROP TRIGGER card_import_batches_financial_identity_insert");
   f.db.prepare(`INSERT INTO card_import_batches(id,household_id,card_id,created_by_user_id,idempotency_key,request_fingerprint,initial_reference_month,declared_invoice_total_cents,opening_balance_cents,imported_purchase_count,imported_installment_count,status,created_at,completed_at,voided_at)
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run("other-batch", "ha", "carda", "ua", "other-batch-key", "other-batch-fingerprint", "2026-09", 0, 0, 0, 0, "pending", AT, null, null);

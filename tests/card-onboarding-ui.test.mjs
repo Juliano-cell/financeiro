@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   addReferenceMonth,
+  buildExistingInstallmentPayload,
   buildOnboardingPayload,
   canAddOnboardingCommitment,
   createOnboardingAttemptManager,
@@ -11,6 +12,7 @@ import {
   MAX_ONBOARDING_COMMITMENTS,
   nextOriginalInstallments,
   parseBrlCents,
+  parseExistingInstallmentSuccessResponse,
   parseOnboardingSuccessResponse,
   referenceMonthOptions,
   resolveInstallmentDisplay,
@@ -18,6 +20,7 @@ import {
 } from "../lib/card-onboarding-ui-rules.mjs";
 
 const component = readFileSync(new URL("../app/card-onboarding-dialog.tsx", import.meta.url), "utf8");
+const existingComponent = readFileSync(new URL("../app/card-existing-installment-dialog.tsx", import.meta.url), "utf8");
 const advanced = readFileSync(new URL("../app/advanced-finance.tsx", import.meta.url), "utf8");
 const detailService = readFileSync(new URL("../lib/invoice-detail-service.ts", import.meta.url), "utf8");
 const advancedRoute = readFileSync(new URL("../app/api/finance/advanced/route.ts", import.meta.url), "utf8");
@@ -160,3 +163,16 @@ test("lista geral de parcelas também usa numeração original", () => { assert.
 test("dashboard e relatórios também usam numeração original", () => { assert.match(analytics, /card_purchase_import_metadata/u); assert.match(analytics, /first_original_installment_number \+ ci\.installment_number - 1/u); });
 test("opening balance continua visível separadamente", () => assert.match(readFileSync(new URL("../app/invoice-detail-dialog.tsx", import.meta.url), "utf8"), /Saldo anterior à implantação/u));
 test("paginação do detalhe permanece delegada ao contrato existente", () => { assert.match(detailService, /activePage/u); assert.match(detailService, /cancelledPage/u); assert.match(detailService, /pageSize/u); });
+
+test("payload complementar aceita total original opcional e calcula somente parcelas remanescentes", () => {
+  const result = buildExistingInstallmentPayload({ cardId: "card-a", firstReferenceMonth: "2026-10", description: "Compra antiga", installmentAmount: "100,00", originalInstallmentCount: "12", firstOriginalInstallmentNumber: "10", originalTotal: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" });
+  assert.equal(result.valid, true); assert.equal(result.payload.originalTotalCents, null); assert.equal(result.preview.remainingInstallmentCount, 3); assert.equal(result.preview.remainingTotalCents, 30000);
+});
+test("payload complementar rejeita numeração fora do total", () => assert.equal(buildExistingInstallmentPayload({ cardId: "card-a", firstReferenceMonth: "2026-10", description: "Compra", installmentAmount: "10,00", originalInstallmentCount: "12", firstOriginalInstallmentNumber: "13", originalTotal: "", originalPurchaseDate: "", categoryId: "", subcategoryId: "", notes: "" }).valid, false));
+test("resposta complementar exige contrato financeiro completo", () => {
+  const value = { cardId: "card-a", batchId: "batch", invoiceId: "invoice", firstReferenceMonth: "2026-10", importedPurchaseCount: 1, importedInstallmentCount: 3, status: "completed", replayed: false };
+  assert.deepEqual(parseExistingInstallmentSuccessResponse(value, "card-a"), value); assert.equal(parseExistingInstallmentSuccessResponse({ ...value, importedPurchaseCount: 2 }, "card-a"), null);
+});
+test("ação complementar está disponível somente no ramo de cartão ativo e possui revisão", () => {
+  assert.match(advanced, /card\.isActive && .*CardExistingInstallmentAction/su); assert.match(existingComponent, /Adicionar parcelamento existente/u); assert.match(existingComponent, /Confirmar parcelamento/u); assert.match(existingComponent, /não movimenta conta nem registra pagamento/iu);
+});
