@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { initializeReportFromDashboard, type DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import type { AnalyticsBreakdown, AnalyticsComparison, AnalyticsDetail, AnalyticsResponse, AnalyticsTrend } from "@/lib/finance-analytics-types";
 import { applyReportCategoryFilter, applyReportSubcategoryFilter, reportMovementMode } from "@/lib/finance-ui-rules.mjs";
@@ -306,7 +307,7 @@ function EmptyBlock({ icon: Icon, title, text, compact = false }: { icon: typeof
 }
 
 function ReportsSkeleton({ selection, onSelection }: { selection: FinancePeriodSelection; onSelection: (value: FinancePeriodSelection) => void }) {
-  return <section className="space-y-5"><div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between"><div><div className="h-4 w-40 animate-pulse rounded bg-[#dfe7e4]" /><div className="mt-3 h-8 w-64 animate-pulse rounded bg-[#dfe7e4]" /></div><div className="w-full xl:max-w-3xl"><FinancePeriodFilter value={selection} onChange={onSelection} disabled /></div></div><div className="h-48 animate-pulse rounded-[24px] bg-[#dfe7e4]" /><div className="grid gap-3 md:grid-cols-3">{Array.from({ length: 3 }, (_, index) => <div key={index} className="h-48 animate-pulse rounded-[22px] bg-[#dfe7e4]" />)}</div><div className="h-96 animate-pulse rounded-[24px] bg-[#dfe7e4]" /></section>;
+  return <section className="space-y-5"><div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between"><div><Skeleton className="h-4 w-40" /><Skeleton className="mt-3 h-8 w-64" /></div><div className="w-full xl:max-w-3xl"><FinancePeriodFilter value={selection} onChange={onSelection} disabled /></div></div><Skeleton className="h-48 rounded-[24px]" /><div className="grid gap-3 md:grid-cols-3">{Array.from({ length: 3 }, (_, index) => <Skeleton key={index} className="h-48 rounded-[22px]" />)}</div><Skeleton className="h-96 rounded-[24px]" /></section>;
 }
 
 function ReportsFailure({ selection, onSelection, message, onRetry }: { selection: FinancePeriodSelection; onSelection: (value: FinancePeriodSelection) => void; message: string; onRetry: () => void }) {
