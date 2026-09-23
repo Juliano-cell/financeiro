@@ -40,12 +40,21 @@ const lifecycleUrl = `data:text/javascript,${encodeURIComponent(compiled)}`;
 const extraPrimitives = `${primitives}\nexport function Checkbox({children,...props}) { return createElement("div", props, children); }`;
 let compiledAdvanced = ts.transpileModule(advanced, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 compiledAdvanced = compiledAdvanced.replace(/from "([^"]+)"/gu, (_, specifier) => {
-  const url = specifier.startsWith("@/components/") ? `data:text/javascript,${encodeURIComponent(extraPrimitives)}` : specifier === "@/app/invoice-lifecycle" ? lifecycleUrl : specifier === "@/app/card-onboarding-dialog" ? "data:text/javascript,export function CardOnboardingAction(){return null}" : specifier === "@/app/card-existing-installment-dialog" ? "data:text/javascript,export function CardExistingInstallmentAction(){return null}" : specifier.startsWith("@/lib/") ? new URL(`../lib/${specifier.slice(6)}`, import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
+  const url = specifier.startsWith("@/components/") ? `data:text/javascript,${encodeURIComponent(extraPrimitives)}` : specifier === "@/app/invoice-lifecycle" ? lifecycleUrl : specifier === "@/app/ui-preferences" ? "data:text/javascript,export function useUiPreferences(){return {valuesHidden:false}}" : specifier === "@/app/card-onboarding-dialog" ? "data:text/javascript,export function CardOnboardingAction(){return null}" : specifier === "@/app/card-existing-installment-dialog" ? "data:text/javascript,export function CardExistingInstallmentAction(){return null}" : specifier.startsWith("@/lib/") ? new URL(`../lib/${specifier.slice(6)}`, import.meta.url).href : specifier === "sonner" ? "data:text/javascript,export const toast={success(){},info(){}}" : import.meta.resolve(specifier);
   return `from ${JSON.stringify(url)}`;
 });
 const { AdvancedFinanceView, advancedApi: realAdvancedApi } = await import(`data:text/javascript,${encodeURIComponent(compiledAdvanced)}`);
 const renderInvoice = (value) => renderToStaticMarkup(createElement(InvoiceLifecycle, { invoice: value, accounts, onChanged: async () => {} }));
 const renderDialog = (editing) => renderToStaticMarkup(createElement(InvoiceOperationDialog, { invoice: reopened, accounts, editing, onClose() {}, onInvalidate() {}, onChanged: async () => {} }));
+
+test("lista real de vencimentos identifica parcela sem alterar a descrição", () => {
+  const bill = { id: "bill-installment", description: "Móveis", amountCents: 166667, dueDate: "2099-01-15", categoryId: "category", subcategoryId: null, recurrence: "none", recurrenceSeriesId: null, recurrenceEndDate: null, status: "pending", displayStatus: "pending", accountId: null, notes: null, payment: null, installment: { seriesId: "series", number: 2, count: 3, originalTotalCents: 500000, firstDueDate: "2098-12-15" } };
+  const data = { selectedMonth: "2099-01", cards: [], invoices: [], installments: [], bills: [bill], notificationSettings: { enabled: false, offsets: [] }, summary: { availableCents: 0, incomeCents: 0, expenseCents: 0, paidBillsCents: 0, pendingBillsCents: bill.amountCents, cardCents: 0, installmentCents: 0, commitmentsCents: bill.amountCents, projectedCents: -bill.amountCents } };
+  const html = renderToStaticMarkup(createElement(AdvancedFinanceView, { view: "bills", data, accounts: [], categories: [{ id: "category", name: "Casa", type: "expense", isActive: true, subcategories: [] }], onChanged: async () => {} }));
+  assert.match(html, /Móveis/);
+  assert.match(html, /Parcela 2\/3/);
+  assert.match(html, /Parcelada/);
+});
 
 for (const [status, label] of [["unpaid", "Em aberto"], ["partial", "Parcialmente paga"], ["settled", "Quitada"]]) {
   test(`payment status ${status} exibe ${label}`, () => assert.equal(paymentStatusLabel(status), label));

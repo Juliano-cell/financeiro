@@ -4,8 +4,9 @@ import { and, asc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { bills, cardImportBatches, cardInstallments, cardInvoiceAdjustments, cardInvoices, cardOpeningBalanceAllocations, cardPurchaseImportMetadata, cardPurchases, creditCards, householdMembers, notificationPreferences, transactions } from "@/db/schema";
+import { billInstallmentOccurrences, billInstallmentSeries, bills, cardImportBatches, cardInstallments, cardInvoiceAdjustments, cardInvoices, cardOpeningBalanceAllocations, cardPurchaseImportMetadata, cardPurchases, creditCards, householdMembers, notificationPreferences, transactions } from "@/db/schema";
 import { BillServiceError, cancelBillOccurrence, cancelRecurringBillSeries, createBill, payBill, undoBillPayment, updateBillOccurrence, updateRecurringBillSeries } from "@/lib/bill-service";
+import { BillInstallmentServiceError, createBillInstallmentSeries } from "@/lib/bill-installment-service";
 import { addMonths, buildInstallmentPlan, simulatePurchase } from "@/lib/finance-rules.mjs";
 import { createCardPurchase, FinanceValidationError } from "@/lib/finance-service";
 import { getCurrentAccountBalances } from "@/lib/finance-analytics-service";
@@ -65,7 +66,7 @@ export async function GET(request: Request) {
   const selectedMonth = new URL(request.url).searchParams.get("month") ?? today.slice(0, 7);
   if (!monthSchema.safeParse(selectedMonth).success) return NextResponse.json({ error: "Mês inválido." }, { status: 400 });
   const { db, d1, householdId } = current;
-  const [cardRows, purchaseRows, invoiceRows, installmentRows, importMetadataRows, importBatchRows, adjustmentRows, allocationRows, billRows, transactionRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
+  const [cardRows, purchaseRows, invoiceRows, installmentRows, importMetadataRows, importBatchRows, adjustmentRows, allocationRows, billInstallmentSeriesRows, billInstallmentOccurrenceRows, billRows, transactionRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
     db.select().from(creditCards).where(eq(creditCards.householdId, householdId)).orderBy(asc(creditCards.name)),
     db.select().from(cardPurchases).where(eq(cardPurchases.householdId, householdId)),
     db.select().from(cardInvoices).where(eq(cardInvoices.householdId, householdId)),
@@ -74,6 +75,8 @@ export async function GET(request: Request) {
     db.select().from(cardImportBatches).where(eq(cardImportBatches.householdId, householdId)),
     db.select().from(cardInvoiceAdjustments).where(eq(cardInvoiceAdjustments.householdId, householdId)),
     db.select().from(cardOpeningBalanceAllocations).where(eq(cardOpeningBalanceAllocations.householdId, householdId)),
+    db.select().from(billInstallmentSeries).where(eq(billInstallmentSeries.householdId, householdId)),
+    db.select().from(billInstallmentOccurrences).where(eq(billInstallmentOccurrences.householdId, householdId)),
     db.select().from(bills).where(eq(bills.householdId, householdId)).orderBy(asc(bills.dueDate)),
     db.select().from(transactions).where(eq(transactions.householdId, householdId)),
     db.select().from(notificationPreferences).where(eq(notificationPreferences.householdId, householdId)),
@@ -125,6 +128,22 @@ export async function GET(request: Request) {
   if (inconsistentBillPayment) {
     return NextResponse.json({ error: "Não foi possível exibir os vencimentos porque um pagamento está inconsistente." }, { status: 409, headers: privateHeaders });
   }
+  const billInstallmentSeriesById = new Map(billInstallmentSeriesRows.map((series) => [series.id, series]));
+  const billInstallmentOccurrenceByBillId = new Map(billInstallmentOccurrenceRows.map((occurrence) => [occurrence.billId, occurrence]));
+  let inconsistentBillInstallment = false;
+  const billsWithInstallments = billsWithPayments.map((bill) => {
+    const occurrence = billInstallmentOccurrenceByBillId.get(bill.id);
+    if (!occurrence) return { ...bill, installment: null };
+    const series = billInstallmentSeriesById.get(occurrence.seriesId);
+    if (!series) {
+      inconsistentBillInstallment = true;
+      return { ...bill, installment: null };
+    }
+    return { ...bill, installment: { seriesId: series.id, number: occurrence.installmentNumber, count: series.installmentCount, originalTotalCents: series.totalAmountCents, firstDueDate: series.firstDueDate } };
+  });
+  if (inconsistentBillInstallment) {
+    return NextResponse.json({ error: "Não foi possível exibir os vencimentos porque uma série parcelada está inconsistente." }, { status: 409, headers: privateHeaders });
+  }
   const cards = cardRows.map((card) => {
     const activeParts = installments.filter((item) => item.card?.id === card.id && item.status !== "cancelled" && (stateById.get(item.invoiceId)?.remainingCents ?? 0) > 0 && item.purchase?.status === "active");
     const usedCents = invoiceStates.filter((invoice) => invoice.cardId === card.id).reduce((sum, invoice) => sum + invoice.remainingCents, 0);
@@ -134,7 +153,7 @@ export async function GET(request: Request) {
   const availableCents = balanceRows.filter((item) => item.isActive).reduce((sum, item) => sum + item.currentBalanceCents, 0);
   const monthTransactions = transactionRows.filter((item) => item.status === "confirmed" && item.transactionDate.startsWith(selectedMonth));
   const monthInstallments = installments.filter((item) => item.invoice?.referenceMonth === selectedMonth && item.status !== "cancelled" && item.purchase?.status === "active");
-  const monthBills = billsWithPayments.filter((item) => item.dueDate.startsWith(selectedMonth) && item.status !== "cancelled");
+  const monthBills = billsWithInstallments.filter((item) => item.dueDate.startsWith(selectedMonth) && item.status !== "cancelled");
   const pendingBillsCents = monthBills.filter((item) => item.status === "pending").reduce((sum, item) => sum + item.amountCents, 0);
   const incomeCents = monthTransactions.filter((item) => item.type === "income").reduce((sum, item) => sum + item.amountCents, 0);
   const cashExpenseCents = monthTransactions.filter((item) => item.type === "expense").reduce((sum, item) => sum + item.amountCents, 0);
@@ -142,7 +161,7 @@ export async function GET(request: Request) {
   const pendingCardCents = invoiceStates.filter((item) => item.referenceMonth === selectedMonth).reduce((sum, item) => sum + item.remainingCents, 0);
   const preference = preferenceRows[0]; let notificationOffsets = [7, 3, 1, 0, -1]; try { if (preference) notificationOffsets = JSON.parse(preference.offsetsJson); } catch { /* defaults */ }
   // paidBillsCents is the amount actually paid for bills due in the selected month; expenseCents remains grouped by the transaction date.
-  return NextResponse.json({ selectedMonth, cards, purchases: purchaseRows, invoices, installments, bills: billsWithPayments.map((bill) => ({ ...bill, displayStatus: bill.status === "pending" && bill.dueDate < today ? "overdue" : bill.status })), notificationSettings: { enabled: preference?.enabled ?? true, offsets: notificationOffsets }, summary: { availableCents, incomeCents, expenseCents: cashExpenseCents + cardExpenseCents, paidBillsCents: monthBills.filter((item) => item.status === "paid").reduce((sum, item) => sum + (item.payment?.paidAmountCents ?? 0), 0), pendingBillsCents, cardCents: cardExpenseCents, pendingCardCents, installmentCents: monthInstallments.filter((item) => item.installmentCount > 1).reduce((sum, item) => sum + item.amountCents, 0), commitmentsCents: pendingBillsCents + pendingCardCents, projectedCents: availableCents + (selectedMonth > today.slice(0, 7) ? incomeCents : 0) - pendingBillsCents - pendingCardCents } }, { headers: privateHeaders });
+  return NextResponse.json({ selectedMonth, cards, purchases: purchaseRows, invoices, installments, bills: billsWithInstallments.map((bill) => ({ ...bill, displayStatus: bill.status === "pending" && bill.dueDate < today ? "overdue" : bill.status })), notificationSettings: { enabled: preference?.enabled ?? true, offsets: notificationOffsets }, summary: { availableCents, incomeCents, expenseCents: cashExpenseCents + cardExpenseCents, paidBillsCents: monthBills.filter((item) => item.status === "paid").reduce((sum, item) => sum + (item.payment?.paidAmountCents ?? 0), 0), pendingBillsCents, cardCents: cardExpenseCents, pendingCardCents, installmentCents: monthInstallments.filter((item) => item.installmentCount > 1).reduce((sum, item) => sum + item.amountCents, 0), commitmentsCents: pendingBillsCents + pendingCardCents, projectedCents: availableCents + (selectedMonth > today.slice(0, 7) ? incomeCents : 0) - pendingBillsCents - pendingCardCents } }, { headers: privateHeaders });
 }
 
 export async function POST(request: Request) {
@@ -203,6 +222,25 @@ export async function POST(request: Request) {
     if (action === "get_invoice_payment_history") {
       const parsed = z.object({ invoiceId: id }).parse(body);
       return NextResponse.json(await getInvoicePaymentHistory(parsed.invoiceId, { d1, householdId, userId: user.id, timestamp }), { headers: privateHeaders });
+    }
+    if (action === "create_installment_bill_series") {
+      if (!env.DB) throw new Error("D1 binding indisponível");
+      const parsed = z.object({
+        action: z.literal("create_installment_bill_series"),
+        operationId: operationKey,
+        description: shortText,
+        totalAmountCents: money,
+        installmentCount: z.number().int().min(2).max(120),
+        firstDueDate: dateSchema,
+        categoryId: id,
+        subcategoryId: id.nullable().optional(),
+        accountId: id.nullable().optional(),
+        notes: z.string().max(500).nullable().optional(),
+      }).strict().superRefine((value, issue) => {
+        if (value.totalAmountCents < value.installmentCount) issue.addIssue({ code: z.ZodIssueCode.custom, path: ["totalAmountCents"], message: "O valor total é insuficiente para a quantidade de parcelas." });
+      }).parse(body);
+      const result = await createBillInstallmentSeries(parsed, { d1: env.DB, householdId, userId: user.id, timestamp });
+      return NextResponse.json({ seriesId: result.seriesId, billIds: result.billIds, plan: result.plan, replayed: result.replayed }, { status: result.replayed ? 200 : 201, headers: privateHeaders });
     }
     if (action === "create_bill") {
       if (!env.DB) throw new Error("D1 binding indisponível");
@@ -265,6 +303,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Ação inválida." }, { status: 400 });
   } catch (error) {
     if (error instanceof InvoiceServiceError) return NextResponse.json({ error: error.message, code: error.code }, { status: error.status, headers: privateHeaders });
+    if (error instanceof BillInstallmentServiceError) return NextResponse.json({ error: error.message, ...(error.code ? { code: error.code } : {}) }, { status: error.status, headers: privateHeaders });
     if (error instanceof BillServiceError) return NextResponse.json({ error: error.message, ...(error.code ? { code: error.code } : {}) }, { status: error.status });
     if (error instanceof FinanceValidationError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof CardServiceError) return NextResponse.json({ error: error.message, code: error.code }, { status: error.status, headers: privateHeaders });

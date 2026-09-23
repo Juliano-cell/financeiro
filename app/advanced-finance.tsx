@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, CalendarClock, ChevronLeft, ChevronRight, CreditCard, Pencil, Link2, Plus, Receipt, RotateCcw, Search, Sparkles, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,8 @@ import { CardOnboardingAction } from "@/app/card-onboarding-dialog";
 import { CardExistingInstallmentAction } from "@/app/card-existing-installment-dialog";
 import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
 import { billPaymentAdjustment, formatBillPaymentInput, parseBillPaymentCents } from "@/lib/bill-payment.mjs";
+import { buildBillInstallmentPlan } from "@/lib/bill-installment-rules.mjs";
+import { useUiPreferences } from "@/app/ui-preferences";
 
 export type AdvancedView = "cards" | "installments" | "bills" | "simulator" | "settings";
 type Account = { id: string; name: string; currentBalanceCents: number; isActive: boolean };
@@ -26,7 +28,9 @@ type Card = { id: string; name: string; institution: string; holder: string; lim
 type Installment = { id: string; purchaseId: string; invoiceId: string; installmentNumber: number; installmentCount: number; amountCents: number; status: string; purchase?: { description: string; status: string }; invoice?: { referenceMonth: string; dueDate: string; status: string }; card?: { name: string } };
 type Invoice = CanonicalInvoice & { status: "open" | "closed" | "paid"; totalCents: number; installments: Installment[]; openingBalance: { originalCents: number; openingCents: number; initialStateInstallmentsCents: number; allocatedCents: number; residualCents: number; identifiedCents: number } | null };
 type BillPayment = { transactionId: string; paidAmountCents: number; paidOn: string; accountId: string; adjustmentAmountCents: number; adjustmentType: "normal" | "surcharge" | "discount" };
-type Bill = { id: string; description: string; amountCents: number; dueDate: string; categoryId: string | null; subcategoryId: string | null; recurrence: "none" | "monthly"; recurrenceSeriesId: string | null; recurrenceEndDate: string | null; status: "pending" | "paid" | "cancelled"; displayStatus: "pending" | "paid" | "cancelled" | "overdue"; accountId: string | null; notes: string | null; payment: BillPayment | null };
+type BillInstallment = { seriesId: string; number: number; count: number; originalTotalCents: number; firstDueDate: string };
+type Bill = { id: string; description: string; amountCents: number; dueDate: string; categoryId: string | null; subcategoryId: string | null; recurrence: "none" | "monthly"; recurrenceSeriesId: string | null; recurrenceEndDate: string | null; status: "pending" | "paid" | "cancelled"; displayStatus: "pending" | "paid" | "cancelled" | "overdue"; accountId: string | null; notes: string | null; payment: BillPayment | null; installment: BillInstallment | null };
+type BillCreationMode = "single" | "recurring" | "installment";
 type BillStatusFilter = "pending" | "overdue" | "paid" | "cancelled" | "all";
 type PaidBillDateView = "due" | "payment";
 type NotificationPreference = { exists: boolean; channel: "telegram"; enabled: boolean; billDueTomorrow: boolean; billDueToday: boolean; billOverdue: boolean; preferredLocalTime: string; timezone: "America/Sao_Paulo" };
@@ -229,9 +233,10 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
       const status = item.status === "paid" ? "Paga" : item.status === "cancelled" ? "Cancelada" : timing === "overdue" ? "Atrasada" : timing === "today" ? "Vence hoje" : "Pendente";
       const relative = item.status === "pending" ? billRelativeDueLabel(item.dueDate, today) : null;
       const classification = item.subcategoryId ? `${categoryName(item)} · ${subcategoryName(item)}` : categoryName(item);
+      const kind = item.installment ? "Parcelada" : item.recurrence === "monthly" ? "Mensal" : "Avulsa";
       return <article key={item.id} className={`min-w-0 rounded-2xl border bg-card p-4 ${timing === "overdue" ? "border-destructive/30" : timing === "today" ? "border-chart-2/40" : ""} ${item.status === "cancelled" ? "opacity-70" : ""}`}>
         <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0 flex-1"><div className="flex min-w-0 flex-wrap items-center gap-2"><h4 className="min-w-0 break-words font-medium">{item.description}</h4><Badge variant={item.status === "cancelled" || timing === "overdue" ? "destructive" : item.status === "paid" ? "secondary" : "outline"} className={timing === "today" ? "border-chart-2/40 bg-chart-2/10 text-chart-2" : undefined}>{status}</Badge></div><p className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5 text-sm"><span className={timing === "overdue" ? "font-semibold text-destructive" : timing === "today" ? "font-semibold text-chart-2" : "text-foreground"}>{relative ?? `Vencimento em ${formatBillDate(item.dueDate)}`}</span>{relative && <><span className="text-muted-foreground" aria-hidden="true">·</span><span className="text-muted-foreground">{formatBillDate(item.dueDate)}</span></>}</p>{timing === "overdue" && <p className="mt-1 text-xs font-medium text-muted-foreground">Competência: {monthLabel(item.dueDate.slice(0, 7))}</p>}<p className="mt-1.5 break-words text-xs text-muted-foreground">{classification} · {item.recurrence === "monthly" ? "Mensal" : "Avulsa"}</p><p className="mt-1 break-words text-xs text-muted-foreground">{statusFilter === "paid" && paidDateView === "payment" ? "Conta do pagamento" : "Conta"}: {accountName(item)}</p></div>
+          <div className="min-w-0 flex-1"><div className="flex min-w-0 flex-wrap items-center gap-2"><h4 className="min-w-0 break-words font-medium">{item.description}</h4>{item.installment && <Badge variant="outline">Parcela {item.installment.number}/{item.installment.count}</Badge>}<Badge variant={item.status === "cancelled" || timing === "overdue" ? "destructive" : item.status === "paid" ? "secondary" : "outline"} className={timing === "today" ? "border-chart-2/40 bg-chart-2/10 text-chart-2" : undefined}>{status}</Badge></div><p className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5 text-sm"><span className={timing === "overdue" ? "font-semibold text-destructive" : timing === "today" ? "font-semibold text-chart-2" : "text-foreground"}>{relative ?? `Vencimento em ${formatBillDate(item.dueDate)}`}</span>{relative && <><span className="text-muted-foreground" aria-hidden="true">·</span><span className="text-muted-foreground">{formatBillDate(item.dueDate)}</span></>}</p>{timing === "overdue" && <p className="mt-1 text-xs font-medium text-muted-foreground">Competência: {monthLabel(item.dueDate.slice(0, 7))}</p>}<p className="mt-1.5 break-words text-xs text-muted-foreground">{classification} · {kind}</p><p className="mt-1 break-words text-xs text-muted-foreground">{statusFilter === "paid" && paidDateView === "payment" ? "Conta do pagamento" : "Conta"}: {accountName(item)}</p></div>
           <div className="sm:max-w-[40%] sm:text-right"><span className="block text-xs text-muted-foreground">{item.payment ? "Valor pago" : "Valor previsto"}</span><strong className="mt-1 block break-words text-xl tabular-nums">{brl(item.payment?.paidAmountCents ?? item.amountCents)}</strong></div>
         </div>
         {item.payment && <dl className="mt-3 grid gap-2 rounded-xl bg-muted p-3 text-sm sm:grid-cols-3"><BillDetail label="Valor previsto" value={brl(item.amountCents)} /><BillDetail label="Pago em" value={formatBillDate(item.payment.paidOn)} />{item.payment.adjustmentType === "normal" ? <BillDetail label="Ajuste" value="Sem ajuste" /> : <BillDetail label={item.payment.adjustmentType === "surcharge" ? "Acréscimo / juros" : "Desconto"} value={`${item.payment.adjustmentType === "surcharge" ? "+ " : ""}${brl(Math.abs(item.payment.adjustmentAmountCents))}`} />}</dl>}
@@ -251,61 +256,97 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
 }
 
 function BillEditorDialog({ open, item, bills, accounts, categories, onOpenChange, onChanged }: { open: boolean; item: Bill | null; bills: Bill[]; accounts: Account[]; categories: Category[]; onOpenChange: (open: boolean) => void; onChanged: () => Promise<void> }) {
+  const { valuesHidden } = useUiPreferences();
   const availableCategories = activeBillCategories(categories) as Category[];
   const initialCategoryId = availableCategories.some((category) => category.id === item?.categoryId) ? item?.categoryId ?? null : null;
   const initialSubcategories = activeBillSubcategories(categories, initialCategoryId) as Subcategory[];
   const [classification, setClassification] = useState({ categoryId: initialCategoryId, subcategoryId: initialSubcategories.some((subcategory) => subcategory.id === item?.subcategoryId) ? item?.subcategoryId ?? null : null });
   const [accountId, setAccountId] = useState(accounts.some((account) => account.id === item?.accountId && account.isActive) ? item?.accountId ?? null : null);
-  const [recurrence, setRecurrence] = useState<"none" | "monthly">(item?.recurrence ?? "none");
+  const [creationMode, setCreationMode] = useState<BillCreationMode>(item?.recurrence === "monthly" ? "recurring" : "single");
+  const [amount, setAmount] = useState(item ? (item.amountCents / 100).toFixed(2).replace(".", ",") : "");
+  const [dueDate, setDueDate] = useState(item?.dueDate ?? "");
+  const [installmentCount, setInstallmentCount] = useState("2");
+  const [operationId, setOperationId] = useState(() => crypto.randomUUID());
   const [scope, setScope] = useState<"occurrence" | "future" | "selected">("occurrence");
   const [selectedOccurrenceIds, setSelectedOccurrenceIds] = useState<string[]>(item?.recurrenceSeriesId ? [item.id] : []);
   const [changeSelectedDueDate, setChangeSelectedDueDate] = useState(false);
   const [changeFutureDueDate, setChangeFutureDueDate] = useState(false);
   const [changeFutureRecurrenceEnd, setChangeFutureRecurrenceEnd] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const submitLock = useRef(false);
   const recurringEdit = Boolean(item?.recurrenceSeriesId);
   const seriesOccurrences = recurringBillOccurrences(bills, item?.recurrenceSeriesId) as Bill[];
   const eligibleIds = eligibleRecurringBillIds(bills, item?.recurrenceSeriesId) as string[];
   const futureIds = eligibleRecurringBillIds(bills, item?.recurrenceSeriesId, item?.dueDate) as string[];
   const selectedIds = normalizeRecurringBillSelection(selectedOccurrenceIds, eligibleIds) as string[];
   const affectedCount = scope === "occurrence" ? 1 : scope === "future" ? futureIds.length : selectedIds.length;
+  let preview: Array<{ installmentNumber: number; installmentCount: number; amountCents: number; dueDate: string }> = [];
+  let previewError = "";
+  let previewTotalCents = 0;
+  const previewHasInput = amount.trim().length > 0 && installmentCount.trim().length > 0 && dueDate.length > 0;
+  if (!item && creationMode === "installment" && previewHasInput) {
+    try {
+      previewTotalCents = cents(amount);
+      preview = buildBillInstallmentPlan({ description: "Prévia", totalAmountCents: previewTotalCents, installmentCount: Number(installmentCount), firstDueDate: dueDate, categoryId: "preview", subcategoryId: null, accountId: null, notes: null });
+    } catch (error) { previewError = error instanceof Error ? error.message : "Não foi possível calcular a prévia."; }
+  }
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (submitLock.current) return;
     const classificationMessage = billClassificationError(classification, categories);
-    if (classificationMessage) { toast.error(classificationMessage); return; }
+    if (classificationMessage) { setSubmitError(classificationMessage); toast.error(classificationMessage); return; }
     const form = new FormData(event.currentTarget);
+    if (!item && creationMode === "installment" && (!previewHasInput || previewError || preview.length === 0)) {
+      const message = previewError || "Preencha valor total, quantidade e primeiro vencimento para conferir o parcelamento.";
+      setSubmitError(message); toast.error(message); return;
+    }
+    submitLock.current = true;
     setBusy(true);
+    setSubmitError(null);
     let completed = false;
     try {
       if (!item) {
-        await advancedApi({ action: "create_bill", description: form.get("description"), amountCents: cents(form.get("amount")), dueDate: form.get("dueDate"), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, recurrence, recurrenceEndDate: recurrence === "monthly" ? form.get("recurrenceEndDate") || null : null, notes: form.get("notes") || null });
-        toast.success("Vencimento criado.");
+        if (creationMode === "installment") {
+          await advancedApi({ action: "create_installment_bill_series", operationId, description: form.get("description"), totalAmountCents: previewTotalCents, installmentCount: Number(installmentCount), firstDueDate: dueDate, categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, notes: form.get("notes") || null });
+        } else {
+          const recurrence = creationMode === "recurring" ? "monthly" : "none";
+          await advancedApi({ action: "create_bill", description: form.get("description"), amountCents: cents(amount), dueDate, categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, recurrence, recurrenceEndDate: recurrence === "monthly" ? form.get("recurrenceEndDate") || null : null, notes: form.get("notes") || null });
+        }
       } else if (scope !== "occurrence" && item.recurrenceSeriesId) {
         const occurrenceIds = scope === "future" ? futureIds : selectedIds;
         const calendar = buildRecurringBillCalendarPayload({ scope, changeDueDate: scope === "future" ? changeFutureDueDate : changeSelectedDueDate, changeRecurrenceEnd: scope === "future" && changeFutureRecurrenceEnd, dayOfMonth: form.get("dayOfMonth"), endsOn: form.get("recurrenceEndDate") });
-        await advancedApi({ action: "update_recurring_bill_series", id: item.recurrenceSeriesId, anchorBillId: item.id, scope, occurrenceIds, ...calendar, description: form.get("description"), amountCents: cents(form.get("amount")), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, notes: form.get("notes") || null });
-        toast.success(`${occurrenceIds.length} vencimento(s) atualizado(s).`);
+        await advancedApi({ action: "update_recurring_bill_series", id: item.recurrenceSeriesId, anchorBillId: item.id, scope, occurrenceIds, ...calendar, description: form.get("description"), amountCents: cents(amount), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, notes: form.get("notes") || null });
       } else {
-        await advancedApi({ action: "update_bill_occurrence", id: item.id, description: form.get("description"), amountCents: cents(form.get("amount")), dueDate: form.get("dueDate"), categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, notes: form.get("notes") || null });
-        toast.success("Vencimento atualizado.");
+        await advancedApi({ action: "update_bill_occurrence", id: item.id, description: form.get("description"), amountCents: cents(amount), dueDate, categoryId: classification.categoryId, subcategoryId: classification.subcategoryId, accountId, notes: form.get("notes") || null });
       }
       await onChanged();
+      if (!item && creationMode === "installment") setOperationId(crypto.randomUUID());
+      toast.success(!item ? creationMode === "installment" ? `${preview.length} parcelas criadas.` : "Vencimento criado." : scope !== "occurrence" && item.recurrenceSeriesId ? `${scope === "future" ? futureIds.length : selectedIds.length} vencimento(s) atualizado(s).` : "Vencimento atualizado.");
       completed = true;
-    } catch (error) { toast.error(error instanceof Error ? error.message : "Não foi possível salvar o vencimento."); }
-    finally { setBusy(false); if (completed) onOpenChange(false); }
+    } catch (error) {
+      const message = error instanceof AdvancedApiError && error.code === "BILL_INSTALLMENT_IDEMPOTENCY_CONFLICT" ? "Esta tentativa já foi usada com outros dados. Revise os campos ou inicie uma nova criação." : error instanceof Error ? error.message : "Não foi possível salvar o vencimento.";
+      setSubmitError(message); toast.error(message);
+    }
+    finally { submitLock.current = false; setBusy(false); if (completed) onOpenChange(false); }
   };
-  return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}><DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-xl"><DialogHeader><DialogTitle>{item ? "Editar vencimento" : "Novo vencimento"}</DialogTitle><DialogDescription>{item ? "Apenas vencimentos pendentes podem ter dados financeiros alterados." : "Cadastre a classificação e escolha uma conta ou deixe para definir no pagamento."}</DialogDescription></DialogHeader><form onSubmit={submit} className="grid gap-4 sm:grid-cols-2">
+  return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}><DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>{item ? "Editar vencimento" : "Novo vencimento"}</DialogTitle><DialogDescription>{item ? "Apenas vencimentos pendentes podem ter dados financeiros alterados." : "Cadastre a classificação e escolha uma conta ou deixe para definir no pagamento."}</DialogDescription></DialogHeader><form onSubmit={submit} className="grid min-w-0 gap-4 sm:grid-cols-2">
+    {!item && <fieldset className="sm:col-span-2"><legend className="text-sm font-medium">Tipo da conta</legend><div className="mt-2 grid grid-cols-3 gap-2" role="group" aria-label="Tipo da conta">{([{"value":"single","label":"Única"},{"value":"recurring","label":"Recorrente"},{"value":"installment","label":"Parcelada"}] as Array<{ value: BillCreationMode; label: string }>).map((option) => <Button key={option.value} type="button" variant={creationMode === option.value ? "default" : "outline"} aria-pressed={creationMode === option.value} disabled={busy} className="min-w-0 px-2" onClick={() => { setCreationMode(option.value); setSubmitError(null); }}>{option.label}</Button>)}</div></fieldset>}
+    {item?.installment && <div className="sm:col-span-2 rounded-xl border bg-muted/50 p-3 text-sm"><p className="font-medium">Editando somente a parcela {item.installment.number}/{item.installment.count}</p><p className="mt-1 text-muted-foreground">As demais parcelas e o valor total original da série não serão recalculados.</p></div>}
     {recurringEdit && <div className="sm:col-span-2"><Label>Quais vencimentos você deseja alterar?</Label><Select value={scope} onValueChange={(value) => setScope(value as "occurrence" | "future" | "selected")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="occurrence">Somente este vencimento</SelectItem><SelectItem value="future">Este e os próximos vencimentos pendentes</SelectItem><SelectItem value="selected">Escolher vencimentos</SelectItem></SelectContent></Select></div>}
-    <div className="sm:col-span-2"><Field name="description" label="Descrição" defaultValue={item?.description ?? ""} required /></div><Field name="amount" label="Valor (R$)" defaultValue={item ? (item.amountCents / 100).toFixed(2).replace(".", ",") : ""} inputMode="decimal" required />
-    {scope === "future" && recurringEdit ? changeFutureDueDate ? <Field name="dayOfMonth" label="Novo dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : null : scope === "selected" && recurringEdit ? changeSelectedDueDate ? <Field name="dayOfMonth" label="Novo dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : null : <Field name="dueDate" label="Vencimento" type="date" defaultValue={item?.dueDate} required />}
+    <div className="sm:col-span-2"><Field name="description" label="Descrição" defaultValue={item?.description ?? ""} required /></div><Field name="amount" label={!item && creationMode === "installment" ? "Valor total (R$)" : "Valor (R$)"} value={amount} onChange={(event) => { setAmount(event.target.value); setSubmitError(null); }} inputMode="decimal" required />
+    {!item && creationMode === "installment" && <Field name="installmentCount" label="Quantidade de parcelas" type="number" min={2} max={120} step={1} value={installmentCount} onChange={(event) => { setInstallmentCount(event.target.value); setSubmitError(null); }} required />}
+    {scope === "future" && recurringEdit ? changeFutureDueDate ? <Field name="dayOfMonth" label="Novo dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : null : scope === "selected" && recurringEdit ? changeSelectedDueDate ? <Field name="dayOfMonth" label="Novo dia do vencimento" type="number" min={1} max={31} defaultValue={Number(item?.dueDate.slice(8))} required /> : null : <Field name="dueDate" label={!item && creationMode === "installment" ? "Primeiro vencimento" : "Vencimento"} type="date" value={dueDate} onChange={(event) => { setDueDate(event.target.value); setSubmitError(null); }} required />}
     <BillClassificationFields categories={availableCategories} classification={classification} onChange={setClassification} />
     <div><Label>Conta para pagamento</Label><Select value={accountId ?? "none"} onValueChange={(value) => setAccountId(normalizeBillAccountId(value))}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">Definir ao pagar</SelectItem>{accounts.filter((account) => account.isActive).map((account) => <SelectItem key={account.id} value={account.id}>{account.name}</SelectItem>)}</SelectContent></Select></div>
-    {!item && <div><Label>Recorrência</Label><Select value={recurrence} onValueChange={(value) => setRecurrence(value as "none" | "monthly")}><SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">Não recorrente</SelectItem><SelectItem value="monthly">Todo mês</SelectItem></SelectContent></Select></div>}
-    {((!item && recurrence === "monthly") || (scope === "future" && recurringEdit && changeFutureRecurrenceEnd)) && <Field name="recurrenceEndDate" label="Repetir até (opcional)" type="date" defaultValue={item?.recurrenceEndDate ?? ""} />}
+    {((!item && creationMode === "recurring") || (scope === "future" && recurringEdit && changeFutureRecurrenceEnd)) && <Field name="recurrenceEndDate" label="Repetir até (opcional)" type="date" defaultValue={item?.recurrenceEndDate ?? ""} />}
     {scope === "future" && recurringEdit && <div className="sm:col-span-2 grid gap-2 rounded-2xl border border-[#d8e1de] p-3"><label className="flex cursor-pointer items-start gap-3 rounded-xl bg-[#f4f7f5] p-3"><Checkbox checked={changeFutureDueDate} onCheckedChange={(value) => setChangeFutureDueDate(value === true)} /><span><span className="block text-sm font-medium">Alterar também o dia de vencimento</span><span className="block text-xs text-[#71837e]">Desmarcado, cada ocorrência mantém sua própria data.</span></span></label><label className="flex cursor-pointer items-start gap-3 rounded-xl bg-[#f4f7f5] p-3"><Checkbox checked={changeFutureRecurrenceEnd} onCheckedChange={(value) => setChangeFutureRecurrenceEnd(value === true)} /><span><span className="block text-sm font-medium">Alterar também a data limite da recorrência</span><span className="block text-xs text-[#71837e]">Desmarcado, o término atual da série é preservado.</span></span></label></div>}
     {scope === "selected" && recurringEdit && <div className="sm:col-span-2 rounded-2xl border border-[#d8e1de] p-3"><label className="flex cursor-pointer items-start gap-3 rounded-xl bg-[#f4f7f5] p-3"><Checkbox checked={changeSelectedDueDate} onCheckedChange={(value) => setChangeSelectedDueDate(value === true)} /><span><span className="block text-sm font-medium">Alterar também o dia do vencimento</span><span className="block text-xs text-[#71837e]">Desmarcado, cada ocorrência mantém sua própria data.</span></span></label><div className="mt-3 flex flex-wrap items-center justify-between gap-2"><div><Label>Escolher ocorrências</Label><p className="text-xs text-[#71837e]">Pagas e canceladas são exibidas apenas para contexto.</p></div><Button type="button" size="sm" variant="ghost" onClick={() => setSelectedOccurrenceIds(selectedIds.length === eligibleIds.length ? [] : eligibleIds)}>{selectedIds.length === eligibleIds.length ? "Desmarcar todos" : "Selecionar todos os elegíveis"}</Button></div><div className="mt-3 max-h-56 space-y-2 overflow-y-auto pr-1">{seriesOccurrences.map((occurrence) => { const eligible = occurrence.status === "pending"; const checked = selectedIds.includes(occurrence.id); const status = occurrence.status === "paid" ? "Pago" : occurrence.status === "cancelled" ? "Cancelado" : occurrence.displayStatus === "overdue" ? "Vencido · pendente" : "Pendente"; return <label key={occurrence.id} className={`flex items-center gap-3 rounded-xl border p-3 ${eligible ? "cursor-pointer bg-white" : "cursor-not-allowed bg-[#f4f7f5] opacity-65"}`}><Checkbox checked={checked} disabled={!eligible} onCheckedChange={(value) => setSelectedOccurrenceIds(toggleRecurringBillSelection(selectedIds, occurrence.id, value === true, eligibleIds))} /><span className="min-w-0 flex-1"><span className="block text-sm font-medium">{formatBillDate(occurrence.dueDate)}</span><span className="block text-xs text-[#71837e]">{brl(occurrence.amountCents)} · {status}</span></span></label>; })}</div></div>}
     {recurringEdit && <div className="sm:col-span-2 rounded-xl bg-[#edf6f3] px-3 py-2 text-sm font-medium text-[#285f56]">{affectedCount} vencimento(s) será(ão) alterado(s).</div>}
-    <div className="sm:col-span-2"><Field name="notes" label="Observação" defaultValue={item?.notes ?? ""} /></div><DialogFooter className="sm:col-span-2"><Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>Cancelar</Button><Button type="submit" disabled={busy || (scope === "selected" && selectedIds.length === 0)}>{busy ? "Salvando..." : item ? "Salvar alterações" : "Criar vencimento"}</Button></DialogFooter>
+    <div className="sm:col-span-2"><Field name="notes" label="Observação" defaultValue={item?.notes ?? ""} /></div>
+    {!item && creationMode === "installment" && <section className="min-w-0 sm:col-span-2 rounded-2xl border bg-muted/40 p-4" aria-labelledby="bill-installment-preview-title"><div className="flex min-w-0 flex-wrap items-start justify-between gap-2"><div><h3 id="bill-installment-preview-title" className="font-semibold">Parcelamento</h3><p className="text-xs text-muted-foreground">Prévia visual. O servidor recalculará o plano ao salvar.</p></div>{preview.length > 0 && <div className="text-right text-sm"><p className="text-muted-foreground">Total</p><strong className="tabular-nums">{formatFinancialCents(previewTotalCents, { hidden: valuesHidden })}</strong><p className="text-xs text-muted-foreground">{preview.length} parcelas</p></div>}</div>{!previewHasInput && <p className="mt-4 text-sm text-muted-foreground">Preencha valor total, quantidade e primeiro vencimento para visualizar as parcelas.</p>}{previewError && <p className="mt-4 text-sm text-destructive" role="alert">{previewError}</p>}{preview.length > 0 && <><div className="mt-4 max-h-64 min-w-0 space-y-2 overflow-y-auto pr-1" aria-label="Prévia das parcelas">{preview.map((installment) => <div key={installment.installmentNumber} className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-1 rounded-xl border bg-background p-3 text-sm sm:grid-cols-[auto_minmax(0,1fr)_auto]"><span className="font-medium tabular-nums">{installment.installmentNumber}/{installment.installmentCount}</span><span className="text-muted-foreground sm:text-center">{formatBillDate(installment.dueDate)}</span><strong className="col-span-2 min-w-0 break-words text-right tabular-nums sm:col-span-1">{formatFinancialCents(installment.amountCents, { hidden: valuesHidden })}</strong></div>)}</div><div className="mt-3 flex flex-wrap justify-between gap-2 border-t pt-3 text-sm"><span className="text-muted-foreground">Soma das parcelas</span><strong className="tabular-nums">{formatFinancialCents(preview.reduce((sum, installment) => sum + installment.amountCents, 0), { hidden: valuesHidden })}</strong></div></>}</section>}
+    {submitError && <p className="sm:col-span-2 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert">{submitError}</p>}
+    <DialogFooter className="sm:col-span-2"><Button type="button" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>Cancelar</Button><Button type="submit" disabled={busy || (scope === "selected" && selectedIds.length === 0)}>{busy ? "Salvando..." : item ? "Salvar alterações" : creationMode === "installment" ? "Criar parcelas" : "Criar vencimento"}</Button></DialogFooter>
   </form></DialogContent></Dialog>;
 }
 
