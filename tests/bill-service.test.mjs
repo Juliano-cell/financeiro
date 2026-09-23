@@ -112,16 +112,34 @@ function insertBill(db, ids, overrides = {}) {
   return values;
 }
 
+let paymentOperation = 0;
+function paymentInput(bill, accountId, overrides = {}) {
+  return {
+    id: bill.id,
+    accountId,
+    paidAmountCents: bill.amountCents,
+    paidOn: "2026-09-12",
+    expectedAmountCents: bill.amountCents,
+    operationId: `bill-payment-${++paymentOperation}`,
+    differenceTreatment: null,
+    ...overrides,
+  };
+}
+
 function assertBillError(status, code) {
   return (error) => error instanceof BillServiceError && error.status === status && (code === undefined || error.code === code);
 }
 
-test("route exige accountId e delega as operações críticas ao serviço", () => {
+test("route exige comando completo de pagamento e delega operações críticas ao serviço", () => {
   const route = readFileSync(new URL("../app/api/finance/advanced/route.ts", import.meta.url), "utf8");
-  assert.match(route, /z\.object\(\{ id, accountId: id \}\)/);
+  assert.match(route, /paidAmountCents: money, paidOn: dateSchema, expectedAmountCents: money, operationId: operationKey/);
+  assert.match(route, /differenceTreatment: z\.literal\("discount"\)/);
   assert.doesNotMatch(route, /parsed\.accountId \?\? bill\.accountId/);
   assert.match(route, /payBill\(parsed, \{ d1: env\.DB, householdId, userId: user\.id, timestamp \}\)/);
   assert.match(route, /undoBillPayment\(parsed\.id, \{ d1: env\.DB, householdId, userId: user\.id, timestamp \}\)/);
+  assert.match(route, /paidBillsCents: monthBills\.filter[\s\S]*item\.payment\?\.paidAmountCents/);
+  assert.match(route, /const adjustment = billPaymentAdjustment\(bill\.amountCents, transaction\.amountCents\)/);
+  assert.match(route, /payment: \{ transactionId: transaction\.id, paidAmountCents: transaction\.amountCents, paidOn: transaction\.transactionDate, accountId: transaction\.accountId, \.\.\.adjustment \}/);
   assert.match(route, /changeDueDate: z\.boolean\(\)/);
   assert.match(route, /changeRecurrenceEnd: z\.boolean\(\)/);
   assert.match(route, /dayOfMonth: z\.number\(\).*\.optional\(\)/);
@@ -181,7 +199,7 @@ test("future bill Telegram cria pending com conta nula, auditoria e consumo atô
   const audit = JSON.parse(db.prepare("SELECT new_data FROM audit_logs WHERE entity_id=?").get(result.ids[0]).new_data);
   assert.equal(audit.source.purchaseDate, "2026-09-14");
 
-  const paid = await payBill({ id: result.ids[0], accountId: a.account }, context(db, a));
+  const paid = await payBill(paymentInput({ id: result.ids[0], amountCents: 12_000 }, a.account), context(db, a));
   assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE id=? AND payment_method='conta_a_pagar'").get(paid.transactionId).total, 1);
   assert.equal(db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT count(*) total FROM financial_events WHERE payment_method='conta_a_pagar'`).get(a.household, a.household).total, 1);
   await undoBillPayment(result.ids[0], context(db, a));
@@ -236,7 +254,7 @@ test("edição valida classificação e mantém bills legadas legíveis", async 
   await assert.rejects(updateBillOccurrence({ id: pending.id, description: "Categoria trocada", amountCents: 1000, dueDate: "2026-09-21", categoryId: a.otherCategory, subcategoryId: a.subcategory }, context(db, a)), assertBillError(400));
 
   const paid = insertBill(db, a);
-  await payBill({ id: paid.id, accountId: a.account }, context(db, a));
+  await payBill(paymentInput(paid, a.account), context(db, a));
   await assert.rejects(updateBillOccurrence({ id: paid.id, description: "Alterada", amountCents: 1000, dueDate: "2026-09-21", categoryId: a.category, subcategoryId: a.subcategory }, context(db, a)), assertBillError(409));
 });
 
@@ -388,7 +406,7 @@ test("edição em série mantém pagas e canceladas intactas e não cria transa�
   const db = database();
   const a = seedHousehold(db, "a");
   const recurring = await createBill({ description: "Mensal", amountCents: 3000, dueDate: "2026-09-10", categoryId: a.category, subcategoryId: a.subcategory, accountId: null, recurrence: "monthly", recurrenceEndDate: "2026-12-10" }, context(db, a));
-  await payBill({ id: recurring.ids[1], accountId: a.account }, context(db, a));
+  await payBill(paymentInput({ id: recurring.ids[1], amountCents: 3000 }, a.account), context(db, a));
   db.prepare("UPDATE bills SET status='cancelled' WHERE id=?").run(recurring.ids[2]);
   const transactionCount = db.prepare("SELECT count(*) total FROM transactions").get().total;
   const paidPaymentId = db.prepare("SELECT payment_transaction_id FROM bills WHERE id=?").get(recurring.ids[1]).payment_transaction_id;
@@ -461,12 +479,12 @@ test("pay_bill rejeita conta ausente, inválida, inativa ou de outro household",
   const a = seedHousehold(db, "a");
   const b = seedHousehold(db, "b");
   const bill = insertBill(db, a);
-  await assert.rejects(payBill({ id: bill.id }, context(db, a)), assertBillError(400));
-  await assert.rejects(payBill({ id: bill.id, accountId: "missing" }, context(db, a)), assertBillError(400));
-  await assert.rejects(payBill({ id: bill.id, accountId: a.inactiveAccount }, context(db, a)), assertBillError(400));
-  await assert.rejects(payBill({ id: bill.id, accountId: b.account }, context(db, a)), assertBillError(400));
+  await assert.rejects(payBill(paymentInput(bill, undefined), context(db, a)), assertBillError(400));
+  await assert.rejects(payBill(paymentInput(bill, "missing"), context(db, a)), assertBillError(400));
+  await assert.rejects(payBill(paymentInput(bill, a.inactiveAccount), context(db, a)), assertBillError(400));
+  await assert.rejects(payBill(paymentInput(bill, b.account), context(db, a)), assertBillError(400));
   const foreignBill = insertBill(db, b);
-  await assert.rejects(payBill({ id: foreignBill.id, accountId: a.account }, context(db, a)), assertBillError(404));
+  await assert.rejects(payBill(paymentInput(foreignBill, a.account), context(db, a)), assertBillError(404));
 });
 
 test("somente bill pending e classificada pode ser paga", async () => {
@@ -474,18 +492,18 @@ test("somente bill pending e classificada pode ser paga", async () => {
   const a = seedHousehold(db, "a");
   const cancelled = insertBill(db, a, { status: "cancelled" });
   const legacy = insertBill(db, a, { categoryId: null, subcategoryId: null });
-  await assert.rejects(payBill({ id: cancelled.id, accountId: a.account }, context(db, a)), assertBillError(409));
-  await assert.rejects(payBill({ id: legacy.id, accountId: a.account }, context(db, a)), assertBillError(409, "BILL_CLASSIFICATION_REQUIRED"));
+  await assert.rejects(payBill(paymentInput(cancelled, a.account), context(db, a)), assertBillError(409));
+  await assert.rejects(payBill(paymentInput(legacy, a.account), context(db, a)), assertBillError(409, "BILL_CLASSIFICATION_REQUIRED"));
   const paid = insertBill(db, a);
-  await payBill({ id: paid.id, accountId: a.account }, context(db, a));
-  await assert.rejects(payBill({ id: paid.id, accountId: a.account }, context(db, a)), assertBillError(409));
+  await payBill(paymentInput(paid, a.account), context(db, a));
+  await assert.rejects(payBill(paymentInput(paid, a.account), context(db, a)), assertBillError(409));
 });
 
-test("pagamento atômico usa a conta confirmada e copia classificação e responsável", async () => {
+test("pagamento atômico usa a conta confirmada, preserva a planejada e copia classificação e responsável", async () => {
   const db = database();
   const a = seedHousehold(db, "a");
   const bill = insertBill(db, a, { accountId: a.account });
-  const result = await payBill({ id: bill.id, accountId: a.secondAccount }, context(db, a));
+  const result = await payBill(paymentInput(bill, a.secondAccount), context(db, a));
   const transaction = db.prepare("SELECT * FROM transactions WHERE id=?").get(result.transactionId);
   assert.equal(transaction.account_id, a.secondAccount);
   assert.equal(transaction.category_id, a.category);
@@ -494,8 +512,81 @@ test("pagamento atômico usa a conta confirmada e copia classificação e respon
   assert.equal(transaction.payment_method, "conta_a_pagar");
   assert.equal(transaction.transaction_date, "2026-09-12");
   const storedBill = db.prepare("SELECT status, account_id, payment_transaction_id, paid_at FROM bills WHERE id=?").get(bill.id);
-  assert.deepEqual({ ...storedBill }, { status: "paid", account_id: a.secondAccount, payment_transaction_id: result.transactionId, paid_at: AT });
+  assert.deepEqual({ ...storedBill }, { status: "paid", account_id: a.account, payment_transaction_id: result.transactionId, paid_at: AT });
   assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE payment_method='conta_a_pagar'").get().total, 1);
+  const audit = db.prepare("SELECT action, old_data, new_data FROM audit_logs WHERE entity_type='bill' AND entity_id=? AND action='pay'").get(bill.id);
+  assert.equal(audit.action, "pay");
+  assert.deepEqual(JSON.parse(audit.old_data), { status: "pending", originalAmountCents: 20_000, plannedAccountId: a.account });
+  assert.equal(JSON.parse(audit.new_data).accountId, a.secondAccount);
+});
+
+test("pagamento usa o valor real em normal, acréscimo e desconto sem duplicar transações", async () => {
+  for (const scenario of [
+    { suffix: "normal", paid: 20_000, treatment: null, type: "normal", adjustment: 0 },
+    { suffix: "surcharge", paid: 20_500, treatment: null, type: "surcharge", adjustment: 500 },
+    { suffix: "discount", paid: 19_500, treatment: "discount", type: "discount", adjustment: -500 },
+  ]) {
+    const db = database();
+    const a = seedHousehold(db, scenario.suffix);
+    const bill = insertBill(db, a);
+    const result = await payBill(paymentInput(bill, a.account, { paidAmountCents: scenario.paid, differenceTreatment: scenario.treatment }), context(db, a));
+    const transaction = db.prepare("SELECT amount_cents,transaction_date,account_id FROM transactions WHERE id=?").get(result.transactionId);
+    assert.deepEqual({ ...transaction }, { amount_cents: scenario.paid, transaction_date: "2026-09-12", account_id: a.account });
+    assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE payment_method='conta_a_pagar'").get().total, 1);
+    const balance = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-12", a.household, "2026-09-12", a.household).find((row) => row.account_id === a.account).current_balance_cents;
+    assert.equal(balance, 100_000 - scenario.paid);
+    const audit = JSON.parse(db.prepare("SELECT new_data FROM audit_logs WHERE entity_id=? AND action='pay'").get(bill.id).new_data);
+    assert.deepEqual({ paid: audit.paidAmountCents, adjustment: audit.adjustmentAmountCents, type: audit.adjustmentType }, { paid: scenario.paid, adjustment: scenario.adjustment, type: scenario.type });
+  }
+});
+
+test("desconto exige confirmação explícita e não implementa pagamento parcial", async () => {
+  const db = database();
+  const a = seedHousehold(db, "discount-confirmation");
+  const bill = insertBill(db, a);
+  await assert.rejects(payBill(paymentInput(bill, a.account, { paidAmountCents: 19_500 }), context(db, a)), assertBillError(400, "BILL_DISCOUNT_CONFIRMATION_REQUIRED"));
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+  assert.equal(db.prepare("SELECT status FROM bills WHERE id=?").get(bill.id).status, "pending");
+});
+
+test("pagamento rejeita dinheiro inválido, valor stale e datas inválidas ou futuras", async () => {
+  for (const paidAmountCents of [0, -1, Number.NaN, 100_000_000_001]) {
+    const db = database(); const a = seedHousehold(db, `money-${String(paidAmountCents)}`); const bill = insertBill(db, a);
+    await assert.rejects(payBill(paymentInput(bill, a.account, { paidAmountCents }), context(db, a)), assertBillError(400));
+  }
+  {
+    const db = database(); const a = seedHousehold(db, "stale"); const bill = insertBill(db, a);
+    await assert.rejects(payBill(paymentInput(bill, a.account, { expectedAmountCents: 19_999 }), context(db, a)), assertBillError(409, "BILL_PAYMENT_STALE"));
+  }
+  for (const paidOn of ["2026-02-30", "2026-09-13"]) {
+    const db = database(); const a = seedHousehold(db, `date-${paidOn}`); const bill = insertBill(db, a);
+    await assert.rejects(payBill(paymentInput(bill, a.account, { paidOn }), context(db, a)), assertBillError(400));
+  }
+});
+
+test("retry idêntico reconhece o pagamento e operationId com payload diferente conflita", async () => {
+  const db = database();
+  const a = seedHousehold(db, "retry");
+  const bill = insertBill(db, a);
+  const input = paymentInput(bill, a.account, { operationId: "stable-operation" });
+  const first = await payBill(input, context(db, a));
+  const retry = await payBill(input, context(db, a));
+  assert.equal(first.transactionId, retry.transactionId);
+  assert.equal(first.replayed, false);
+  assert.equal(retry.replayed, true);
+  assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_id=? AND action='pay'").get(bill.id).total, 1);
+  await assert.rejects(payBill({ ...input, paidAmountCents: 20_001 }, context(db, a)), assertBillError(409, "BILL_IDEMPOTENCY_CONFLICT"));
+  await undoBillPayment(bill.id, context(db, a));
+  await assert.rejects(payBill(input, context(db, a)), assertBillError(409, "BILL_IDEMPOTENCY_CONFLICT"));
+});
+
+test("centavos acima e abaixo do previsto permanecem exatos", async () => {
+  for (const [suffix, paidAmountCents, differenceTreatment] of [["cent-up", 20_001, null], ["cent-down", 19_999, "discount"]]) {
+    const db = database(); const a = seedHousehold(db, suffix); const bill = insertBill(db, a);
+    const result = await payBill(paymentInput(bill, a.account, { paidAmountCents, differenceTreatment }), context(db, a));
+    assert.equal(db.prepare("SELECT amount_cents FROM transactions WHERE id=?").get(result.transactionId).amount_cents, paidAmountCents);
+  }
 });
 
 test("duas tentativas concorrentes criam exatamente uma transaction", async () => {
@@ -503,8 +594,8 @@ test("duas tentativas concorrentes criam exatamente uma transaction", async () =
   const a = seedHousehold(db, "a");
   const bill = insertBill(db, a);
   const attempts = await Promise.allSettled([
-    payBill({ id: bill.id, accountId: a.account }, context(db, a)),
-    payBill({ id: bill.id, accountId: a.account }, context(db, a)),
+    payBill(paymentInput(bill, a.account), context(db, a)),
+    payBill(paymentInput(bill, a.account), context(db, a)),
   ]);
   assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 1);
   assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 1);
@@ -517,10 +608,11 @@ test("falha na atualização da bill reverte a transaction do mesmo batch", asyn
   const a = seedHousehold(db, "a");
   const bill = insertBill(db, a);
   db.exec("CREATE TRIGGER force_bill_payment_failure BEFORE UPDATE OF status ON bills WHEN NEW.status='paid' BEGIN SELECT RAISE(ABORT, 'forced payment failure'); END");
-  await assert.rejects(payBill({ id: bill.id, accountId: a.account }, context(db, a)), /forced payment failure/);
+  await assert.rejects(payBill(paymentInput(bill, a.account), context(db, a)), /forced payment failure/);
   assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE payment_method='conta_a_pagar'").get().total, 0);
   assert.equal(db.prepare("SELECT status, payment_transaction_id FROM bills WHERE id=?").get(bill.id).status, "pending");
   assert.equal(db.prepare("SELECT payment_transaction_id FROM bills WHERE id=?").get(bill.id).payment_transaction_id, null);
+  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_id=? AND action='pay'").get(bill.id).total, 0);
 });
 
 test("undo remove somente a transaction vinculada e restaura bill, saldo e analytics", async () => {
@@ -528,7 +620,7 @@ test("undo remove somente a transaction vinculada e restaura bill, saldo e analy
   const a = seedHousehold(db, "a");
   const bill = insertBill(db, a);
   db.prepare("INSERT INTO transactions(id,household_id,type,amount_cents,description,transaction_date,responsible_user_id,account_id,payment_method,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run("unrelated", a.household, "expense", 500, "Outra", "2026-09-12", a.user, a.account, "cash", "confirmed", "dashboard", AT, AT);
-  const paid = await payBill({ id: bill.id, accountId: a.account }, context(db, a));
+  const paid = await payBill(paymentInput(bill, a.account), context(db, a));
   const paidEvents = db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT count(*) total FROM financial_events WHERE payment_method='conta_a_pagar'`).get(a.household, a.household);
   const paidBalance = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-12", a.household, "2026-09-12", a.household).find((row) => row.account_id === a.account).current_balance_cents;
   assert.equal(paidEvents.total, 1);
@@ -543,7 +635,23 @@ test("undo remove somente a transaction vinculada e restaura bill, saldo e analy
   const undoneBalance = db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-12", a.household, "2026-09-12", a.household).find((row) => row.account_id === a.account).current_balance_cents;
   assert.equal(undoneEvents.total, 0);
   assert.equal(undoneBalance, 99_500);
+  const undoAudit = db.prepare("SELECT old_data,new_data FROM audit_logs WHERE entity_id=? AND action='undo_payment'").get(bill.id);
+  assert.equal(JSON.parse(undoAudit.old_data).paidAmountCents, 20_000);
+  assert.equal(JSON.parse(undoAudit.new_data).status, "pending");
   await assert.rejects(undoBillPayment(bill.id, context(db, a)), assertBillError(409));
+});
+
+test("estorno remove integralmente pagamentos com acréscimo e desconto", async () => {
+  for (const [suffix, paidAmountCents, differenceTreatment] of [["undo-surcharge", 20_500, null], ["undo-discount", 19_500, "discount"]]) {
+    const db = database(); const a = seedHousehold(db, suffix); const bill = insertBill(db, a);
+    const paid = await payBill(paymentInput(bill, a.account, { paidAmountCents, differenceTreatment }), context(db, a));
+    assert.equal(db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-12", a.household, "2026-09-12", a.household).find((row) => row.account_id === a.account).current_balance_cents, 100_000 - paidAmountCents);
+    await undoBillPayment(bill.id, context(db, a));
+    assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE id=?").get(paid.transactionId).total, 0);
+    assert.deepEqual({ ...db.prepare("SELECT status,paid_at,payment_transaction_id,account_id FROM bills WHERE id=?").get(bill.id) }, { status: "pending", paid_at: null, payment_transaction_id: null, account_id: a.account });
+    assert.equal(db.prepare(CURRENT_ACCOUNT_BALANCES_SQL).all(a.household, "2026-09-12", a.household, "2026-09-12", a.household).find((row) => row.account_id === a.account).current_balance_cents, 100_000);
+    assert.equal(JSON.parse(db.prepare("SELECT old_data FROM audit_logs WHERE entity_id=? AND action='undo_payment'").get(bill.id).old_data).paidAmountCents, paidAmountCents);
+  }
 });
 
 test("undo rejeita household diferente e vínculo inconsistente sem excluir dados", async () => {
@@ -551,7 +659,7 @@ test("undo rejeita household diferente e vínculo inconsistente sem excluir dado
   const a = seedHousehold(db, "a");
   const b = seedHousehold(db, "b");
   const bill = insertBill(db, a);
-  const paid = await payBill({ id: bill.id, accountId: a.account }, context(db, a));
+  const paid = await payBill(paymentInput(bill, a.account), context(db, a));
   await assert.rejects(undoBillPayment(bill.id, context(db, b)), assertBillError(404));
   db.prepare("UPDATE transactions SET amount_cents=amount_cents+1 WHERE id=?").run(paid.transactionId);
   await assert.rejects(undoBillPayment(bill.id, context(db, a)), assertBillError(409, "BILL_PAYMENT_INCONSISTENT"));
@@ -559,15 +667,32 @@ test("undo rejeita household diferente e vínculo inconsistente sem excluir dado
   assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE id=?").get(paid.transactionId).total, 1);
 });
 
+test("undo legado sem auditoria exige valor e conta originais", async () => {
+  const db = database();
+  const a = seedHousehold(db, "legacy-undo");
+  const bill = insertBill(db, a, { accountId: a.account });
+  db.prepare("INSERT INTO transactions(id,household_id,type,amount_cents,description,category_id,subcategory_id,transaction_date,responsible_user_id,account_id,payment_method,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run("transaction_legacy", a.household, "expense", bill.amountCents, bill.description, a.category, a.subcategory, "2026-09-12", a.user, a.account, "conta_a_pagar", "confirmed", "dashboard", AT, AT);
+  db.prepare("UPDATE bills SET status='paid', payment_transaction_id='transaction_legacy', paid_at=? WHERE id=?").run(AT, bill.id);
+  await undoBillPayment(bill.id, context(db, a));
+  assert.equal(db.prepare("SELECT status FROM bills WHERE id=?").get(bill.id).status, "pending");
+
+  const corrupt = insertBill(db, a, { accountId: a.account });
+  db.prepare("INSERT INTO transactions(id,household_id,type,amount_cents,description,category_id,subcategory_id,transaction_date,responsible_user_id,account_id,payment_method,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run("transaction_corrupt", a.household, "expense", corrupt.amountCents + 1, corrupt.description, a.category, a.subcategory, "2026-09-12", a.user, a.account, "conta_a_pagar", "confirmed", "dashboard", AT, AT);
+  db.prepare("UPDATE bills SET status='paid', payment_transaction_id='transaction_corrupt', paid_at=? WHERE id=?").run(AT, corrupt.id);
+  await assert.rejects(undoBillPayment(corrupt.id, context(db, a)), assertBillError(409, "BILL_PAYMENT_INCONSISTENT"));
+  assert.equal(db.prepare("SELECT status FROM bills WHERE id=?").get(corrupt.id).status, "paid");
+});
+
 test("falha ao remover a transaction reverte toda a operação de undo", async () => {
   const db = database();
   const a = seedHousehold(db, "a");
   const bill = insertBill(db, a);
-  const paid = await payBill({ id: bill.id, accountId: a.account }, context(db, a));
+  const paid = await payBill(paymentInput(bill, a.account), context(db, a));
   db.exec(`CREATE TRIGGER force_bill_undo_failure BEFORE DELETE ON transactions WHEN OLD.id='${paid.transactionId}' BEGIN SELECT RAISE(ABORT, 'forced undo failure'); END`);
   await assert.rejects(undoBillPayment(bill.id, context(db, a)), /forced undo failure/);
   const storedBill = db.prepare("SELECT status, payment_transaction_id FROM bills WHERE id=?").get(bill.id);
   assert.equal(storedBill.status, "paid");
   assert.equal(storedBill.payment_transaction_id, paid.transactionId);
   assert.equal(db.prepare("SELECT count(*) total FROM transactions WHERE id=?").get(paid.transactionId).total, 1);
+  assert.equal(db.prepare("SELECT count(*) total FROM audit_logs WHERE entity_id=? AND action='undo_payment'").get(bill.id).total, 0);
 });

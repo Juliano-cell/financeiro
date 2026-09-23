@@ -1,4 +1,5 @@
 import { addMonths, dateForDayOfMonth } from "./finance-rules.mjs";
+import { billPaymentAdjustment, MAX_BILL_PAYMENT_CENTS } from "./bill-payment.mjs";
 
 type BillContext = {
   d1: D1Database;
@@ -56,6 +57,16 @@ export type UpdateRecurringBillSeriesInput = BillClassification & {
   notes?: string | null;
 };
 
+export type PayBillInput = {
+  id: string;
+  accountId: string;
+  paidAmountCents: number;
+  paidOn: string;
+  expectedAmountCents: number;
+  operationId: string;
+  differenceTreatment?: "discount" | null;
+};
+
 type BillRow = {
   id: string;
   household_id: string;
@@ -69,6 +80,14 @@ type BillRow = {
   status: "pending" | "paid" | "cancelled";
   payment_transaction_id: string | null;
   notes: string | null;
+};
+
+type BillPaymentTransactionRow = {
+  id: string;
+  household_id: string;
+  amount_cents: number;
+  transaction_date: string;
+  account_id: string;
 };
 
 export class BillServiceError extends Error {
@@ -86,6 +105,12 @@ export class BillServiceError extends Error {
 const uid = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 const isoTimestamp = (context: BillContext) => context.timestamp ?? new Date().toISOString();
 
+async function operationScopedId(prefix: string, householdId: string, operationId: string) {
+  const bytes = new TextEncoder().encode(`${householdId}\u0000${operationId}`);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return `${prefix}_${Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
 function saoPauloDate(timestamp: string) {
   const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(timestamp));
   const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
@@ -97,7 +122,11 @@ function assertText(value: string) {
 }
 
 function assertMoney(value: number) {
-  if (!Number.isSafeInteger(value) || value < 1 || value > 100_000_000_000) throw new BillServiceError("Valor inválido.");
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_BILL_PAYMENT_CENTS) throw new BillServiceError("Valor inválido.");
+}
+
+function assertOperationId(value: string) {
+  if (typeof value !== "string" || !value.trim() || value.length > 200) throw new BillServiceError("Identificação da operação inválida.");
 }
 
 function assertDate(value: string) {
@@ -163,6 +192,33 @@ async function validateClassification(context: BillContext, classification: Bill
 
 async function getBill(context: BillContext, billId: string) {
   return context.d1.prepare("SELECT id, household_id, description, amount_cents, category_id, subcategory_id, account_id, due_date, recurrence_series_id, status, payment_transaction_id, notes FROM bills WHERE id = ? AND household_id = ? LIMIT 1").bind(billId, context.householdId).first<BillRow>();
+}
+
+async function getBillPaymentTransaction(context: BillContext, transactionId: string) {
+  return context.d1.prepare(`SELECT id, household_id, amount_cents, transaction_date, account_id
+    FROM transactions
+    WHERE id = ? AND household_id = ? AND type = 'expense' AND payment_method = 'conta_a_pagar' AND status = 'confirmed' AND origin = 'dashboard'
+    LIMIT 1`).bind(transactionId, context.householdId).first<BillPaymentTransactionRow>();
+}
+
+async function resolvePaymentReplay(input: PayBillInput, context: BillContext, transactionId: string) {
+  const [bill, transaction, paymentAudit] = await Promise.all([
+    getBill(context, input.id),
+    getBillPaymentTransaction(context, transactionId),
+    context.d1.prepare("SELECT id FROM audit_logs WHERE id = ? AND household_id = ? AND action = 'pay' AND entity_type = 'bill' LIMIT 1").bind(`audit_pay_${transactionId}`, context.householdId).first<{ id: string }>(),
+  ]);
+  const exact = bill?.status === "paid"
+    && bill.payment_transaction_id === transactionId
+    && bill.amount_cents === input.expectedAmountCents
+    && transaction?.amount_cents === input.paidAmountCents
+    && transaction.transaction_date === input.paidOn
+    && transaction.account_id === input.accountId
+    && (input.differenceTreatment ?? null) === (input.paidAmountCents < input.expectedAmountCents ? "discount" : null);
+  if (exact) return { transactionId, replayed: true as const };
+  if (transaction || paymentAudit || bill?.payment_transaction_id === transactionId) {
+    throw new BillServiceError("A identificação da operação já foi usada com dados diferentes.", 409, "BILL_IDEMPOTENCY_CONFLICT");
+  }
+  return null;
 }
 
 function changes(result: D1Result | undefined) {
@@ -465,49 +521,121 @@ export async function cancelRecurringBillSeries(seriesId: string, context: BillC
   if (changes(results[0]) !== 1) throw new BillServiceError("A série foi alterada por outra operação.", 409);
 }
 
-export async function payBill(input: { id: string; accountId: string }, context: BillContext) {
+export async function payBill(input: PayBillInput, context: BillContext) {
   if (!input.accountId) throw new BillServiceError("Selecione a conta usada no pagamento.");
+  assertMoney(input.paidAmountCents);
+  assertMoney(input.expectedAmountCents);
+  assertDate(input.paidOn);
+  assertOperationId(input.operationId);
+  const timestamp = isoTimestamp(context);
+  if (input.paidOn > saoPauloDate(timestamp)) throw new BillServiceError("A data do pagamento não pode ser futura.");
+
   await assertActiveMembership(context);
+  const transactionId = await operationScopedId("transaction_bill", context.householdId, input.operationId);
   const bill = await getBill(context, input.id);
   if (!bill) throw new BillServiceError("Conta a pagar não encontrada.", 404);
-  if (bill.status === "paid") throw new BillServiceError("Esta conta já foi paga.", 409);
+  if (bill.status === "paid") {
+    const replay = await resolvePaymentReplay(input, context, transactionId);
+    if (replay) return replay;
+    throw new BillServiceError("Esta conta já foi paga.", 409, "BILL_ALREADY_PROCESSED");
+  }
   if (bill.status === "cancelled") throw new BillServiceError("Uma conta cancelada não pode ser paga.", 409);
+  if (bill.amount_cents !== input.expectedAmountCents) throw new BillServiceError("O valor previsto foi alterado. Atualize os dados antes de pagar.", 409, "BILL_PAYMENT_STALE");
+
+  const adjustment = billPaymentAdjustment(bill.amount_cents, input.paidAmountCents);
+  if (adjustment.adjustmentType === "discount" && input.differenceTreatment !== "discount") {
+    throw new BillServiceError("Confirme explicitamente que a diferença será tratada como desconto e que o vencimento será quitado.", 400, "BILL_DISCOUNT_CONFIRMATION_REQUIRED");
+  }
+  if (adjustment.adjustmentType !== "discount" && input.differenceTreatment) {
+    throw new BillServiceError("O tratamento informado não corresponde ao valor pago.", 400, "BILL_PAYMENT_TREATMENT_INVALID");
+  }
+
   await validateAccount(context, input.accountId);
   await validateClassification(context, { categoryId: bill.category_id ?? "", subcategoryId: bill.subcategory_id }, true);
 
-  const timestamp = isoTimestamp(context);
-  const transactionId = uid("transaction");
-  const transactionDate = saoPauloDate(timestamp);
+  const auditId = `audit_pay_${transactionId}`;
+  const auditOld = JSON.stringify({ status: "pending", originalAmountCents: bill.amount_cents, plannedAccountId: bill.account_id });
+  const auditNew = JSON.stringify({
+    status: "paid",
+    originalAmountCents: bill.amount_cents,
+    paidAmountCents: input.paidAmountCents,
+    adjustmentAmountCents: adjustment.adjustmentAmountCents,
+    adjustmentType: adjustment.adjustmentType,
+    accountId: input.accountId,
+    paidOn: input.paidOn,
+    confirmedAt: timestamp,
+    transactionId,
+    operationId: input.operationId,
+  });
   const insert = context.d1.prepare(`INSERT INTO transactions (id, household_id, type, amount_cents, description, category_id, subcategory_id, transaction_date, transaction_time, responsible_user_id, account_id, payment_method, status, origin, notes, created_at, updated_at)
-    SELECT ?, b.household_id, 'expense', b.amount_cents, b.description, b.category_id, b.subcategory_id, ?, NULL, ?, ?, 'conta_a_pagar', 'confirmed', 'dashboard', b.notes, ?, ?
+    SELECT ?, b.household_id, 'expense', ?, b.description, b.category_id, b.subcategory_id, ?, NULL, ?, ?, 'conta_a_pagar', 'confirmed', 'dashboard', b.notes, ?, ?
     FROM bills b
     INNER JOIN accounts a ON a.id = ? AND a.household_id = b.household_id AND a.is_active = 1
     INNER JOIN categories c ON c.id = b.category_id AND c.household_id = b.household_id AND c.is_active = 1 AND c.type IN ('expense','both')
-    WHERE b.id = ? AND b.household_id = ? AND b.status = 'pending' AND b.payment_transaction_id IS NULL
+    WHERE b.id = ? AND b.household_id = ? AND b.amount_cents = ? AND b.status = 'pending' AND b.payment_transaction_id IS NULL
       AND EXISTS (SELECT 1 FROM household_members hm WHERE hm.household_id = b.household_id AND hm.user_id = ? AND hm.status = 'active')
       AND ((b.subcategory_id IS NULL AND NOT EXISTS (SELECT 1 FROM subcategories sx WHERE sx.household_id = b.household_id AND sx.category_id = b.category_id AND sx.is_active = 1))
-        OR EXISTS (SELECT 1 FROM subcategories s WHERE s.id = b.subcategory_id AND s.household_id = b.household_id AND s.category_id = b.category_id AND s.is_active = 1))`).bind(transactionId, transactionDate, context.userId, input.accountId, timestamp, timestamp, input.accountId, input.id, context.householdId, context.userId);
-  const update = context.d1.prepare("UPDATE bills SET status = 'paid', paid_at = ?, account_id = ?, payment_transaction_id = ?, updated_at = ? WHERE id = ? AND household_id = ? AND status = 'pending' AND payment_transaction_id IS NULL AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND household_id = ? AND account_id = ? AND payment_method = 'conta_a_pagar')").bind(timestamp, input.accountId, transactionId, timestamp, input.id, context.householdId, transactionId, context.householdId, input.accountId);
-  const results = await context.d1.batch([insert, update]);
-  if (changes(results[0]) !== 1 || changes(results[1]) !== 1) throw new BillServiceError("Este vencimento já foi pago ou alterado por outra operação.", 409, "BILL_ALREADY_PROCESSED");
-  return { transactionId };
+        OR EXISTS (SELECT 1 FROM subcategories s WHERE s.id = b.subcategory_id AND s.household_id = b.household_id AND s.category_id = b.category_id AND s.is_active = 1))`).bind(transactionId, input.paidAmountCents, input.paidOn, context.userId, input.accountId, timestamp, timestamp, input.accountId, input.id, context.householdId, input.expectedAmountCents, context.userId);
+  const update = context.d1.prepare(`UPDATE bills SET status = 'paid', paid_at = ?, payment_transaction_id = ?, updated_at = ?
+    WHERE id = ? AND household_id = ? AND amount_cents = ? AND status = 'pending' AND payment_transaction_id IS NULL
+      AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND household_id = ? AND amount_cents = ? AND transaction_date = ? AND account_id = ? AND payment_method = 'conta_a_pagar' AND status = 'confirmed')`).bind(timestamp, transactionId, timestamp, input.id, context.householdId, input.expectedAmountCents, transactionId, context.householdId, input.paidAmountCents, input.paidOn, input.accountId);
+  const audit = context.d1.prepare(`INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at)
+    SELECT ?, ?, ?, 'pay', 'bill', ?, ?, ?, ?
+    WHERE EXISTS (SELECT 1 FROM bills WHERE id = ? AND household_id = ? AND status = 'paid' AND payment_transaction_id = ?)
+      AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND household_id = ? AND amount_cents = ? AND transaction_date = ? AND account_id = ? AND payment_method = 'conta_a_pagar' AND status = 'confirmed')`).bind(auditId, context.householdId, context.userId, bill.id, auditOld, auditNew, timestamp, bill.id, context.householdId, transactionId, transactionId, context.householdId, input.paidAmountCents, input.paidOn, input.accountId);
+
+  let results: D1Result[];
+  try {
+    results = await context.d1.batch([insert, update, audit]);
+  } catch (error) {
+    const replay = await resolvePaymentReplay(input, context, transactionId);
+    if (replay) return replay;
+    throw error;
+  }
+  if (changes(results[0]) !== 1 || changes(results[1]) !== 1 || changes(results[2]) !== 1) {
+    const replay = await resolvePaymentReplay(input, context, transactionId);
+    if (replay) return replay;
+    throw new BillServiceError("Este vencimento já foi pago ou alterado por outra operação.", 409, "BILL_ALREADY_PROCESSED");
+  }
+  return { transactionId, replayed: false as const };
 }
 
 export async function undoBillPayment(billId: string, context: BillContext) {
   await assertActiveMembership(context);
   const bill = await getBill(context, billId);
   if (!bill) throw new BillServiceError("Conta a pagar não encontrada.", 404);
-  if (bill.status !== "paid" || !bill.payment_transaction_id || !bill.account_id) throw new BillServiceError("Este vencimento não possui um pagamento válido para desfazer.", 409);
-  const transaction = await context.d1.prepare("SELECT id FROM transactions WHERE id = ? AND household_id = ? AND type = 'expense' AND amount_cents = ? AND description = ? AND category_id IS ? AND subcategory_id IS ? AND account_id = ? AND payment_method = 'conta_a_pagar' AND status = 'confirmed' AND origin = 'dashboard' AND notes IS ? LIMIT 1").bind(bill.payment_transaction_id, context.householdId, bill.amount_cents, bill.description, bill.category_id, bill.subcategory_id, bill.account_id, bill.notes).first<{ id: string }>();
+  if (bill.status !== "paid" || !bill.payment_transaction_id) throw new BillServiceError("Este vencimento não possui um pagamento válido para desfazer.", 409);
+  const transaction = await context.d1.prepare("SELECT id, amount_cents, account_id, transaction_date FROM transactions WHERE id = ? AND household_id = ? AND type = 'expense' AND description = ? AND category_id IS ? AND subcategory_id IS ? AND payment_method = 'conta_a_pagar' AND status = 'confirmed' AND origin = 'dashboard' AND notes IS ? LIMIT 1").bind(bill.payment_transaction_id, context.householdId, bill.description, bill.category_id, bill.subcategory_id, bill.notes).first<{ id: string; amount_cents: number; account_id: string; transaction_date: string }>();
   if (!transaction) throw new BillServiceError("O vínculo de pagamento deste vencimento está inconsistente.", 409, "BILL_PAYMENT_INCONSISTENT");
+  const paymentAudit = await context.d1.prepare("SELECT new_data FROM audit_logs WHERE id = ? AND household_id = ? AND entity_type = 'bill' AND entity_id = ? AND action = 'pay' LIMIT 1").bind(`audit_pay_${transaction.id}`, context.householdId, bill.id).first<{ new_data: string | null }>();
+  if (!paymentAudit?.new_data) {
+    const validLegacyPayment = !transaction.id.startsWith("transaction_bill_")
+      && transaction.amount_cents === bill.amount_cents
+      && transaction.account_id === bill.account_id;
+    if (!validLegacyPayment) throw new BillServiceError("A auditoria deste pagamento está ausente ou inconsistente.", 409, "BILL_PAYMENT_INCONSISTENT");
+  } else {
+    let recorded: { originalAmountCents?: number; paidAmountCents?: number; accountId?: string; paidOn?: string; transactionId?: string };
+    try { recorded = JSON.parse(paymentAudit.new_data) as typeof recorded; } catch { throw new BillServiceError("A auditoria deste pagamento está inconsistente.", 409, "BILL_PAYMENT_INCONSISTENT"); }
+    if (recorded.originalAmountCents !== bill.amount_cents || recorded.paidAmountCents !== transaction.amount_cents || recorded.accountId !== transaction.account_id || recorded.paidOn !== transaction.transaction_date || recorded.transactionId !== transaction.id) {
+      throw new BillServiceError("O vínculo de pagamento deste vencimento está inconsistente.", 409, "BILL_PAYMENT_INCONSISTENT");
+    }
+  }
 
   const timestamp = isoTimestamp(context);
+  const adjustment = billPaymentAdjustment(bill.amount_cents, transaction.amount_cents);
+  const auditId = `audit_undo_${transaction.id}`;
+  const auditOld = JSON.stringify({ status: "paid", originalAmountCents: bill.amount_cents, paidAmountCents: transaction.amount_cents, adjustmentAmountCents: adjustment.adjustmentAmountCents, adjustmentType: adjustment.adjustmentType, accountId: transaction.account_id, paidOn: transaction.transaction_date, transactionId: transaction.id });
+  const auditNew = JSON.stringify({ status: "pending", originalAmountCents: bill.amount_cents, plannedAccountId: bill.account_id, reversedAt: timestamp, reversedTransactionId: transaction.id });
   const update = context.d1.prepare(`UPDATE bills SET status = 'pending', paid_at = NULL, payment_transaction_id = NULL, updated_at = ?
     WHERE id = ? AND household_id = ? AND status = 'paid' AND payment_transaction_id = ?
       AND EXISTS (SELECT 1 FROM household_members WHERE household_id = ? AND user_id = ? AND status = 'active')
-      AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND household_id = ? AND type = 'expense' AND amount_cents = ? AND description = ? AND category_id IS ? AND subcategory_id IS ? AND account_id = ? AND payment_method = 'conta_a_pagar' AND status = 'confirmed' AND origin = 'dashboard' AND notes IS ?)`).bind(timestamp, bill.id, context.householdId, transaction.id, context.householdId, context.userId, transaction.id, context.householdId, bill.amount_cents, bill.description, bill.category_id, bill.subcategory_id, bill.account_id, bill.notes);
-  const remove = context.d1.prepare("DELETE FROM transactions WHERE id = ? AND household_id = ? AND type = 'expense' AND payment_method = 'conta_a_pagar' AND status = 'confirmed' AND origin = 'dashboard' AND NOT EXISTS (SELECT 1 FROM bills WHERE payment_transaction_id = transactions.id)").bind(transaction.id, context.householdId);
-  const results = await context.d1.batch([update, remove]);
-  if (changes(results[0]) !== 1 || changes(results[1]) !== 1) throw new BillServiceError("O pagamento foi alterado por outra operação e não pôde ser desfeito.", 409, "BILL_PAYMENT_CHANGED");
+      AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND household_id = ? AND type = 'expense' AND amount_cents = ? AND description = ? AND category_id IS ? AND subcategory_id IS ? AND account_id = ? AND transaction_date = ? AND payment_method = 'conta_a_pagar' AND status = 'confirmed' AND origin = 'dashboard' AND notes IS ?)`).bind(timestamp, bill.id, context.householdId, transaction.id, context.householdId, context.userId, transaction.id, context.householdId, transaction.amount_cents, bill.description, bill.category_id, bill.subcategory_id, transaction.account_id, transaction.transaction_date, bill.notes);
+  const remove = context.d1.prepare("DELETE FROM transactions WHERE id = ? AND household_id = ? AND type = 'expense' AND amount_cents = ? AND account_id = ? AND transaction_date = ? AND payment_method = 'conta_a_pagar' AND status = 'confirmed' AND origin = 'dashboard' AND NOT EXISTS (SELECT 1 FROM bills WHERE payment_transaction_id = transactions.id)").bind(transaction.id, context.householdId, transaction.amount_cents, transaction.account_id, transaction.transaction_date);
+  const audit = context.d1.prepare(`INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at)
+    SELECT ?, ?, ?, 'undo_payment', 'bill', ?, ?, ?, ?
+    WHERE EXISTS (SELECT 1 FROM bills WHERE id = ? AND household_id = ? AND status = 'pending' AND payment_transaction_id IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM transactions WHERE id = ? AND household_id = ?)`).bind(auditId, context.householdId, context.userId, bill.id, auditOld, auditNew, timestamp, bill.id, context.householdId, transaction.id, context.householdId);
+  const results = await context.d1.batch([update, remove, audit]);
+  if (changes(results[0]) !== 1 || changes(results[1]) !== 1 || changes(results[2]) !== 1) throw new BillServiceError("O pagamento foi alterado por outra operação e não pôde ser desfeito.", 409, "BILL_PAYMENT_CHANGED");
   return { transactionId: transaction.id };
 }

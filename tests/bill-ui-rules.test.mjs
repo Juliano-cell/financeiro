@@ -95,12 +95,13 @@ test("pagamento preseleciona somente a conta ativa definida na bill", () => {
 
 test("pagamento nunca usa fallback para a primeira conta ativa", () => {
   assert.equal(initialBillPaymentAccountId({ accountId: null }, accounts), null);
-  assert.throws(() => buildBillPaymentPayload("bill", null), /selecione a conta/i);
+  assert.throws(() => buildBillPaymentPayload({ billId: "bill", accountId: null, operationId: "op" }), /selecione a conta/i);
 });
 
-test("pagamento envia accountId explicitamente e respeita troca de conta", () => {
-  assert.deepEqual(buildBillPaymentPayload("bill", "primary"), { action: "pay_bill", id: "bill", accountId: "primary" });
-  assert.deepEqual(buildBillPaymentPayload("bill", "second"), { action: "pay_bill", id: "bill", accountId: "second" });
+test("pagamento envia valor real, data, expectativa, operação e tratamento explicitamente", () => {
+  const base = { billId: "bill", paidAmountCents: 9500, paidOn: "2026-09-12", expectedAmountCents: 10000, operationId: "op", differenceTreatment: "discount" };
+  assert.deepEqual(buildBillPaymentPayload({ ...base, accountId: "primary" }), { action: "pay_bill", id: "bill", accountId: "primary", paidAmountCents: 9500, paidOn: "2026-09-12", expectedAmountCents: 10000, operationId: "op", differenceTreatment: "discount" });
+  assert.equal(buildBillPaymentPayload({ ...base, accountId: "second" }).accountId, "second");
 });
 
 test("Definir ao pagar é serializado como accountId null no cadastro", () => {
@@ -176,8 +177,9 @@ test("interface abre confirmação e delega operações sem fallback automático
   const source = readFileSync(new URL("../app/advanced-finance.tsx", import.meta.url), "utf8");
   assert.match(source, /openPayment\(item\)/);
   assert.match(source, /<BillPaymentDialog/);
-  assert.match(source, /buildBillPaymentPayload\(bill\.id, accountId\)/);
-  assert.match(source, /disabled=\{busy \|\| !accountId\}/);
+  assert.match(source, /buildBillPaymentPayload\(\{ billId: bill\.id, accountId, paidAmountCents, paidOn, expectedAmountCents: bill\.amountCents, operationId/);
+  assert.match(source, /adjustment\?\.adjustmentType === "discount" && !discountConfirmed/);
+  assert.match(source, /type="date" max=\{today\}/);
   assert.doesNotMatch(source, /accounts\.find\(\(value\) => value\.id === item\.accountId\) \?\? accounts\.find/);
   assert.match(source, /action: "undo_bill_payment"/);
   assert.match(source, /action: "update_bill_occurrence"/);
