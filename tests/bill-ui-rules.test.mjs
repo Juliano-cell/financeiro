@@ -5,8 +5,12 @@ import {
   activeBillSubcategories,
   billActions,
   billClassificationError,
+  billDayRefreshDelay,
   billDueDayOffset,
+  billOpenAmountCents,
+  billReferenceMonthInSaoPaulo,
   billRelativeDueLabel,
+  billsForSelectedMonthAndGlobalOverdue,
   billTiming,
   billTodayInSaoPaulo,
   buildBillPaymentPayload,
@@ -15,6 +19,7 @@ import {
   eligibleRecurringBillIds,
   filterAndSortBills,
   friendlyBillPaymentError,
+  globalOverdueBills,
   initialBillPaymentAccountId,
   normalizeBillAccountId,
   normalizeRecurringBillSelection,
@@ -61,6 +66,15 @@ test("indicadores relativos preservam amanhã, futuro e pluralização do atraso
 test("hoje financeiro usa America/Sao_Paulo na virada do UTC", () => {
   assert.equal(billTodayInSaoPaulo(new Date("2026-09-21T01:30:00.000Z")), "2026-09-20");
   assert.equal(billTodayInSaoPaulo(new Date("2026-09-21T03:30:00.000Z")), "2026-09-21");
+  assert.equal(billReferenceMonthInSaoPaulo(new Date("2026-10-01T01:30:00.000Z")), "2026-09");
+  assert.equal(billReferenceMonthInSaoPaulo(new Date("2026-10-01T03:30:00.000Z")), "2026-10");
+});
+
+test("refresh diário é agendado uma única vez para logo após a meia-noite de São Paulo", () => {
+  const beforeMidnight = billDayRefreshDelay(new Date("2026-09-21T02:59:30.000Z"));
+  assert.ok(beforeMidnight >= 30_000 && beforeMidnight <= 32_000);
+  const afterMidnight = billDayRefreshDelay(new Date("2026-09-21T03:00:30.000Z"));
+  assert.ok(afterMidnight >= 86_369_000 && afterMidnight <= 86_372_000);
 });
 
 test("filtro padrão mostra pendentes na ordem atrasadas, hoje e próximas", () => {
@@ -85,6 +99,81 @@ test("resumo considera apenas pendentes e soma valores por urgência", () => {
     today: { count: 1, valueCents: 11366 },
     upcoming: { count: 2, valueCents: 16990 },
   });
+});
+
+const globalBills = [
+  { id: "old-year", description: "IPTU antigo", amountCents: 30000, dueDate: "2025-12-31", accountId: "old-account", categoryId: "old-category", status: "pending", recurrenceSeriesId: null },
+  { id: "many-months", description: "Condomínio março", amountCents: 20000, dueDate: "2026-03-15", accountId: "primary", categoryId: "food", status: "pending", recurrenceSeriesId: "housing" },
+  { id: "previous-month", description: "Condomínio agosto", amountCents: 10000, dueDate: "2026-08-15", accountId: "primary", categoryId: "food", status: "pending", recurrenceSeriesId: "housing" },
+  { id: "selected-overdue", description: "Condomínio setembro", amountCents: 5000, dueDate: "2026-09-10", accountId: "primary", categoryId: "food", status: "pending", recurrenceSeriesId: "housing" },
+  { id: "selected-today", description: "Seguro setembro", amountCents: 4000, dueDate: "2026-09-20", accountId: "second", categoryId: "transport", status: "pending", recurrenceSeriesId: null },
+  { id: "selected-next", description: "Internet setembro", amountCents: 3000, dueDate: "2026-09-21", accountId: null, categoryId: "food", status: "pending", recurrenceSeriesId: null },
+  { id: "selected-paid", description: "Água setembro", amountCents: 2000, dueDate: "2026-09-05", accountId: "primary", categoryId: "food", status: "paid", recurrenceSeriesId: null },
+  { id: "selected-cancelled", description: "Academia setembro", amountCents: 1000, dueDate: "2026-09-04", accountId: "primary", categoryId: "food", status: "cancelled", recurrenceSeriesId: null },
+  { id: "old-paid", description: "Água agosto", amountCents: 9000, dueDate: "2026-08-05", accountId: "primary", categoryId: "food", status: "paid", recurrenceSeriesId: null },
+  { id: "old-cancelled", description: "Academia agosto", amountCents: 8000, dueDate: "2026-08-04", accountId: "primary", categoryId: "food", status: "cancelled", recurrenceSeriesId: null },
+  { id: "future-other-month", description: "Seguro outubro", amountCents: 7000, dueDate: "2026-10-20", accountId: "second", categoryId: "transport", status: "pending", recurrenceSeriesId: null },
+];
+
+test("união mantém atrasadas globais e demais estados somente no mês sem duplicar IDs", () => {
+  const relevant = billsForSelectedMonthAndGlobalOverdue(globalBills, "2026-09", today);
+  assert.deepEqual(relevant.map((bill) => bill.id), ["old-year", "many-months", "previous-month", "selected-overdue", "selected-today", "selected-next", "selected-paid", "selected-cancelled"]);
+  assert.equal(relevant.filter((bill) => bill.id === "selected-overdue").length, 1);
+  assert.deepEqual(globalOverdueBills(globalBills, today).map((bill) => bill.id), ["old-year", "many-months", "previous-month", "selected-overdue"]);
+});
+
+test("mês diferente preserva atrasadas globais mas não globaliza hoje, próximas, pagas ou canceladas", () => {
+  const relevant = billsForSelectedMonthAndGlobalOverdue(globalBills, "2026-10", today);
+  assert.deepEqual(relevant.map((bill) => bill.id), ["old-year", "many-months", "previous-month", "selected-overdue", "future-other-month"]);
+  assert.deepEqual(relevant.filter((bill) => billTiming(bill, today) === "today"), []);
+  assert.deepEqual(relevant.filter((bill) => bill.status === "paid"), []);
+  assert.deepEqual(relevant.filter((bill) => bill.status === "cancelled"), []);
+  assert.deepEqual(relevant.filter((bill) => billTiming(bill, today) === "upcoming").map((bill) => bill.id), ["future-other-month"]);
+});
+
+test("resumo global de atrasadas usa valor em aberto e mantém Hoje e Próximas mensais", () => {
+  const overdue = summarizePendingBills(globalOverdueBills(globalBills, today), today).overdue;
+  const monthly = summarizePendingBills(globalBills.filter((bill) => bill.dueDate.startsWith("2026-09")), today);
+  assert.deepEqual(overdue, { count: 4, valueCents: 65000 });
+  assert.deepEqual(monthly.today, { count: 1, valueCents: 4000 });
+  assert.deepEqual(monthly.upcoming, { count: 1, valueCents: 3000 });
+  assert.equal(billOpenAmountCents(globalBills[0]), globalBills[0].amountCents);
+});
+
+test("busca, conta, categoria e status alcançam atrasadas antigas na união relevante", () => {
+  const relevant = billsForSelectedMonthAndGlobalOverdue(globalBills, "2026-09", today);
+  assert.deepEqual(filterAndSortBills(relevant, { today, status: "overdue", search: "IPTU" }).map((bill) => bill.id), ["old-year"]);
+  assert.deepEqual(filterAndSortBills(relevant, { today, status: "overdue", accountId: "old-account" }).map((bill) => bill.id), ["old-year"]);
+  assert.deepEqual(filterAndSortBills(relevant, { today, status: "overdue", categoryId: "old-category" }).map((bill) => bill.id), ["old-year"]);
+  assert.deepEqual(filterAndSortBills(relevant, { today, status: "overdue" }).map((bill) => bill.id), ["old-year", "many-months", "previous-month", "selected-overdue"]);
+});
+
+test("ocorrências recorrentes são classificadas individualmente por status e data", () => {
+  const occurrences = [
+    { id: "june", dueDate: "2026-06-10", status: "pending", amountCents: 1000, recurrenceSeriesId: "series" },
+    { id: "july", dueDate: "2026-07-10", status: "paid", amountCents: 1000, recurrenceSeriesId: "series" },
+    { id: "august", dueDate: "2026-08-10", status: "pending", amountCents: 1000, recurrenceSeriesId: "series" },
+    { id: "september", dueDate: "2026-09-25", status: "pending", amountCents: 1000, recurrenceSeriesId: "series" },
+  ];
+  assert.deepEqual(globalOverdueBills(occurrences, today).map((bill) => bill.id), ["june", "august"]);
+});
+
+test("pagamento normal, com desconto ou acréscimo remove atraso e estorno o restaura", () => {
+  for (const adjustmentType of ["normal", "discount", "surcharge"]) {
+    const overdue = { id: adjustmentType, dueDate: "2026-06-10", status: "pending", amountCents: 1000, payment: null };
+    assert.deepEqual(globalOverdueBills([overdue], today).map((bill) => bill.id), [adjustmentType]);
+    const paid = { ...overdue, status: "paid", payment: { adjustmentType } };
+    assert.deepEqual(globalOverdueBills([paid], today), []);
+    const undone = { ...paid, status: "pending", payment: null };
+    assert.deepEqual(globalOverdueBills([undone], today).map((bill) => bill.id), [adjustmentType]);
+  }
+});
+
+test("datas civis cobrem fevereiro e virada de ano sem depender do fuso UTC da máquina", () => {
+  assert.equal(billDueDayOffset("2028-02-29", "2028-02-28"), 1);
+  assert.equal(billDueDayOffset("2028-03-01", "2028-02-29"), 1);
+  assert.equal(billDueDayOffset("2027-01-01", "2026-12-31"), 1);
+  assert.equal(billTiming({ status: "pending", dueDate: "2026-12-31" }, "2027-01-01"), "overdue");
 });
 
 test("pagamento preseleciona somente a conta ativa definida na bill", () => {
@@ -175,6 +264,8 @@ test("erro de classificação recebe mensagem amigável", () => {
 
 test("interface abre confirmação e delega operações sem fallback automático", () => {
   const source = readFileSync(new URL("../app/advanced-finance.tsx", import.meta.url), "utf8");
+  const financeApp = readFileSync(new URL("../app/finance-app.tsx", import.meta.url), "utf8");
+  const route = readFileSync(new URL("../app/api/finance/advanced/route.ts", import.meta.url), "utf8");
   assert.match(source, /openPayment\(item\)/);
   assert.match(source, /<BillPaymentDialog/);
   assert.match(source, /buildBillPaymentPayload\(\{ billId: bill\.id, accountId, paidAmountCents, paidOn, expectedAmountCents: bill\.amountCents, operationId/);
@@ -203,4 +294,26 @@ test("interface abre confirmação e delega operações sem fallback automático
   assert.match(source, /Todas as contas/);
   assert.match(source, /Todas as categorias/);
   assert.match(source, /min-h-11 flex-1 sm:flex-none/);
+  assert.match(source, /Atrasadas — todos os meses/);
+  assert.match(source, /Competência: \{monthLabel\(item\.dueDate\.slice\(0, 7\)\)\}/);
+  assert.match(source, /globalOverdueBills\(data\.bills, today\)/);
+  assert.match(source, /billsForSelectedMonthAndGlobalOverdue\(data\.bills, data\.selectedMonth, today\)/);
+  assert.match(source, /filterAccounts = accounts\.filter\(\(account\) => relevantRows/);
+  assert.match(source, /filterCategories = categories\.filter\(\(category\) => relevantRows/);
+  assert.match(source, /\{"value":"overdue","label":"Atrasadas"\}/);
+  assert.match(source, /openPayment\(item\)/);
+  assert.match(source, /openEditor\(item\)/);
+  assert.match(source, /bill: item, kind: "cancel"/);
+  assert.doesNotMatch(source, /setSelectedMonth/);
+  assert.match(source, /setToday\(billTodayInSaoPaulo\(\)\)/);
+  assert.match(source, /billDayRefreshDelay\(\)/);
+  assert.match(source, /bg-card/);
+  assert.match(source, /text-muted-foreground/);
+  assert.doesNotMatch(source, /Atrasadas — todos os meses[\s\S]{0,250}bg-\[#/);
+  assert.match(source, /formatFinancialCents/);
+  assert.match(financeApp, /useState\(\(\) => billReferenceMonthInSaoPaulo\(\)\)/);
+  assert.match(source, /onChange\(billReferenceMonthInSaoPaulo\(\)\)/);
+  assert.doesNotMatch(source, /MonthNavigator[\s\S]{0,500}toISOString\(\)\.slice\(0, 7\)/);
+  assert.match(route, /from\(bills\)\.where\(eq\(bills\.householdId, householdId\)\)/);
+  assert.doesNotMatch(source.slice(source.indexOf("function BillsView"), source.indexOf("function BillEditorDialog")), /data\.invoices|cardInvoice/);
 });

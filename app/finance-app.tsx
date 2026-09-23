@@ -20,6 +20,7 @@ import type { DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import { activeSubcategories, changeTransactionCategory, changeTransactionType, transactionClassificationError } from "@/lib/finance-ui-rules.mjs";
 import { createFinancialRefreshController } from "@/lib/invoice-ui-rules.mjs";
 import { formatFinancialCents } from "@/lib/ui-preferences.mjs";
+import { billReferenceMonthInSaoPaulo } from "@/lib/bill-ui-rules.mjs";
 import { useUiPreferences } from "@/app/ui-preferences";
 import { ThemeToggle } from "@/app/theme-toggle";
 import { Toaster } from "@/components/ui/sonner";
@@ -60,7 +61,7 @@ export function FinanceApp() {
   const [data, setData] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<View>("dashboard");
-  const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [selectedMonth, setSelectedMonth] = useState(() => billReferenceMonthInSaoPaulo());
   const [advanced, setAdvanced] = useState<AdvancedSnapshot | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [transactionOpen, setTransactionOpen] = useState(false);

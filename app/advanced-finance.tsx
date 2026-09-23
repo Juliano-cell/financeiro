@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { activeBillCategories, activeBillSubcategories, billActions, billClassificationError, billRelativeDueLabel, billTiming, billTodayInSaoPaulo, buildBillPaymentPayload, buildRecurringBillCalendarPayload, changeBillCategory, eligibleRecurringBillIds, filterAndSortBills, friendlyBillPaymentError, initialBillPaymentAccountId, normalizeBillAccountId, normalizeRecurringBillSelection, recurringBillOccurrences, summarizePendingBills, toggleRecurringBillSelection } from "@/lib/bill-ui-rules.mjs";
+import { activeBillCategories, activeBillSubcategories, billActions, billClassificationError, billDayRefreshDelay, billReferenceMonthInSaoPaulo, billRelativeDueLabel, billsForSelectedMonthAndGlobalOverdue, billTiming, billTodayInSaoPaulo, buildBillPaymentPayload, buildRecurringBillCalendarPayload, changeBillCategory, eligibleRecurringBillIds, filterAndSortBills, friendlyBillPaymentError, globalOverdueBills, initialBillPaymentAccountId, normalizeBillAccountId, normalizeRecurringBillSelection, recurringBillOccurrences, summarizePendingBills, toggleRecurringBillSelection } from "@/lib/bill-ui-rules.mjs";
 import { activeSubcategories, changeTransactionCategory, transactionClassificationError } from "@/lib/finance-ui-rules.mjs";
 import { InvoiceLifecycle, type CanonicalInvoice, type FinancialController, type FinancialRefresh } from "@/app/invoice-lifecycle";
 import { CardOnboardingAction } from "@/app/card-onboarding-dialog";
@@ -27,7 +27,7 @@ type Installment = { id: string; purchaseId: string; invoiceId: string; installm
 type Invoice = CanonicalInvoice & { status: "open" | "closed" | "paid"; totalCents: number; installments: Installment[]; openingBalance: { originalCents: number; openingCents: number; initialStateInstallmentsCents: number; allocatedCents: number; residualCents: number; identifiedCents: number } | null };
 type BillPayment = { transactionId: string; paidAmountCents: number; paidOn: string; accountId: string; adjustmentAmountCents: number; adjustmentType: "normal" | "surcharge" | "discount" };
 type Bill = { id: string; description: string; amountCents: number; dueDate: string; categoryId: string | null; subcategoryId: string | null; recurrence: "none" | "monthly"; recurrenceSeriesId: string | null; recurrenceEndDate: string | null; status: "pending" | "paid" | "cancelled"; displayStatus: "pending" | "paid" | "cancelled" | "overdue"; accountId: string | null; notes: string | null; payment: BillPayment | null };
-type BillStatusFilter = "pending" | "paid" | "cancelled" | "all";
+type BillStatusFilter = "pending" | "overdue" | "paid" | "cancelled" | "all";
 type NotificationPreference = { exists: boolean; channel: "telegram"; enabled: boolean; billDueTomorrow: boolean; billDueToday: boolean; billOverdue: boolean; preferredLocalTime: string; timezone: "America/Sao_Paulo" };
 export type AdvancedSnapshot = { selectedMonth: string; cards: Card[]; invoices: Invoice[]; installments: Installment[]; bills: Bill[]; notificationSettings: { enabled: boolean; offsets: number[] }; summary: { availableCents: number; incomeCents: number; expenseCents: number; paidBillsCents: number; pendingBillsCents: number; cardCents: number; installmentCents: number; commitmentsCents: number; projectedCents: number } };
 
@@ -48,7 +48,7 @@ export class AdvancedApiError extends Error {
 }
 
 export async function advancedApi(body?: Record<string, unknown>, month?: string, signal?: AbortSignal) {
-  const response = await fetch(body ? "/api/finance/advanced" : `/api/finance/advanced?month=${encodeURIComponent(month ?? new Date().toISOString().slice(0, 7))}`, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal } : { signal });
+  const response = await fetch(body ? "/api/finance/advanced" : `/api/finance/advanced?month=${encodeURIComponent(month ?? billReferenceMonthInSaoPaulo())}`, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal } : { signal });
   let data: { error?: string; code?: string } & Record<string, unknown>;
   try { data = await response.json(); } catch { throw new AdvancedApiError("Não foi possível confirmar o resultado da operação.", undefined, response.status); }
   if (!response.ok) throw new AdvancedApiError(data.error ?? "Não foi possível concluir a operação.", data.code, response.status);
@@ -75,8 +75,7 @@ async function notificationPreferencesApi(preference?: Omit<NotificationPreferen
 }
 
 export function MonthNavigator({ month, onChange }: { month: string; onChange: (month: string) => void }) {
-  const current = new Date().toISOString().slice(0, 7);
-  return <div className="flex items-center justify-between gap-1 rounded-xl border border-[#d8e1de] bg-white p-1 shadow-sm" aria-label="Selecionar mês"><Button variant="ghost" size="icon" onClick={() => onChange(addMonth(month, -1))} aria-label="Mês anterior"><ChevronLeft className="h-4 w-4" /></Button><button className="min-w-32 px-2 text-sm font-semibold capitalize" onClick={() => onChange(current)} title="Voltar ao mês atual">{monthLabel(month)}</button><Button variant="ghost" size="icon" onClick={() => onChange(addMonth(month, 1))} aria-label="Próximo mês"><ChevronRight className="h-4 w-4" /></Button></div>;
+  return <div className="flex items-center justify-between gap-1 rounded-xl border bg-card p-1 shadow-sm" aria-label="Selecionar mês"><Button variant="ghost" size="icon" onClick={() => onChange(addMonth(month, -1))} aria-label="Mês anterior"><ChevronLeft className="h-4 w-4" /></Button><button className="min-w-32 px-2 text-sm font-semibold capitalize" onClick={() => onChange(billReferenceMonthInSaoPaulo())} title="Voltar ao mês atual">{monthLabel(month)}</button><Button variant="ghost" size="icon" onClick={() => onChange(addMonth(month, 1))} aria-label="Próximo mês"><ChevronRight className="h-4 w-4" /></Button></div>;
 }
 
 export function AdvancedFinanceView({ view, data, accounts, categories, onChanged, financial, onFinancialRefresh }: { view: AdvancedView; data: AdvancedSnapshot | null; accounts: Account[]; categories: Category[]; onChanged: () => Promise<void>; financial?: FinancialController; onFinancialRefresh?: FinancialRefresh }) {
@@ -149,60 +148,75 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
   const [search, setSearch] = useState("");
   const [accountFilter, setAccountFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
-  const today = billTodayInSaoPaulo();
+  const [today, setToday] = useState(() => billTodayInSaoPaulo());
+  useEffect(() => {
+    let timer = 0;
+    const scheduleNextDay = () => {
+      timer = window.setTimeout(() => {
+        setToday(billTodayInSaoPaulo());
+        scheduleNextDay();
+      }, billDayRefreshDelay());
+    };
+    scheduleNextDay();
+    return () => window.clearTimeout(timer);
+  }, []);
   const monthRows = data.bills.filter((item) => item.dueDate.startsWith(data.selectedMonth));
-  const rows = filterAndSortBills(monthRows, { today, status: statusFilter, search, accountId: accountFilter, categoryId: categoryFilter }) as Bill[];
-  const summary = summarizePendingBills(monthRows, today);
+  const globalOverdueRows = globalOverdueBills(data.bills, today) as Bill[];
+  const relevantRows = billsForSelectedMonthAndGlobalOverdue(data.bills, data.selectedMonth, today) as Bill[];
+  const rows = filterAndSortBills(relevantRows, { today, status: statusFilter, search, accountId: accountFilter, categoryId: categoryFilter }) as Bill[];
+  const monthSummary = summarizePendingBills(monthRows, today);
+  const overdueSummary = summarizePendingBills(globalOverdueRows, today).overdue;
+  const summary = { overdue: overdueSummary, today: monthSummary.today, upcoming: monthSummary.upcoming };
   const categoryName = (bill: Bill) => categories.find((category) => category.id === bill.categoryId)?.name ?? "Sem categoria";
   const subcategoryName = (bill: Bill) => categories.flatMap((category) => category.subcategories ?? []).find((subcategory) => subcategory.id === bill.subcategoryId)?.name ?? "Sem subcategoria";
   const accountName = (bill: Bill) => accounts.find((account) => account.id === bill.accountId)?.name ?? "Definir ao pagar";
-  const filterAccounts = accounts.filter((account) => monthRows.some((bill) => bill.accountId === account.id));
-  const filterCategories = categories.filter((category) => monthRows.some((bill) => bill.categoryId === category.id));
+  const filterAccounts = accounts.filter((account) => relevantRows.some((bill) => bill.accountId === account.id));
+  const filterCategories = categories.filter((category) => relevantRows.some((bill) => bill.categoryId === category.id));
   const nextSession = () => crypto.randomUUID();
   const openEditor = (item: Bill | null) => setEditor({ item, session: nextSession() });
   const openPayment = (bill: Bill) => setPayment({ bill, session: nextSession() });
   const hasSecondaryFilters = Boolean(search || accountFilter !== "all" || categoryFilter !== "all");
   const sectionDefinitions = [
-    { key: "overdue", title: "Atrasadas", description: "Exigem atenção", tone: "text-[#9b3b43]" },
-    { key: "today", title: "Vencem hoje", description: "Pendências do dia", tone: "text-[#8a5a16]" },
-    { key: "upcoming", title: "Próximas", description: "Vencimentos futuros", tone: "text-[#315f55]" },
-    { key: "paid", title: "Pagas", description: "Pagamentos concluídos", tone: "text-[#39742c]" },
-    { key: "cancelled", title: "Canceladas", description: "Sem efeito financeiro", tone: "text-[#71837e]" },
+    { key: "overdue", title: "Atrasadas — todos os meses", description: "Pendências vencidas em qualquer competência", tone: "text-destructive" },
+    { key: "today", title: "Vencem hoje", description: "Pendências do dia no mês selecionado", tone: "text-chart-2" },
+    { key: "upcoming", title: "Próximas", description: "Vencimentos futuros no mês selecionado", tone: "text-foreground" },
+    { key: "paid", title: "Pagas", description: "Pagamentos do mês selecionado", tone: "text-foreground" },
+    { key: "cancelled", title: "Canceladas", description: "Sem efeito financeiro no mês selecionado", tone: "text-muted-foreground" },
   ].map((section) => ({ ...section, items: rows.filter((bill) => billTiming(bill, today) === section.key) })).filter((section) => section.items.length > 0);
 
   return <section>
     <Heading title="Contas e vencimentos" text="Pendências, recorrências e pagamentos ligados a uma única movimentação." action={<Button onClick={() => openEditor(null)}><Plus className="h-4 w-4" /> Nova conta</Button>} />
     <dl className="mt-6 grid min-w-0 grid-cols-3 gap-2 sm:gap-3" aria-label="Resumo dos vencimentos pendentes">
       {[
-        { key: "overdue", label: "Atrasadas", value: summary.overdue, tone: "border-[#efc8cb] bg-[#fff6f6] text-[#8c3434]" },
-        { key: "today", label: "Hoje", value: summary.today, tone: "border-[#ead6a3] bg-[#fffaf0] text-[#805318]" },
-        { key: "upcoming", label: "Próximas", value: summary.upcoming, tone: "border-[#cfe0db] bg-[#f4f8f6] text-[#315f55]" },
+        { key: "overdue", label: "Atrasadas", value: summary.overdue, tone: "border-destructive/30 bg-destructive/10 text-destructive" },
+        { key: "today", label: "Hoje", value: summary.today, tone: "border-chart-2/40 bg-chart-2/10 text-chart-2" },
+        { key: "upcoming", label: "Próximas", value: summary.upcoming, tone: "border-border bg-muted text-foreground" },
       ].map((item) => <div key={item.key} className={`min-w-0 rounded-2xl border p-3 sm:p-4 ${item.tone}`}><dt className="truncate text-xs font-semibold sm:text-sm">{item.label}</dt><dd className="mt-1 flex min-w-0 flex-col gap-0.5"><span className="text-xl font-semibold tabular-nums">{item.value.count}</span><span className="break-words text-xs font-medium tabular-nums sm:text-sm">{brl(item.value.valueCents)}</span></dd></div>)}
     </dl>
-    <div className="mt-5 rounded-2xl border bg-white p-3 sm:p-4">
+    <div className="mt-5 rounded-2xl border bg-card p-3 sm:p-4">
       <div className="flex flex-wrap gap-2" aria-label="Filtrar vencimentos por status">
-        {([{"value":"pending","label":"Pendentes"},{"value":"paid","label":"Pagas"},{"value":"cancelled","label":"Canceladas"},{"value":"all","label":"Todas"}] as Array<{ value: BillStatusFilter; label: string }>).map((item) => <Button key={item.value} type="button" size="sm" variant={statusFilter === item.value ? "default" : "outline"} className="min-h-10 flex-1 sm:flex-none" aria-pressed={statusFilter === item.value} onClick={() => setStatusFilter(item.value)}>{item.label}</Button>)}
+        {([{"value":"pending","label":"Pendentes"},{"value":"overdue","label":"Atrasadas"},{"value":"paid","label":"Pagas"},{"value":"cancelled","label":"Canceladas"},{"value":"all","label":"Todas"}] as Array<{ value: BillStatusFilter; label: string }>).map((item) => <Button key={item.value} type="button" size="sm" variant={statusFilter === item.value ? "default" : "outline"} className="min-h-10 flex-1 sm:flex-none" aria-pressed={statusFilter === item.value} onClick={() => setStatusFilter(item.value)}>{item.label}</Button>)}
       </div>
       <div className="mt-3 grid min-w-0 gap-2 md:grid-cols-[minmax(12rem,1fr)_minmax(10rem,.7fr)_minmax(10rem,.7fr)_auto]">
-        <label className="relative min-w-0"><span className="sr-only">Buscar por descrição</span><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#71837e]" /><Input value={search} onChange={(event) => setSearch(event.target.value)} className="min-h-11 pl-9" placeholder="Buscar descrição" /></label>
+        <label className="relative min-w-0"><span className="sr-only">Buscar por descrição</span><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} className="min-h-11 pl-9" placeholder="Buscar descrição" /></label>
         <Select value={accountFilter} onValueChange={setAccountFilter}><SelectTrigger className="min-h-11 w-full"><SelectValue placeholder="Todas as contas" /></SelectTrigger><SelectContent><SelectItem value="all">Todas as contas</SelectItem><SelectItem value="unassigned">Definir ao pagar</SelectItem>{filterAccounts.map((account) => <SelectItem key={account.id} value={account.id}>{account.name}</SelectItem>)}</SelectContent></Select>
         <Select value={categoryFilter} onValueChange={setCategoryFilter}><SelectTrigger className="min-h-11 w-full"><SelectValue placeholder="Todas as categorias" /></SelectTrigger><SelectContent><SelectItem value="all">Todas as categorias</SelectItem>{filterCategories.map((category) => <SelectItem key={category.id} value={category.id}>{category.name}</SelectItem>)}</SelectContent></Select>
         {hasSecondaryFilters && <Button type="button" variant="ghost" className="min-h-11" onClick={() => { setSearch(""); setAccountFilter("all"); setCategoryFilter("all"); }}>Limpar</Button>}
       </div>
     </div>
-    <div className="mt-6 grid min-w-0 gap-6">{sectionDefinitions.length ? sectionDefinitions.map((section) => <section key={section.key} aria-labelledby={`bill-section-${section.key}`}><div className="mb-2 flex min-w-0 flex-wrap items-baseline justify-between gap-2"><div className="min-w-0"><h3 id={`bill-section-${section.key}`} className={`font-semibold ${section.tone}`}>{section.title}</h3><p className="text-xs text-[#71837e]">{section.description}</p></div><span className="text-xs tabular-nums text-[#71837e]">{section.items.length} {section.items.length === 1 ? "item" : "itens"}</span></div><div className="grid min-w-0 gap-3">{section.items.map((item) => {
+    <div className="mt-6 grid min-w-0 gap-6">{sectionDefinitions.length ? sectionDefinitions.map((section) => <section key={section.key} aria-labelledby={`bill-section-${section.key}`}><div className="mb-2 flex min-w-0 flex-wrap items-baseline justify-between gap-2"><div className="min-w-0"><h3 id={`bill-section-${section.key}`} className={`font-semibold ${section.tone}`}>{section.title}</h3><p className="text-xs text-muted-foreground">{section.description}</p></div><span className="text-xs tabular-nums text-muted-foreground">{section.items.length} {section.items.length === 1 ? "item" : "itens"}</span></div><div className="grid min-w-0 gap-3">{section.items.map((item) => {
       const actions = billActions(item.status);
       const timing = billTiming(item, today);
       const status = item.status === "paid" ? "Paga" : item.status === "cancelled" ? "Cancelada" : timing === "overdue" ? "Atrasada" : timing === "today" ? "Vence hoje" : "Pendente";
       const relative = item.status === "pending" ? billRelativeDueLabel(item.dueDate, today) : null;
       const classification = item.subcategoryId ? `${categoryName(item)} · ${subcategoryName(item)}` : categoryName(item);
-      return <article key={item.id} className={`min-w-0 rounded-2xl border bg-white p-4 ${timing === "overdue" ? "border-[#efc8cb]" : timing === "today" ? "border-[#ead6a3]" : ""} ${item.status === "cancelled" ? "opacity-70" : ""}`}>
+      return <article key={item.id} className={`min-w-0 rounded-2xl border bg-card p-4 ${timing === "overdue" ? "border-destructive/30" : timing === "today" ? "border-chart-2/40" : ""} ${item.status === "cancelled" ? "opacity-70" : ""}`}>
         <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0 flex-1"><div className="flex min-w-0 flex-wrap items-center gap-2"><h4 className="min-w-0 break-words font-medium">{item.description}</h4><Badge variant={item.status === "cancelled" || timing === "overdue" ? "destructive" : item.status === "paid" ? "secondary" : "outline"} className={timing === "today" ? "border-[#d8b75f] bg-[#fff8e5] text-[#805318]" : undefined}>{status}</Badge></div><p className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5 text-sm"><span className={timing === "overdue" ? "font-semibold text-[#9b3b43]" : timing === "today" ? "font-semibold text-[#8a5a16]" : "text-[#48645e]"}>{relative ?? `Vencimento em ${formatBillDate(item.dueDate)}`}</span>{relative && <><span className="text-[#a1aea9]" aria-hidden="true">·</span><span className="text-[#71837e]">{formatBillDate(item.dueDate)}</span></>}</p><p className="mt-1.5 break-words text-xs text-[#71837e]">{classification} · {item.recurrence === "monthly" ? "Mensal" : "Avulsa"}</p><p className="mt-1 break-words text-xs text-[#71837e]">Conta: {accountName(item)}</p></div>
-          <div className="sm:max-w-[40%] sm:text-right"><span className="block text-xs text-[#71837e]">{item.payment ? "Valor pago" : "Valor previsto"}</span><strong className="mt-1 block break-words text-xl tabular-nums">{brl(item.payment?.paidAmountCents ?? item.amountCents)}</strong></div>
+          <div className="min-w-0 flex-1"><div className="flex min-w-0 flex-wrap items-center gap-2"><h4 className="min-w-0 break-words font-medium">{item.description}</h4><Badge variant={item.status === "cancelled" || timing === "overdue" ? "destructive" : item.status === "paid" ? "secondary" : "outline"} className={timing === "today" ? "border-chart-2/40 bg-chart-2/10 text-chart-2" : undefined}>{status}</Badge></div><p className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5 text-sm"><span className={timing === "overdue" ? "font-semibold text-destructive" : timing === "today" ? "font-semibold text-chart-2" : "text-foreground"}>{relative ?? `Vencimento em ${formatBillDate(item.dueDate)}`}</span>{relative && <><span className="text-muted-foreground" aria-hidden="true">·</span><span className="text-muted-foreground">{formatBillDate(item.dueDate)}</span></>}</p>{timing === "overdue" && <p className="mt-1 text-xs font-medium text-muted-foreground">Competência: {monthLabel(item.dueDate.slice(0, 7))}</p>}<p className="mt-1.5 break-words text-xs text-muted-foreground">{classification} · {item.recurrence === "monthly" ? "Mensal" : "Avulsa"}</p><p className="mt-1 break-words text-xs text-muted-foreground">Conta: {accountName(item)}</p></div>
+          <div className="sm:max-w-[40%] sm:text-right"><span className="block text-xs text-muted-foreground">{item.payment ? "Valor pago" : "Valor previsto"}</span><strong className="mt-1 block break-words text-xl tabular-nums">{brl(item.payment?.paidAmountCents ?? item.amountCents)}</strong></div>
         </div>
-        {item.payment && <dl className="mt-3 grid gap-2 rounded-xl bg-[#f4f7f5] p-3 text-sm sm:grid-cols-3"><BillDetail label="Valor previsto" value={brl(item.amountCents)} /><BillDetail label="Data do pagamento" value={formatBillDate(item.payment.paidOn)} />{item.payment.adjustmentType === "normal" ? <BillDetail label="Ajuste" value="Sem ajuste" /> : <BillDetail label={item.payment.adjustmentType === "surcharge" ? "Acréscimo / juros" : "Desconto"} value={`${item.payment.adjustmentType === "surcharge" ? "+ " : ""}${brl(Math.abs(item.payment.adjustmentAmountCents))}`} />}</dl>}
-        {item.notes && <details className="mt-3 text-sm text-[#526b65]"><summary className="cursor-pointer font-medium text-[#48645e]">Ver observação</summary><p className="mt-2 break-words rounded-xl bg-[#f4f7f5] p-3">{item.notes}</p></details>}
+        {item.payment && <dl className="mt-3 grid gap-2 rounded-xl bg-muted p-3 text-sm sm:grid-cols-3"><BillDetail label="Valor previsto" value={brl(item.amountCents)} /><BillDetail label="Data do pagamento" value={formatBillDate(item.payment.paidOn)} />{item.payment.adjustmentType === "normal" ? <BillDetail label="Ajuste" value="Sem ajuste" /> : <BillDetail label={item.payment.adjustmentType === "surcharge" ? "Acréscimo / juros" : "Desconto"} value={`${item.payment.adjustmentType === "surcharge" ? "+ " : ""}${brl(Math.abs(item.payment.adjustmentAmountCents))}`} />}</dl>}
+        {item.notes && <details className="mt-3 text-sm text-muted-foreground"><summary className="cursor-pointer font-medium text-foreground">Ver observação</summary><p className="mt-2 break-words rounded-xl bg-muted p-3">{item.notes}</p></details>}
         {actions.length > 0 && <div className="mt-4 flex flex-wrap justify-end gap-2 border-t pt-3">
           {actions.includes("pay") && <Button className="min-h-11 flex-1 sm:flex-none" variant={timing === "overdue" ? "destructive" : "default"} onClick={() => openPayment(item)}>{timing === "overdue" ? "Pagar atrasada" : "Pagar"}</Button>}
           {actions.includes("edit") && <Button className="min-h-11" variant="outline" onClick={() => openEditor(item)}><Pencil className="h-4 w-4" /> Editar</Button>}
@@ -210,7 +224,7 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
           {actions.includes("undo") && <Button className="min-h-11 w-full sm:w-auto" variant="outline" onClick={() => setConfirmation({ bill: item, kind: "undo", session: nextSession() })}><RotateCcw className="h-4 w-4" /> Desfazer pagamento</Button>}
         </div>}
       </article>;
-    })}</div></section>) : <Empty icon={CalendarClock} text={monthRows.length ? "Nenhum vencimento corresponde aos filtros." : "Nenhum vencimento neste mês."} />}</div>
+    })}</div></section>) : <Empty icon={CalendarClock} text={relevantRows.length ? "Nenhum vencimento corresponde aos filtros." : "Nenhum vencimento neste mês e nenhuma conta atrasada."} />}</div>
     {editor && <BillEditorDialog key={editor.session} open item={editor.item} bills={data.bills} accounts={accounts} categories={categories} onOpenChange={(open) => { if (!open) setEditor(null); }} onChanged={onChanged} />}
     {payment && <BillPaymentDialog key={payment.session} open bill={payment.bill} accounts={accounts} categories={categories} onOpenChange={(open) => { if (!open) setPayment(null); }} onChanged={onChanged} onEdit={() => { const bill = payment.bill; setPayment(null); openEditor(bill); }} />}
     {confirmation && <BillConfirmationDialog key={confirmation.session} open bill={confirmation.bill} kind={confirmation.kind} onOpenChange={(open) => { if (!open) setConfirmation(null); }} onChanged={onChanged} />}
