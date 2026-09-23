@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { activeBillCategories, activeBillSubcategories, billActions, billClassificationError, billDayRefreshDelay, billReferenceMonthInSaoPaulo, billRelativeDueLabel, billsForSelectedMonthAndGlobalOverdue, billTiming, billTodayInSaoPaulo, buildBillPaymentPayload, buildRecurringBillCalendarPayload, changeBillCategory, eligibleRecurringBillIds, filterAndSortBills, friendlyBillPaymentError, globalOverdueBills, initialBillPaymentAccountId, normalizeBillAccountId, normalizeRecurringBillSelection, recurringBillOccurrences, summarizePendingBills, toggleRecurringBillSelection } from "@/lib/bill-ui-rules.mjs";
+import { activeBillCategories, activeBillSubcategories, billActions, billClassificationError, billDayRefreshDelay, billReferenceMonthInSaoPaulo, billRelativeDueLabel, billsForSelectedMonthAndGlobalOverdue, billTiming, billTodayInSaoPaulo, buildBillPaymentPayload, buildRecurringBillCalendarPayload, changeBillCategory, eligibleRecurringBillIds, filterAndSortBills, filterAndSortPaidBills, friendlyBillPaymentError, globalOverdueBills, initialBillPaymentAccountId, normalizeBillAccountId, normalizeRecurringBillSelection, paidBillAccountId, paidBillsForSelectedMonth, recurringBillOccurrences, summarizePendingBills, toggleRecurringBillSelection } from "@/lib/bill-ui-rules.mjs";
 import { activeSubcategories, changeTransactionCategory, transactionClassificationError } from "@/lib/finance-ui-rules.mjs";
 import { InvoiceLifecycle, type CanonicalInvoice, type FinancialController, type FinancialRefresh } from "@/app/invoice-lifecycle";
 import { CardOnboardingAction } from "@/app/card-onboarding-dialog";
@@ -28,6 +28,7 @@ type Invoice = CanonicalInvoice & { status: "open" | "closed" | "paid"; totalCen
 type BillPayment = { transactionId: string; paidAmountCents: number; paidOn: string; accountId: string; adjustmentAmountCents: number; adjustmentType: "normal" | "surcharge" | "discount" };
 type Bill = { id: string; description: string; amountCents: number; dueDate: string; categoryId: string | null; subcategoryId: string | null; recurrence: "none" | "monthly"; recurrenceSeriesId: string | null; recurrenceEndDate: string | null; status: "pending" | "paid" | "cancelled"; displayStatus: "pending" | "paid" | "cancelled" | "overdue"; accountId: string | null; notes: string | null; payment: BillPayment | null };
 type BillStatusFilter = "pending" | "overdue" | "paid" | "cancelled" | "all";
+type PaidBillDateView = "due" | "payment";
 type NotificationPreference = { exists: boolean; channel: "telegram"; enabled: boolean; billDueTomorrow: boolean; billDueToday: boolean; billOverdue: boolean; preferredLocalTime: string; timezone: "America/Sao_Paulo" };
 export type AdvancedSnapshot = { selectedMonth: string; cards: Card[]; invoices: Invoice[]; installments: Installment[]; bills: Bill[]; notificationSettings: { enabled: boolean; offsets: number[] }; summary: { availableCents: number; incomeCents: number; expenseCents: number; paidBillsCents: number; pendingBillsCents: number; cardCents: number; installmentCents: number; commitmentsCents: number; projectedCents: number } };
 
@@ -148,6 +149,7 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
   const [search, setSearch] = useState("");
   const [accountFilter, setAccountFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
+  const [paidDateView, setPaidDateView] = useState<PaidBillDateView>("due");
   const [today, setToday] = useState(() => billTodayInSaoPaulo());
   useEffect(() => {
     let timer = 0;
@@ -163,24 +165,40 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
   const monthRows = data.bills.filter((item) => item.dueDate.startsWith(data.selectedMonth));
   const globalOverdueRows = globalOverdueBills(data.bills, today) as Bill[];
   const relevantRows = billsForSelectedMonthAndGlobalOverdue(data.bills, data.selectedMonth, today) as Bill[];
-  const rows = filterAndSortBills(relevantRows, { today, status: statusFilter, search, accountId: accountFilter, categoryId: categoryFilter }) as Bill[];
+  const paidScopeRows = paidBillsForSelectedMonth(data.bills, data.selectedMonth, paidDateView) as Bill[];
+  const rows = statusFilter === "paid"
+    ? filterAndSortPaidBills(data.bills, { selectedMonth: data.selectedMonth, dateView: paidDateView, search, accountId: accountFilter, categoryId: categoryFilter }) as Bill[]
+    : filterAndSortBills(relevantRows, { today, status: statusFilter, search, accountId: accountFilter, categoryId: categoryFilter }) as Bill[];
+  const filterSourceRows = statusFilter === "paid" ? paidScopeRows : relevantRows;
   const monthSummary = summarizePendingBills(monthRows, today);
   const overdueSummary = summarizePendingBills(globalOverdueRows, today).overdue;
   const summary = { overdue: overdueSummary, today: monthSummary.today, upcoming: monthSummary.upcoming };
   const categoryName = (bill: Bill) => categories.find((category) => category.id === bill.categoryId)?.name ?? "Sem categoria";
   const subcategoryName = (bill: Bill) => categories.flatMap((category) => category.subcategories ?? []).find((subcategory) => subcategory.id === bill.subcategoryId)?.name ?? "Sem subcategoria";
-  const accountName = (bill: Bill) => accounts.find((account) => account.id === bill.accountId)?.name ?? "Definir ao pagar";
-  const filterAccounts = accounts.filter((account) => relevantRows.some((bill) => bill.accountId === account.id));
-  const filterCategories = categories.filter((category) => relevantRows.some((bill) => bill.categoryId === category.id));
+  const accountName = (bill: Bill) => {
+    const accountId = statusFilter === "paid" ? paidBillAccountId(bill, paidDateView) : bill.accountId;
+    return accounts.find((account) => account.id === accountId)?.name ?? (paidDateView === "payment" ? "Conta indisponível" : "Definir ao pagar");
+  };
+  const filterAccounts = accounts.filter((account) => account.id === accountFilter || filterSourceRows.some((bill) => paidBillAccountId(bill, statusFilter === "paid" ? paidDateView : "due") === account.id));
+  const filterCategories = categories.filter((category) => category.id === categoryFilter || filterSourceRows.some((bill) => bill.categoryId === category.id));
   const nextSession = () => crypto.randomUUID();
   const openEditor = (item: Bill | null) => setEditor({ item, session: nextSession() });
   const openPayment = (bill: Bill) => setPayment({ bill, session: nextSession() });
+  const selectStatus = (value: BillStatusFilter) => {
+    if (paidDateView === "payment") setAccountFilter("all");
+    setPaidDateView("due");
+    setStatusFilter(value);
+  };
+  const selectPaidDateView = (value: PaidBillDateView) => {
+    setAccountFilter("all");
+    setPaidDateView(value);
+  };
   const hasSecondaryFilters = Boolean(search || accountFilter !== "all" || categoryFilter !== "all");
   const sectionDefinitions = [
     { key: "overdue", title: "Atrasadas — todos os meses", description: "Pendências vencidas em qualquer competência", tone: "text-destructive" },
     { key: "today", title: "Vencem hoje", description: "Pendências do dia no mês selecionado", tone: "text-chart-2" },
     { key: "upcoming", title: "Próximas", description: "Vencimentos futuros no mês selecionado", tone: "text-foreground" },
-    { key: "paid", title: "Pagas", description: "Pagamentos do mês selecionado", tone: "text-foreground" },
+    { key: "paid", title: paidDateView === "payment" ? "Pagamentos realizados no mês" : "Pagas da competência", description: paidDateView === "payment" ? "Contas efetivamente pagas no mês selecionado" : "Contas com vencimento no mês selecionado", tone: "text-foreground" },
     { key: "cancelled", title: "Canceladas", description: "Sem efeito financeiro no mês selecionado", tone: "text-muted-foreground" },
   ].map((section) => ({ ...section, items: rows.filter((bill) => billTiming(bill, today) === section.key) })).filter((section) => section.items.length > 0);
 
@@ -195,11 +213,12 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
     </dl>
     <div className="mt-5 rounded-2xl border bg-card p-3 sm:p-4">
       <div className="flex flex-wrap gap-2" aria-label="Filtrar vencimentos por status">
-        {([{"value":"pending","label":"Pendentes"},{"value":"overdue","label":"Atrasadas"},{"value":"paid","label":"Pagas"},{"value":"cancelled","label":"Canceladas"},{"value":"all","label":"Todas"}] as Array<{ value: BillStatusFilter; label: string }>).map((item) => <Button key={item.value} type="button" size="sm" variant={statusFilter === item.value ? "default" : "outline"} className="min-h-10 flex-1 sm:flex-none" aria-pressed={statusFilter === item.value} onClick={() => setStatusFilter(item.value)}>{item.label}</Button>)}
+        {([{"value":"pending","label":"Pendentes"},{"value":"overdue","label":"Atrasadas"},{"value":"paid","label":"Pagas"},{"value":"cancelled","label":"Canceladas"},{"value":"all","label":"Todas"}] as Array<{ value: BillStatusFilter; label: string }>).map((item) => <Button key={item.value} type="button" size="sm" variant={statusFilter === item.value ? "default" : "outline"} className="min-h-10 flex-1 sm:flex-none" aria-pressed={statusFilter === item.value} onClick={() => selectStatus(item.value)}>{item.label}</Button>)}
       </div>
+      {statusFilter === "paid" && <div className="mt-3 flex flex-col gap-2 rounded-xl bg-muted p-2 sm:flex-row sm:items-center sm:justify-between"><span className="px-1 text-xs font-medium text-muted-foreground">Organizar pagas por</span><div className="flex gap-2" role="group" aria-label="Organizar contas pagas"><Button type="button" size="sm" className="min-h-10 flex-1 sm:flex-none" variant={paidDateView === "due" ? "default" : "outline"} aria-pressed={paidDateView === "due"} onClick={() => selectPaidDateView("due")}>Por vencimento</Button><Button type="button" size="sm" className="min-h-10 flex-1 sm:flex-none" variant={paidDateView === "payment" ? "default" : "outline"} aria-pressed={paidDateView === "payment"} onClick={() => selectPaidDateView("payment")}>Por pagamento</Button></div></div>}
       <div className="mt-3 grid min-w-0 gap-2 md:grid-cols-[minmax(12rem,1fr)_minmax(10rem,.7fr)_minmax(10rem,.7fr)_auto]">
         <label className="relative min-w-0"><span className="sr-only">Buscar por descrição</span><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" /><Input value={search} onChange={(event) => setSearch(event.target.value)} className="min-h-11 pl-9" placeholder="Buscar descrição" /></label>
-        <Select value={accountFilter} onValueChange={setAccountFilter}><SelectTrigger className="min-h-11 w-full"><SelectValue placeholder="Todas as contas" /></SelectTrigger><SelectContent><SelectItem value="all">Todas as contas</SelectItem><SelectItem value="unassigned">Definir ao pagar</SelectItem>{filterAccounts.map((account) => <SelectItem key={account.id} value={account.id}>{account.name}</SelectItem>)}</SelectContent></Select>
+        <Select value={accountFilter} onValueChange={setAccountFilter}><SelectTrigger className="min-h-11 w-full"><SelectValue placeholder="Todas as contas" /></SelectTrigger><SelectContent><SelectItem value="all">Todas as contas</SelectItem>{!(statusFilter === "paid" && paidDateView === "payment") && <SelectItem value="unassigned">Definir ao pagar</SelectItem>}{filterAccounts.map((account) => <SelectItem key={account.id} value={account.id}>{account.name}</SelectItem>)}</SelectContent></Select>
         <Select value={categoryFilter} onValueChange={setCategoryFilter}><SelectTrigger className="min-h-11 w-full"><SelectValue placeholder="Todas as categorias" /></SelectTrigger><SelectContent><SelectItem value="all">Todas as categorias</SelectItem>{filterCategories.map((category) => <SelectItem key={category.id} value={category.id}>{category.name}</SelectItem>)}</SelectContent></Select>
         {hasSecondaryFilters && <Button type="button" variant="ghost" className="min-h-11" onClick={() => { setSearch(""); setAccountFilter("all"); setCategoryFilter("all"); }}>Limpar</Button>}
       </div>
@@ -212,10 +231,10 @@ function BillsView({ data, accounts, categories, onChanged }: { data: AdvancedSn
       const classification = item.subcategoryId ? `${categoryName(item)} · ${subcategoryName(item)}` : categoryName(item);
       return <article key={item.id} className={`min-w-0 rounded-2xl border bg-card p-4 ${timing === "overdue" ? "border-destructive/30" : timing === "today" ? "border-chart-2/40" : ""} ${item.status === "cancelled" ? "opacity-70" : ""}`}>
         <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0 flex-1"><div className="flex min-w-0 flex-wrap items-center gap-2"><h4 className="min-w-0 break-words font-medium">{item.description}</h4><Badge variant={item.status === "cancelled" || timing === "overdue" ? "destructive" : item.status === "paid" ? "secondary" : "outline"} className={timing === "today" ? "border-chart-2/40 bg-chart-2/10 text-chart-2" : undefined}>{status}</Badge></div><p className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5 text-sm"><span className={timing === "overdue" ? "font-semibold text-destructive" : timing === "today" ? "font-semibold text-chart-2" : "text-foreground"}>{relative ?? `Vencimento em ${formatBillDate(item.dueDate)}`}</span>{relative && <><span className="text-muted-foreground" aria-hidden="true">·</span><span className="text-muted-foreground">{formatBillDate(item.dueDate)}</span></>}</p>{timing === "overdue" && <p className="mt-1 text-xs font-medium text-muted-foreground">Competência: {monthLabel(item.dueDate.slice(0, 7))}</p>}<p className="mt-1.5 break-words text-xs text-muted-foreground">{classification} · {item.recurrence === "monthly" ? "Mensal" : "Avulsa"}</p><p className="mt-1 break-words text-xs text-muted-foreground">Conta: {accountName(item)}</p></div>
+          <div className="min-w-0 flex-1"><div className="flex min-w-0 flex-wrap items-center gap-2"><h4 className="min-w-0 break-words font-medium">{item.description}</h4><Badge variant={item.status === "cancelled" || timing === "overdue" ? "destructive" : item.status === "paid" ? "secondary" : "outline"} className={timing === "today" ? "border-chart-2/40 bg-chart-2/10 text-chart-2" : undefined}>{status}</Badge></div><p className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5 text-sm"><span className={timing === "overdue" ? "font-semibold text-destructive" : timing === "today" ? "font-semibold text-chart-2" : "text-foreground"}>{relative ?? `Vencimento em ${formatBillDate(item.dueDate)}`}</span>{relative && <><span className="text-muted-foreground" aria-hidden="true">·</span><span className="text-muted-foreground">{formatBillDate(item.dueDate)}</span></>}</p>{timing === "overdue" && <p className="mt-1 text-xs font-medium text-muted-foreground">Competência: {monthLabel(item.dueDate.slice(0, 7))}</p>}<p className="mt-1.5 break-words text-xs text-muted-foreground">{classification} · {item.recurrence === "monthly" ? "Mensal" : "Avulsa"}</p><p className="mt-1 break-words text-xs text-muted-foreground">{statusFilter === "paid" && paidDateView === "payment" ? "Conta do pagamento" : "Conta"}: {accountName(item)}</p></div>
           <div className="sm:max-w-[40%] sm:text-right"><span className="block text-xs text-muted-foreground">{item.payment ? "Valor pago" : "Valor previsto"}</span><strong className="mt-1 block break-words text-xl tabular-nums">{brl(item.payment?.paidAmountCents ?? item.amountCents)}</strong></div>
         </div>
-        {item.payment && <dl className="mt-3 grid gap-2 rounded-xl bg-muted p-3 text-sm sm:grid-cols-3"><BillDetail label="Valor previsto" value={brl(item.amountCents)} /><BillDetail label="Data do pagamento" value={formatBillDate(item.payment.paidOn)} />{item.payment.adjustmentType === "normal" ? <BillDetail label="Ajuste" value="Sem ajuste" /> : <BillDetail label={item.payment.adjustmentType === "surcharge" ? "Acréscimo / juros" : "Desconto"} value={`${item.payment.adjustmentType === "surcharge" ? "+ " : ""}${brl(Math.abs(item.payment.adjustmentAmountCents))}`} />}</dl>}
+        {item.payment && <dl className="mt-3 grid gap-2 rounded-xl bg-muted p-3 text-sm sm:grid-cols-3"><BillDetail label="Valor previsto" value={brl(item.amountCents)} /><BillDetail label="Pago em" value={formatBillDate(item.payment.paidOn)} />{item.payment.adjustmentType === "normal" ? <BillDetail label="Ajuste" value="Sem ajuste" /> : <BillDetail label={item.payment.adjustmentType === "surcharge" ? "Acréscimo / juros" : "Desconto"} value={`${item.payment.adjustmentType === "surcharge" ? "+ " : ""}${brl(Math.abs(item.payment.adjustmentAmountCents))}`} />}</dl>}
         {item.notes && <details className="mt-3 text-sm text-muted-foreground"><summary className="cursor-pointer font-medium text-foreground">Ver observação</summary><p className="mt-2 break-words rounded-xl bg-muted p-3">{item.notes}</p></details>}
         {actions.length > 0 && <div className="mt-4 flex flex-wrap justify-end gap-2 border-t pt-3">
           {actions.includes("pay") && <Button className="min-h-11 flex-1 sm:flex-none" variant={timing === "overdue" ? "destructive" : "default"} onClick={() => openPayment(item)}>{timing === "overdue" ? "Pagar atrasada" : "Pagar"}</Button>}

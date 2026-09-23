@@ -18,11 +18,14 @@ import {
   changeBillCategory,
   eligibleRecurringBillIds,
   filterAndSortBills,
+  filterAndSortPaidBills,
   friendlyBillPaymentError,
   globalOverdueBills,
   initialBillPaymentAccountId,
   normalizeBillAccountId,
   normalizeRecurringBillSelection,
+  paidBillAccountId,
+  paidBillsForSelectedMonth,
   recurringBillOccurrences,
   summarizePendingBills,
   toggleRecurringBillSelection,
@@ -169,6 +172,81 @@ test("pagamento normal, com desconto ou acréscimo remove atraso e estorno o res
   }
 });
 
+const paidDateBills = [
+  { id: "august-paid-september", description: "Condomínio agosto", amountCents: 10_000, dueDate: "2026-08-15", accountId: "primary", categoryId: "food", status: "paid", recurrenceSeriesId: null, payment: { paidOn: "2026-09-23", paidAmountCents: 9_500, accountId: "second", adjustmentType: "discount", adjustmentAmountCents: -500 } },
+  { id: "september-paid-august", description: "Seguro setembro", amountCents: 10_000, dueDate: "2026-09-30", accountId: "second", categoryId: "transport", status: "paid", recurrenceSeriesId: null, payment: { paidOn: "2026-08-25", paidAmountCents: 10_500, accountId: "primary", adjustmentType: "surcharge", adjustmentAmountCents: 500 } },
+  { id: "october-same-month", description: "Internet outubro", amountCents: 10_000, dueDate: "2026-10-05", accountId: "primary", categoryId: "food", status: "paid", recurrenceSeriesId: null, payment: { paidOn: "2026-10-05", paidAmountCents: 10_000, accountId: "primary", adjustmentType: "normal", adjustmentAmountCents: 0 } },
+];
+
+test("pagas distinguem competência e data financeira escolhida inclusive no pagamento retroativo", () => {
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-08", dateView: "due" }).map((bill) => bill.id), ["august-paid-september"]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-09", dateView: "payment" }).map((bill) => bill.id), ["august-paid-september"]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-09", dateView: "due" }).map((bill) => bill.id), ["september-paid-august"]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-08", dateView: "payment" }).map((bill) => bill.id), ["september-paid-august"]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-10", dateView: "due" }).map((bill) => bill.id), ["october-same-month"]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-10", dateView: "payment" }).map((bill) => bill.id), ["october-same-month"]);
+});
+
+test("valor real e ajustes de pagamento permanecem íntegros nas duas perspectivas", () => {
+  const discount = filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-09", dateView: "payment" })[0];
+  assert.deepEqual({ expected: discount.amountCents, paid: discount.payment.paidAmountCents, adjustment: discount.payment.adjustmentAmountCents, type: discount.payment.adjustmentType }, { expected: 10_000, paid: 9_500, adjustment: -500, type: "discount" });
+  const surcharge = filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-08", dateView: "payment" })[0];
+  assert.deepEqual({ expected: surcharge.amountCents, paid: surcharge.payment.paidAmountCents, adjustment: surcharge.payment.adjustmentAmountCents, type: surcharge.payment.adjustmentType }, { expected: 10_000, paid: 10_500, adjustment: 500, type: "surcharge" });
+  assert.equal(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-10", dateView: "payment" })[0].payment.adjustmentType, "normal");
+});
+
+test("filtro de conta usa planejamento por vencimento e débito real por pagamento", () => {
+  const bill = paidDateBills[0];
+  assert.equal(paidBillAccountId(bill, "due"), "primary");
+  assert.equal(paidBillAccountId(bill, "payment"), "second");
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-08", dateView: "due", accountId: "primary" }).map((item) => item.id), [bill.id]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-09", dateView: "payment", accountId: "second" }).map((item) => item.id), [bill.id]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-09", dateView: "payment", accountId: "primary" }), []);
+});
+
+test("busca e categoria funcionam nas duas perspectivas de contas pagas", () => {
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-08", dateView: "due", search: "condomínio", categoryId: "food" }).map((bill) => bill.id), ["august-paid-september"]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-09", dateView: "payment", search: "condomínio", categoryId: "food" }).map((bill) => bill.id), ["august-paid-september"]);
+  assert.deepEqual(filterAndSortPaidBills(paidDateBills, { selectedMonth: "2026-09", dateView: "payment", categoryId: "transport" }), []);
+});
+
+test("ordenação é determinística por vencimento ou pagamento e não duplica IDs", () => {
+  const ordered = [
+    { id: "z", description: "Beta", dueDate: "2026-09-10", accountId: null, categoryId: "food", status: "paid", payment: { paidOn: "2026-09-05", accountId: "primary" } },
+    { id: "b", description: "Alfa", dueDate: "2026-09-10", accountId: null, categoryId: "food", status: "paid", payment: { paidOn: "2026-09-05", accountId: "primary" } },
+    { id: "a", description: "Gama", dueDate: "2026-09-08", accountId: null, categoryId: "food", status: "paid", payment: { paidOn: "2026-09-05", accountId: "primary" } },
+  ];
+  assert.deepEqual(filterAndSortPaidBills(ordered, { selectedMonth: "2026-09", dateView: "due" }).map((bill) => bill.id), ["a", "b", "z"]);
+  assert.deepEqual(filterAndSortPaidBills(ordered, { selectedMonth: "2026-09", dateView: "payment" }).map((bill) => bill.id), ["a", "b", "z"]);
+  assert.deepEqual(paidBillsForSelectedMonth([...ordered, ordered[0]], "2026-09", "payment").map((bill) => bill.id), ["z", "b", "a"]);
+});
+
+test("estorno sai de pagamentos e restaura atraso global sem afetar hoje e próximas", () => {
+  const paid = paidDateBills[0];
+  const undone = { ...paid, status: "pending", payment: null };
+  const current = { id: "today-still-monthly", description: "Hoje", amountCents: 1000, dueDate: today, accountId: null, categoryId: "food", status: "pending", payment: null };
+  const upcoming = { id: "upcoming-still-monthly", description: "Próxima", amountCents: 1000, dueDate: "2026-09-21", accountId: null, categoryId: "food", status: "pending", payment: null };
+  assert.deepEqual(filterAndSortPaidBills([undone], { selectedMonth: "2026-09", dateView: "payment" }), []);
+  assert.deepEqual(globalOverdueBills([undone, current, upcoming], today).map((bill) => bill.id), [undone.id]);
+  assert.equal(billTiming(current, today), "today");
+  assert.equal(billTiming(upcoming, today), "upcoming");
+});
+
+test("recorrências independentes podem compartilhar o mês de pagamento", () => {
+  const occurrences = [
+    { id: "series-august", description: "Mensal agosto", dueDate: "2026-08-15", accountId: "primary", categoryId: "food", status: "paid", recurrenceSeriesId: "series", payment: { paidOn: "2026-09-03", accountId: "primary" } },
+    { id: "series-september", description: "Mensal setembro", dueDate: "2026-09-15", accountId: "primary", categoryId: "food", status: "paid", recurrenceSeriesId: "series", payment: { paidOn: "2026-09-20", accountId: "primary" } },
+  ];
+  assert.deepEqual(filterAndSortPaidBills(occurrences, { selectedMonth: "2026-09", dateView: "due" }).map((bill) => bill.id), ["series-september"]);
+  assert.deepEqual(filterAndSortPaidBills(occurrences, { selectedMonth: "2026-09", dateView: "payment" }).map((bill) => bill.id), ["series-august", "series-september"]);
+});
+
+test("competência e pagamento atravessam dezembro e janeiro sem misturar os meses", () => {
+  const annual = { id: "year-turn", description: "IPTU", dueDate: "2026-12-31", accountId: "primary", categoryId: "food", status: "paid", payment: { paidOn: "2027-01-02", accountId: "primary" } };
+  assert.deepEqual(filterAndSortPaidBills([annual], { selectedMonth: "2026-12", dateView: "due" }).map((bill) => bill.id), [annual.id]);
+  assert.deepEqual(filterAndSortPaidBills([annual], { selectedMonth: "2027-01", dateView: "payment" }).map((bill) => bill.id), [annual.id]);
+});
+
 test("datas civis cobrem fevereiro e virada de ano sem depender do fuso UTC da máquina", () => {
   assert.equal(billDueDayOffset("2028-02-29", "2028-02-28"), 1);
   assert.equal(billDueDayOffset("2028-03-01", "2028-02-29"), 1);
@@ -298,9 +376,21 @@ test("interface abre confirmação e delega operações sem fallback automático
   assert.match(source, /Competência: \{monthLabel\(item\.dueDate\.slice\(0, 7\)\)\}/);
   assert.match(source, /globalOverdueBills\(data\.bills, today\)/);
   assert.match(source, /billsForSelectedMonthAndGlobalOverdue\(data\.bills, data\.selectedMonth, today\)/);
-  assert.match(source, /filterAccounts = accounts\.filter\(\(account\) => relevantRows/);
-  assert.match(source, /filterCategories = categories\.filter\(\(category\) => relevantRows/);
+  assert.match(source, /filterAndSortPaidBills\(data\.bills/);
+  assert.match(source, /paidBillsForSelectedMonth\(data\.bills, data\.selectedMonth, paidDateView\)/);
+  assert.match(source, /paidBillAccountId\(bill, statusFilter === "paid" \? paidDateView : "due"\)/);
+  assert.match(source, /filterSourceRows\.some\(\(bill\) => bill\.categoryId === category\.id\)/);
   assert.match(source, /\{"value":"overdue","label":"Atrasadas"\}/);
+  assert.match(source, /useState<PaidBillDateView>\("due"\)/);
+  assert.match(source, /statusFilter === "paid" &&/);
+  assert.match(source, />Por vencimento<\/Button>/);
+  assert.match(source, />Por pagamento<\/Button>/);
+  assert.match(source, /Pagas da competência/);
+  assert.match(source, /Pagamentos realizados no mês/);
+  assert.match(source, /Conta do pagamento/);
+  assert.match(source, /!\(statusFilter === "paid" && paidDateView === "payment"\).*Definir ao pagar/);
+  assert.match(source, /BillDetail label="Pago em"/);
+  assert.match(source, /item\.payment\?\.paidAmountCents \?\? item\.amountCents/);
   assert.match(source, /openPayment\(item\)/);
   assert.match(source, /openEditor\(item\)/);
   assert.match(source, /bill: item, kind: "cancel"/);
