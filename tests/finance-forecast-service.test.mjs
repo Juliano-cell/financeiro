@@ -8,6 +8,14 @@ import {
   getFinanceForecast,
   resolveForecastWindow,
 } from "../lib/finance-forecast-service.ts";
+import {
+  cancelExpectedIncome,
+  createExpectedIncome,
+  createRecurringExpectedIncome,
+  receiveExpectedIncome,
+  reverseExpectedIncomeReceipt,
+  updateExpectedIncome,
+} from "../lib/expected-income-service.ts";
 
 const AT = "2026-09-15T15:00:00.000Z";
 const NOW = new Date(AT);
@@ -64,6 +72,50 @@ function fixture(t, initialBalance = 0) {
 
 function forecast(f, months = FORECAST_DEFAULT_MONTHS, householdId = f.a.household, now = NOW) {
   return getFinanceForecast({ d1: f.d1, householdId, now }, months);
+}
+
+function expectedContext(f, owner = f.a) {
+  return { d1: f.d1, householdId: owner.household, userId: owner.user, timestamp: AT };
+}
+
+function expectedInput(owner, suffix, overrides = {}) {
+  return {
+    operationId: `expected-${suffix}`,
+    description: `Expected ${suffix}`,
+    expectedAmountCents: 100,
+    expectedDate: "2026-10-01",
+    plannedAccountId: owner.account,
+    categoryId: null,
+    subcategoryId: null,
+    notes: null,
+    ...overrides,
+  };
+}
+
+async function expected(f, suffix, overrides = {}, owner = f.a) {
+  return createExpectedIncome(expectedInput(owner, suffix, overrides), expectedContext(f, owner));
+}
+
+function limitedExpectedSeries(db, owner) {
+  db.prepare(`INSERT INTO expected_income_operations(
+    id,household_id,idempotency_key,request_hash,operation_type,series_id,performed_by_user_id,financial_date,created_at
+  ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+    "limited-op", owner.household, "limited-key", "a".repeat(64), "create_series", "limited-series", owner.user, "2026-09-30", AT,
+  );
+  db.prepare(`INSERT INTO expected_income_series(
+    id,household_id,description,expected_amount_cents,configured_day,starts_on,ends_on,
+    planned_account_id,is_active,materialized_through_month,last_operation_id,created_by_user_id,origin,created_at,updated_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    "limited-series", owner.household, "Limited private description", 700, 30, "2026-09-30", null,
+    owner.account, 1, "2026-09", "limited-op", owner.user, "web", AT, AT,
+  );
+  db.prepare(`INSERT INTO expected_income_occurrences(
+    id,household_id,series_id,occurrence_month,description,expected_amount_cents,expected_date,
+    planned_account_id,status,last_operation_id,created_by_user_id,origin,created_at,updated_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    "limited-occurrence", owner.household, "limited-series", "2026-09", "Limited private description", 700, "2026-09-30",
+    owner.account, "pending", "limited-op", owner.user, "web", AT, AT,
+  );
 }
 
 function transaction(db, owner, values) {
@@ -170,6 +222,185 @@ test("transactions incluem somente confirmadas, futuras, da conta ativa e do hou
   assert.equal(value.knownFutureOutflowCents, 300);
   assert.deepEqual(value.months.flatMap((month) => month.details.futureTransactions).map((item) => item.id), ["future-income", "future-expense"]);
   assert.doesNotMatch(JSON.stringify(value), /private|inactive-future|pending|cancelled/u);
+});
+
+test("B4 separa receita futura confirmada, expected income e atraso na fórmula mensal", async t => {
+  const f = fixture(t, 200_000);
+  transaction(f.db, f.a, { id: "legacy-income", type: "income", amount: 300_000, date: "2026-10-01" });
+  transaction(f.db, f.a, { id: "future-expense", type: "expense", amount: 20_000, date: "2026-10-02" });
+  await expected(f, "future", { expectedAmountCents: 120_000, expectedDate: "2026-10-03" });
+  await expected(f, "overdue", { expectedAmountCents: 50_000, expectedDate: "2026-09-14" });
+  bill(f.db, f.a, { id: "future-bill-b4", amount: 150_000, date: "2026-10-20" });
+  const cardId = card(f.db, f.a, "b4");
+  invoice(f.db, f.a, { id: "invoice-b4", cardId, month: "2026-10", date: "2026-10-10" });
+  purchaseInstallment(f.db, f.a, { cardId, invoiceId: "invoice-b4", installmentId: "part-b4", amount: 80_000 });
+
+  const value = await forecast(f);
+  assert.equal(value.knownFutureIncomeCents, 300_000);
+  assert.equal(value.expectedIncomeCents, 120_000);
+  assert.equal(value.overdueExpectedIncomeCents, 50_000);
+  assert.equal(value.months[0].overdueExpectedIncomeCents, 50_000);
+  assert.equal(value.months[1].knownFutureIncomeCents, 300_000);
+  assert.equal(value.months[1].futureIncomeCents, 300_000);
+  assert.equal(value.months[1].expectedIncomeCents, 120_000);
+  assert.equal(value.projectedEndingBalanceCents, 420_000);
+  assert.deepEqual(value.months[1].details.expectedIncome.map((item) => item.source), ["expected_income"]);
+});
+
+test("B4 oracle encadeia 1.000 para 1.300 e depois 1.400 sem repetir atraso", async t => {
+  const f = fixture(t, 100_000);
+  transaction(f.db, f.a, { id: "oracle-income", type: "income", amount: 10_000, date: "2026-09-16" });
+  transaction(f.db, f.a, { id: "oracle-expense", type: "expense", amount: 5_000, date: "2026-09-17" });
+  await expected(f, "oracle-normal", { expectedAmountCents: 50_000, expectedDate: "2026-09-20" });
+  await expected(f, "oracle-overdue", { expectedAmountCents: 20_000, expectedDate: "2026-09-14" });
+  await expected(f, "oracle-next", { expectedAmountCents: 40_000, expectedDate: "2026-10-20" });
+  bill(f.db, f.a, { id: "oracle-bill-one", amount: 30_000, date: "2026-09-22" });
+  bill(f.db, f.a, { id: "oracle-bill-two", amount: 20_000, date: "2026-10-22" });
+  const cardId = card(f.db, f.a, "oracle");
+  invoice(f.db, f.a, { id: "oracle-invoice-one", cardId, month: "2026-09", date: "2026-09-25" });
+  invoice(f.db, f.a, { id: "oracle-invoice-two", cardId, month: "2026-10", date: "2026-10-25" });
+  purchaseInstallment(f.db, f.a, { cardId, invoiceId: "oracle-invoice-one", installmentId: "oracle-part-one", amount: 15_000 });
+  purchaseInstallment(f.db, f.a, { cardId, invoiceId: "oracle-invoice-two", installmentId: "oracle-part-two", amount: 10_000 });
+
+  const value = await forecast(f, 2);
+  assert.deepEqual({
+    opening: value.months[0].openingBalanceCents,
+    legacy: value.months[0].knownFutureIncomeCents,
+    expected: value.months[0].expectedIncomeCents,
+    overdue: value.months[0].overdueExpectedIncomeCents,
+    futureExpense: value.months[0].futureTransactionExpenseCents,
+    bills: value.months[0].dueBillsCents,
+    invoice: value.months[0].cardInvoiceRemainingCents,
+    closing: value.months[0].closingBalanceCents,
+  }, { opening: 100_000, legacy: 10_000, expected: 50_000, overdue: 20_000, futureExpense: 5_000, bills: 30_000, invoice: 15_000, closing: 130_000 });
+  assert.equal(value.months[1].openingBalanceCents, 130_000);
+  assert.equal(value.months[1].expectedIncomeCents, 40_000);
+  assert.equal(value.months[1].overdueExpectedIncomeCents, 0);
+  assert.equal(value.months[1].closingBalanceCents, 140_000);
+});
+
+test("B4 recebimento exato remove expected e move somente o realizado para o saldo", async t => {
+  const f = fixture(t, 10_000);
+  const created = await expected(f, "receive-exact", { expectedAmountCents: 20_000 });
+  let value = await forecast(f);
+  assert.equal(value.currentBalanceCents, 10_000);
+  assert.equal(value.expectedIncomeCents, 20_000);
+  await receiveExpectedIncome({
+    operationId: "receive-exact-b4", occurrenceId: created.occurrenceId, receivedAmountCents: 20_000,
+    receivedDate: "2026-09-15", actualAccountId: f.a.account,
+  }, expectedContext(f));
+  value = await forecast(f);
+  assert.equal(value.currentBalanceCents, 30_000);
+  assert.equal(value.expectedIncomeCents, 0);
+  assert.equal(value.knownFutureIncomeCents, 0);
+  assert.equal(value.projectedEndingBalanceCents, 30_000);
+});
+
+test("B4 lifecycle inclui somente pending, usa valor previsto e volta após estorno", async t => {
+  const f = fixture(t, 10_000);
+  const received = await expected(f, "receive", { expectedAmountCents: 20_000 });
+  const cancelled = await expected(f, "cancel", { expectedAmountCents: 30_000 });
+  await expected(f, "pending", { expectedAmountCents: 40_000 });
+  await receiveExpectedIncome({
+    operationId: "receive-b4", occurrenceId: received.occurrenceId, receivedAmountCents: 22_000,
+    receivedDate: "2026-09-15", actualAccountId: f.a.account,
+  }, expectedContext(f));
+  await cancelExpectedIncome({ operationId: "cancel-b4", occurrenceId: cancelled.occurrenceId }, expectedContext(f));
+
+  let value = await forecast(f);
+  assert.equal(value.currentBalanceCents, 32_000);
+  assert.equal(value.expectedIncomeCents, 40_000);
+  assert.equal(value.projectedEndingBalanceCents, 72_000);
+
+  await reverseExpectedIncomeReceipt({
+    operationId: "reverse-b4", occurrenceId: received.occurrenceId, reversalDate: "2026-09-15",
+  }, expectedContext(f));
+  value = await forecast(f);
+  assert.equal(value.currentBalanceCents, 10_000);
+  assert.equal(value.expectedIncomeCents, 60_000);
+  assert.equal(value.projectedEndingBalanceCents, 70_000);
+});
+
+test("B4 edição move valor e competência sem duplicar ocorrência", async t => {
+  const f = fixture(t);
+  const created = await expected(f, "edit", { expectedAmountCents: 100, expectedDate: "2026-10-10" });
+  await updateExpectedIncome({
+    ...expectedInput(f.a, "edit-update", { expectedAmountCents: 250, expectedDate: "2026-11-20" }),
+    occurrenceId: created.occurrenceId,
+  }, expectedContext(f));
+  const value = await forecast(f, 3);
+  assert.equal(value.months[1].expectedIncomeCents, 0);
+  assert.equal(value.months[2].expectedIncomeCents, 250);
+  assert.equal(value.months.flatMap((month) => month.details.expectedIncome).length, 1);
+});
+
+test("B4 recorrência dia 31 usa somente ocorrências materializadas e respeita mês curto", async t => {
+  const f = fixture(t);
+  await createRecurringExpectedIncome({
+    operationId: "series-day-31",
+    description: "Recurring 31",
+    expectedAmountCents: 3_020,
+    configuredDay: 31,
+    startsOn: "2027-01-31",
+    endsOn: "2027-04-30",
+    plannedAccountId: null,
+    categoryId: null,
+    subcategoryId: null,
+    notes: null,
+  }, expectedContext(f));
+  const value = await forecast(f, 8);
+  assert.deepEqual(
+    value.months.flatMap((month) => month.details.expectedIncome).map((item) => item.originalDate),
+    ["2027-01-31", "2027-02-28", "2027-03-31", "2027-04-30"],
+  );
+  assert.equal(value.expectedIncomeCents, 12_080);
+  assert.equal(value.warnings.some((item) => item.code === "EXPECTED_INCOME_COVERAGE_LIMITED"), false);
+});
+
+test("B4 atraso é alocado uma vez; hoje não é atraso e calendário usa São Paulo", async t => {
+  const f = fixture(t);
+  await expected(f, "yesterday", { expectedAmountCents: 10, expectedDate: "2026-09-14" });
+  await expected(f, "today", { expectedAmountCents: 20, expectedDate: "2026-09-15" });
+  await expected(f, "tomorrow", { expectedAmountCents: 30, expectedDate: "2026-09-16" });
+  await expected(f, "month-end", { expectedAmountCents: 40, expectedDate: "2026-09-30" });
+  await expected(f, "year-end", { expectedAmountCents: 50, expectedDate: "2026-12-31" });
+  await expected(f, "leap", { expectedAmountCents: 60, expectedDate: "2028-02-29" });
+  const value = await forecast(f, 24);
+  assert.equal(value.months[0].overdueExpectedIncomeCents, 10);
+  assert.equal(value.months[0].expectedIncomeCents, 90);
+  assert.equal(value.months[3].expectedIncomeCents, 50);
+  assert.equal(value.months[17].expectedIncomeCents, 60);
+  assert.equal(value.months.slice(1).reduce((sum, month) => sum + month.overdueExpectedIncomeCents, 0), 0);
+});
+
+test("B4 alerta cobertura limitada sem sintetizar ocorrência nem expor série", async t => {
+  const f = fixture(t);
+  limitedExpectedSeries(f.db, f.a);
+  const value = await forecast(f, 3);
+  const warning = value.warnings.find((item) => item.code === "EXPECTED_INCOME_COVERAGE_LIMITED");
+  assert.deepEqual(warning, {
+    code: "EXPECTED_INCOME_COVERAGE_LIMITED", count: 1,
+    message: "Há séries de receitas previstas sem ocorrências materializadas em todo o horizonte.",
+  });
+  assert.equal(value.expectedIncomeCents, 700);
+  assert.doesNotMatch(JSON.stringify(warning), /limited-series|Limited private description/u);
+  assert.equal(f.db.prepare("SELECT count(*) total FROM expected_income_occurrences").get().total, 1);
+});
+
+test("B4 overlap é apenas sinalizado e nunca deduplica valores", async t => {
+  const f = fixture(t);
+  f.db.prepare("INSERT INTO accounts(id,household_id,name,type,initial_balance_cents,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")
+    .run("other-account", f.a.household, "Other", "bank", 0, 1, AT, AT);
+  transaction(f.db, f.a, { id: "matching", type: "income", amount: 500, date: "2026-10-10" });
+  await expected(f, "overlap-null", { expectedAmountCents: 500, expectedDate: "2026-10-10", plannedAccountId: null });
+  await expected(f, "overlap-other", { expectedAmountCents: 500, expectedDate: "2026-10-10", plannedAccountId: "other-account" });
+  const value = await forecast(f);
+  const warning = value.warnings.find((item) => item.code === "POSSIBLE_FUTURE_INCOME_OVERLAP");
+  assert.equal(warning.count, 1);
+  assert.equal(value.knownFutureIncomeCents, 500);
+  assert.equal(value.expectedIncomeCents, 1_000);
+  assert.equal(value.projectedEndingBalanceCents, 1_500);
+  assert.doesNotMatch(JSON.stringify(warning), /matching|overlap-null|Expected/u);
 });
 
 test("bills pending entram, paid/cancelled saem e Definir ao pagar permanece no agregado", async t => {
@@ -394,7 +625,7 @@ test("horizonte aceita limites seguros e rejeita valores inválidos", () => {
   assert.throws(() => resolveForecastWindow(new Date("invalid"), 6));
 });
 
-test("consulta é read-only, usa um batch fixo de cinco SELECTs e mantém isolamento", async t => {
+test("consulta é read-only, usa um batch fixo de sete SELECTs e mantém isolamento", async t => {
   const f = fixture(t, 123);
   bill(f.db, f.b, { id: "private-bill", amount: 999_999, date: "2026-10-01" });
   const before = f.db.prepare("SELECT total_changes() AS value").get().value;
@@ -402,7 +633,7 @@ test("consulta é read-only, usa um batch fixo de cinco SELECTs e mantém isolam
   const after = f.db.prepare("SELECT total_changes() AS value").get().value;
   assert.equal(after, before);
   assert.equal(f.d1.batchCount, 1);
-  assert.equal(f.d1.statements.length, 5);
+  assert.equal(f.d1.statements.length, 7);
   assert.ok(f.d1.statements.every((sql) => /^\s*(?:WITH|SELECT)/u.test(sql)));
   assert.doesNotMatch(f.d1.statements.join("\n"), /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/u);
   assert.equal(value.currentBalanceCents, 123);

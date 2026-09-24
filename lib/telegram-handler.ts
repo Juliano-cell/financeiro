@@ -15,6 +15,7 @@ import { createTelegramFinancialSessionId, isTelegramCallbackForSession, paginat
 import { buildTelegramInstallmentPreview, effectiveTelegramPaymentFlow, isValidTelegramDate, parseTelegramInstallmentCount, resolveTelegramDueDate, telegramFinancialPersistenceTarget, transitionTelegramPaymentFlow } from "@/lib/telegram-payment-flow.mjs";
 import { formatBrl, type TelegramButton } from "@/lib/telegram";
 import { telegramUpdateSchema } from "@/lib/telegram-update.mjs";
+import { futureGenericTransactionMessage, genericTransactionToday } from "@/lib/generic-transaction-date-rules.mjs";
 
 type FinancialIntent = {
   intent: string;
@@ -448,6 +449,10 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
         return { text: `✅ Vencimento de ${formatBrl(intent.amountCents!)} criado para ${intent.dueDate}. A conta será definida ao pagar.` };
       }
     } catch (error) {
+      if (persistenceTarget === "transaction" && error instanceof FinanceValidationError && error.code === "FUTURE_GENERIC_TRANSACTION_NOT_ALLOWED") {
+        await commitUpdate(updateId);
+        return { text: error.message, buttons: telegramConfirmationButtons(state.sessionId!) };
+      }
       if (persistenceTarget === "card_purchase" && error instanceof FinanceValidationError) {
         // Consume only this update. Never restore a session cancelled/replaced while validation ran.
         await commitUpdate(updateId);
@@ -583,6 +588,10 @@ export async function handleTelegramUpdate(rawUpdate: unknown): Promise<Telegram
     if (!date) {
       await saveState(updateId, telegramUserId, link.householdId, state);
       return { text: "Data inválida. Use AAAA-MM-DD, hoje, ontem ou anteontem.", buttons: telegramCancelButtons(state.sessionId!) };
+    }
+    if (telegramFinancialPersistenceTarget(state.financialIntent) === "transaction" && date > genericTransactionToday()) {
+      await saveState(updateId, telegramUserId, link.householdId, state);
+      return { text: futureGenericTransactionMessage(state.financialIntent.type === "income" ? "income" : "expense"), buttons: telegramCancelButtons(state.sessionId!) };
     }
     const intent = updateTelegramIntentField(state.financialIntent, "date", date) as FinancialIntent;
     return presentIntent(updateId, telegramUserId, link.householdId, { ...state, financialIntent: intent }, context);

@@ -74,6 +74,17 @@ function setup(t) {
     .run("future-a", a.household, "income", 30_000, "Future A", "2026-10-01", a.user, a.account, "confirmed", "dashboard", AT, AT);
   db.prepare("INSERT INTO transactions(id,household_id,type,amount_cents,description,transaction_date,responsible_user_id,account_id,status,origin,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
     .run("private-b", b.household, "income", 8_888_888, "Private B", "2026-10-01", b.user, b.account, "confirmed", "dashboard", AT, AT);
+  for (const [owner, suffix, amount] of [[a, "a", 12_000], [b, "b", 7_777_777]]) {
+    db.prepare("INSERT INTO expected_income_operations(id,household_id,idempotency_key,request_hash,operation_type,occurrence_id,performed_by_user_id,financial_date,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+      .run(`expected-op-${suffix}`, owner.household, `expected-key-${suffix}`, "b".repeat(64), "create_occurrence", `expected-${suffix}`, owner.user, "2026-10-02", AT);
+    db.prepare(`INSERT INTO expected_income_occurrences(
+      id,household_id,description,expected_amount_cents,expected_date,planned_account_id,status,
+      last_operation_id,created_by_user_id,origin,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      `expected-${suffix}`, owner.household, `Expected ${suffix}`, amount, "2026-10-02", owner.account,
+      "pending", `expected-op-${suffix}`, owner.user, "web", AT, AT,
+    );
+  }
   runtime.DB = new LocalD1(db);
   globalThis.__forecastApiCookie = COOKIE;
   globalThis.__accountStatementApiCookie = COOKIE;
@@ -116,8 +127,12 @@ test("household vem somente da sessão e dados de outra família nunca contamina
   assert.equal(result.body.horizon.months, 6);
   assert.equal(result.body.currentBalanceCents, 20_000);
   assert.equal(result.body.knownFutureIncomeCents, 30_000);
+  assert.equal(result.body.expectedIncomeCents, 12_000);
+  assert.equal(result.body.overdueExpectedIncomeCents, 0);
+  assert.equal(result.body.months[1].knownFutureIncomeCents, 30_000);
+  assert.equal(result.body.months[1].expectedIncomeCents, 12_000);
   assert.match(JSON.stringify(result.body), /Future A/u);
-  assert.doesNotMatch(JSON.stringify(result.body), /Private B|private-b|8888888|9999999/u);
+  assert.doesNotMatch(JSON.stringify(result.body), /Private B|private-b|Expected b|7777777|8888888|9999999/u);
   assertPrivate(result.headers);
   const injected = await get(`householdId=${f.b.household}`);
   assert.equal(injected.status, 400);

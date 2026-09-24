@@ -3,9 +3,20 @@ import { and, eq, inArray } from "drizzle-orm";
 import { getDb } from "@/db";
 import { accounts, cardInvoices, categories, creditCards, householdMembers, subcategories, telegramProcessedUpdates } from "@/db/schema";
 import { buildInstallmentPlan } from "@/lib/finance-rules.mjs";
+import { futureGenericTransactionViolation, genericTransactionToday } from "@/lib/generic-transaction-date-rules.mjs";
 import { canInvoiceReceivePurchase, conservativeLegacyInvoiceSnapshot, invoiceCivilDate, invoiceClosesOn } from "./invoice-service";
 
-export class FinanceValidationError extends Error {}
+export class FinanceValidationError extends Error {
+  code?: string;
+  planningTarget?: "expected_income" | "bill";
+
+  constructor(message: string, options: { code?: string; planningTarget?: "expected_income" | "bill" } = {}) {
+    super(message);
+    this.name = "FinanceValidationError";
+    this.code = options.code;
+    this.planningTarget = options.planningTarget;
+  }
+}
 export class DuplicateTelegramUpdateError extends Error {}
 
 export function telegramFinancialOperationUpdateId(operationId: string) {
@@ -156,9 +167,11 @@ export async function createTransaction(input: TransactionInput, context: Creati
   assertText(input.description, "Descrição");
   assertMoney(input.amountCents);
   assertDate(input.transactionDate);
+  const at = context.timestamp ?? timestamp();
+  const dateViolation = futureGenericTransactionViolation({ type: input.type, transactionDate: input.transactionDate, today: genericTransactionToday(new Date(at)) });
+  if (dateViolation) throw new FinanceValidationError(dateViolation.message, { code: dateViolation.code, planningTarget: dateViolation.planningTarget });
   await validateMembership(context.householdId, context.userId);
   await validateTransactionRelations(context.householdId, input);
-  const at = timestamp();
   const transactionId = uid("transaction");
   const auditId = uid("audit");
   const d1 = database();

@@ -359,6 +359,23 @@ test("handler responde de forma amigável à confirmação depois do consumo da 
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_conversation_states").get().total, 0);
 });
 
+for (const [kind, text, guidance] of [
+  ["despesa", "Gastei 85 no mercado no pix", /use Contas/u],
+  ["receita", "Recebi 85 por serviços no Nubank", /use Entradas previstas/u],
+]) {
+  test(`Telegram bloqueia edição para data futura em ${kind} sem criar movimento`, async () => {
+    const db = database(); seedTelegramContext(db);
+    const started = await beginFinancialConversation(db, kind === "despesa" ? 11101 : 11201, text);
+    let response = await handleTelegramUpdate(callbackUpdate(kind === "despesa" ? 11102 : 11202, callbackByText(started.response, "Alterar")));
+    response = await handleTelegramUpdate(callbackUpdate(kind === "despesa" ? 11103 : 11203, callbackByText(response, "Data")));
+    response = await handleTelegramUpdate(messageUpdate(kind === "despesa" ? 11104 : 11204, "2099-12-31"));
+    assert.match(response.text, guidance);
+    assert.equal(storedFinancialState(db).phase, "editing_date");
+    assert.equal(db.prepare("SELECT count(*) total FROM transactions").get().total, 0);
+    assert.equal(db.prepare("SELECT count(*) total FROM bills").get().total, 0);
+  });
+}
+
 test("cancelamento real consome a sessão atomicamente e impede confirmação posterior", async () => {
   const db = database(); seedTelegramContext(db);
   const { response, state } = await beginFinancialConversation(db, 1201);

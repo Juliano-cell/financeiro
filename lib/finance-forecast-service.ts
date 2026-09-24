@@ -27,7 +27,8 @@ SELECT
   t.type,
   t.amount_cents,
   t.description,
-  t.transaction_date
+  t.transaction_date,
+  t.account_id
 FROM transactions t
 INNER JOIN accounts a
   ON a.household_id = t.household_id
@@ -38,6 +39,31 @@ WHERE t.household_id = ?
   AND t.transaction_date > ?
   AND t.transaction_date <= ?
 ORDER BY t.transaction_date, t.id`;
+
+export const PENDING_EXPECTED_INCOME_SQL = `
+SELECT
+  o.id,
+  o.series_id,
+  o.description,
+  o.expected_amount_cents,
+  o.expected_date,
+  o.planned_account_id
+FROM expected_income_occurrences o
+WHERE o.household_id = ?
+  AND o.status = 'pending'
+  AND o.expected_date <= ?
+ORDER BY o.expected_date, o.id`;
+
+export const EXPECTED_INCOME_COVERAGE_SQL = `
+SELECT
+  s.id,
+  s.ends_on,
+  s.materialized_through_month
+FROM expected_income_series s
+WHERE s.household_id = ?
+  AND s.is_active = 1
+  AND s.starts_on <= ?
+ORDER BY s.id`;
 
 export const PENDING_BILLS_SQL = `
 SELECT
@@ -194,7 +220,10 @@ function emptyMonth(month: string): ForecastMonth {
   return {
     month,
     openingBalanceCents: 0,
+    knownFutureIncomeCents: 0,
     futureIncomeCents: 0,
+    expectedIncomeCents: 0,
+    overdueExpectedIncomeCents: 0,
     futureTransactionExpenseCents: 0,
     overdueBillsCents: 0,
     dueBillsCents: 0,
@@ -202,7 +231,10 @@ function emptyMonth(month: string): ForecastMonth {
     knownOutflowCents: 0,
     projectedNetCashFlowCents: 0,
     closingBalanceCents: 0,
-    details: { futureTransactions: [], overdueBills: [], dueBills: [], cardInvoices: [] },
+    details: {
+      futureTransactions: [], expectedIncome: [], overdueExpectedIncome: [],
+      overdueBills: [], dueBills: [], cardInvoices: [],
+    },
   };
 }
 
@@ -232,11 +264,16 @@ export async function getFinanceForecast(context: ForecastContext, months = FORE
   const statements = [
     context.d1.prepare(CURRENT_ACCOUNT_BALANCES_SQL).bind(context.householdId, window.today, context.householdId, window.today, context.householdId),
     context.d1.prepare(FUTURE_TRANSACTIONS_SQL).bind(context.householdId, window.today, window.horizonEnd),
+    context.d1.prepare(PENDING_EXPECTED_INCOME_SQL).bind(context.householdId, window.horizonEnd),
     context.d1.prepare(PENDING_BILLS_SQL).bind(context.householdId, window.horizonEnd),
     context.d1.prepare(FORECAST_INVOICES_SQL).bind(context.householdId, window.horizonEnd),
     context.d1.prepare(RECURRENCE_COVERAGE_SQL).bind(context.householdId, window.horizonEnd),
+    context.d1.prepare(EXPECTED_INCOME_COVERAGE_SQL).bind(context.householdId, window.horizonEnd),
   ];
-  const [balanceResult, transactionResult, billResult, invoiceResult, recurrenceResult] = await context.d1.batch<unknown>(statements);
+  const [
+    balanceResult, transactionResult, expectedIncomeResult, billResult, invoiceResult,
+    recurrenceResult, expectedIncomeCoverageResult,
+  ] = await context.d1.batch<unknown>(statements);
   const balanceRows = rows(balanceResult);
   let currentBalanceCents = 0;
   for (const row of balanceRows) {
@@ -246,7 +283,8 @@ export async function getFinanceForecast(context: ForecastContext, months = FORE
 
   const monthsByKey = new Map(window.monthKeys.map((month) => [month, emptyMonth(month)]));
 
-  for (const row of rows(transactionResult)) {
+  const transactionRows = rows(transactionResult);
+  for (const row of transactionRows) {
     const originalDate = text(row, "transaction_date");
     const allocated = monthOf(originalDate);
     const target = monthsByKey.get(allocated);
@@ -260,8 +298,34 @@ export async function getFinanceForecast(context: ForecastContext, months = FORE
       installment: null, recurrenceSeriesId: null,
     });
     target.details.futureTransactions.push(item);
-    if (direction === "income") target.futureIncomeCents = checkedAdd(target.futureIncomeCents, amountCents);
+    if (direction === "income") {
+      target.futureIncomeCents = checkedAdd(target.futureIncomeCents, amountCents);
+      target.knownFutureIncomeCents = checkedAdd(target.knownFutureIncomeCents, amountCents);
+    }
     else target.futureTransactionExpenseCents = checkedAdd(target.futureTransactionExpenseCents, amountCents);
+  }
+
+  const expectedIncomeRows = rows(expectedIncomeResult);
+  for (const row of expectedIncomeRows) {
+    const originalDate = text(row, "expected_date");
+    const allocated = allocationMonth(originalDate, window.today, window.firstMonth);
+    const target = monthsByKey.get(allocated);
+    if (!target) throw new FinanceForecastIntegrityError("Receita prevista fora do horizonte consultado.");
+    const amountCents = money(row, "expected_amount_cents");
+    const overdue = originalDate < window.today;
+    const item = detail({
+      id: text(row, "id"), source: "expected_income", direction: "income",
+      description: text(row, "description"), amountCents, originalDate, allocationMonth: allocated,
+      status: "pending", qualification: nullableText(row, "series_id") ? "materialized_recurring" : "registered",
+      overdue, installment: null, recurrenceSeriesId: nullableText(row, "series_id"),
+    });
+    if (overdue) {
+      target.overdueExpectedIncomeCents = checkedAdd(target.overdueExpectedIncomeCents, amountCents);
+      target.details.overdueExpectedIncome.push(item);
+    } else {
+      target.expectedIncomeCents = checkedAdd(target.expectedIncomeCents, amountCents);
+      target.details.expectedIncome.push(item);
+    }
   }
 
   for (const row of rows(billResult)) {
@@ -338,9 +402,44 @@ export async function getFinanceForecast(context: ForecastContext, months = FORE
       message: `A recorrência “${text(row, "description")}” não possui ocorrências materializadas em todo o horizonte.`,
     });
   }
+  let limitedExpectedIncomeSeries = 0;
+  for (const row of rows(expectedIncomeCoverageResult)) {
+    const endsOn = nullableText(row, "ends_on");
+    const requiredThroughMonth = monthOf(endsOn && endsOn < window.horizonEnd ? endsOn : window.horizonEnd);
+    if (text(row, "materialized_through_month") < requiredThroughMonth) limitedExpectedIncomeSeries += 1;
+  }
+  if (limitedExpectedIncomeSeries > 0) {
+    warnings.push({
+      code: "EXPECTED_INCOME_COVERAGE_LIMITED",
+      count: limitedExpectedIncomeSeries,
+      message: "Há séries de receitas previstas sem ocorrências materializadas em todo o horizonte.",
+    });
+  }
+  const futureIncomeTransactions = transactionRows.filter((row) => row.type === "income");
+  let possibleOverlapCount = 0;
+  for (const occurrence of expectedIncomeRows) {
+    const plannedAccountId = nullableText(occurrence, "planned_account_id");
+    const amountCents = money(occurrence, "expected_amount_cents");
+    const expectedDate = text(occurrence, "expected_date");
+    if (futureIncomeTransactions.some((transaction) =>
+      money(transaction, "amount_cents") === amountCents
+      && text(transaction, "transaction_date") === expectedDate
+      && (plannedAccountId === null || text(transaction, "account_id") === plannedAccountId))) {
+      possibleOverlapCount += 1;
+    }
+  }
+  if (possibleOverlapCount > 0) {
+    warnings.push({
+      code: "POSSIBLE_FUTURE_INCOME_OVERLAP",
+      count: possibleOverlapCount,
+      message: "Há possíveis sobreposições entre receitas futuras confirmadas e receitas previstas pendentes.",
+    });
+  }
 
   let openingBalanceCents = currentBalanceCents;
   let knownFutureIncomeCents = 0;
+  let expectedIncomeCents = 0;
+  let overdueExpectedIncomeCents = 0;
   let knownFutureOutflowCents = 0;
   const monthValues = window.monthKeys.map((key) => {
     const month = monthsByKey.get(key)!;
@@ -349,11 +448,17 @@ export async function getFinanceForecast(context: ForecastContext, months = FORE
       checkedAdd(month.futureTransactionExpenseCents, month.overdueBillsCents),
       checkedAdd(month.dueBillsCents, month.cardInvoiceRemainingCents),
     );
-    month.projectedNetCashFlowCents = month.futureIncomeCents - month.knownOutflowCents;
+    const totalIncomeCents = checkedAdd(
+      checkedAdd(month.knownFutureIncomeCents, month.expectedIncomeCents),
+      month.overdueExpectedIncomeCents,
+    );
+    month.projectedNetCashFlowCents = totalIncomeCents - month.knownOutflowCents;
     if (!Number.isSafeInteger(month.projectedNetCashFlowCents)) throw new FinanceForecastIntegrityError("Fluxo mensal fora do limite seguro.");
     month.closingBalanceCents = checkedAdd(month.openingBalanceCents, month.projectedNetCashFlowCents);
     openingBalanceCents = month.closingBalanceCents;
-    knownFutureIncomeCents = checkedAdd(knownFutureIncomeCents, month.futureIncomeCents);
+    knownFutureIncomeCents = checkedAdd(knownFutureIncomeCents, month.knownFutureIncomeCents);
+    expectedIncomeCents = checkedAdd(expectedIncomeCents, month.expectedIncomeCents);
+    overdueExpectedIncomeCents = checkedAdd(overdueExpectedIncomeCents, month.overdueExpectedIncomeCents);
     knownFutureOutflowCents = checkedAdd(knownFutureOutflowCents, month.knownOutflowCents);
     return month;
   });
@@ -366,6 +471,8 @@ export async function getFinanceForecast(context: ForecastContext, months = FORE
     horizon: { months, fromMonth: window.firstMonth, throughMonth: window.throughMonth },
     currentBalanceCents,
     knownFutureIncomeCents,
+    expectedIncomeCents,
+    overdueExpectedIncomeCents,
     knownFutureOutflowCents,
     projectedEndingBalanceCents: openingBalanceCents,
     months: monthValues,
