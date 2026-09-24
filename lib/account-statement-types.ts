@@ -1,12 +1,14 @@
 export type AccountStatementEventType =
   | "income"
   | "expense"
+  | "expected_income_receipt"
+  | "expected_income_reversal"
   | "invoice_payment"
   | "invoice_payment_reversal";
 
 export type AccountStatementEventFilter = "all" | AccountStatementEventType;
 export type AccountStatementDirection = "credit" | "debit";
-export type AccountStatementEntityType = "transaction" | "invoice_payment" | "invoice_payment_operation";
+export type AccountStatementEntityType = "transaction" | "expected_income_operation" | "invoice_payment" | "invoice_payment_operation";
 
 export type AccountStatementItem = {
   id: string;

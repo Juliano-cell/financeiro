@@ -4,7 +4,7 @@ import { and, asc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getCurrentUser, isSameOriginRequest } from "@/app/auth";
 import { getDb } from "@/db";
-import { billInstallmentOccurrences, billInstallmentSeries, bills, cardImportBatches, cardInstallments, cardInvoiceAdjustments, cardInvoices, cardOpeningBalanceAllocations, cardPurchaseImportMetadata, cardPurchases, creditCards, householdMembers, notificationPreferences, transactions } from "@/db/schema";
+import { billInstallmentOccurrences, billInstallmentSeries, bills, cardImportBatches, cardInstallments, cardInvoiceAdjustments, cardInvoices, cardOpeningBalanceAllocations, cardPurchaseImportMetadata, cardPurchases, creditCards, expectedIncomeOperations, householdMembers, notificationPreferences, transactions } from "@/db/schema";
 import { BillServiceError, cancelBillOccurrence, cancelRecurringBillSeries, createBill, payBill, undoBillPayment, updateBillOccurrence, updateRecurringBillSeries } from "@/lib/bill-service";
 import { BillInstallmentServiceError, createBillInstallmentSeries } from "@/lib/bill-installment-service";
 import { addMonths, buildInstallmentPlan, simulatePurchase } from "@/lib/finance-rules.mjs";
@@ -66,7 +66,7 @@ export async function GET(request: Request) {
   const selectedMonth = new URL(request.url).searchParams.get("month") ?? today.slice(0, 7);
   if (!monthSchema.safeParse(selectedMonth).success) return NextResponse.json({ error: "Mês inválido." }, { status: 400 });
   const { db, d1, householdId } = current;
-  const [cardRows, purchaseRows, invoiceRows, installmentRows, importMetadataRows, importBatchRows, adjustmentRows, allocationRows, billInstallmentSeriesRows, billInstallmentOccurrenceRows, billRows, transactionRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
+  const [cardRows, purchaseRows, invoiceRows, installmentRows, importMetadataRows, importBatchRows, adjustmentRows, allocationRows, billInstallmentSeriesRows, billInstallmentOccurrenceRows, billRows, transactionRows, expectedIncomeOperationRows, preferenceRows, invoiceStates, balanceRows] = await Promise.all([
     db.select().from(creditCards).where(eq(creditCards.householdId, householdId)).orderBy(asc(creditCards.name)),
     db.select().from(cardPurchases).where(eq(cardPurchases.householdId, householdId)),
     db.select().from(cardInvoices).where(eq(cardInvoices.householdId, householdId)),
@@ -79,6 +79,7 @@ export async function GET(request: Request) {
     db.select().from(billInstallmentOccurrences).where(eq(billInstallmentOccurrences.householdId, householdId)),
     db.select().from(bills).where(eq(bills.householdId, householdId)).orderBy(asc(bills.dueDate)),
     db.select().from(transactions).where(eq(transactions.householdId, householdId)),
+    db.select({ transactionId: expectedIncomeOperations.transactionId, operationType: expectedIncomeOperations.operationType, financialDate: expectedIncomeOperations.financialDate }).from(expectedIncomeOperations).where(eq(expectedIncomeOperations.householdId, householdId)),
     db.select().from(notificationPreferences).where(eq(notificationPreferences.householdId, householdId)),
     getHouseholdInvoiceStates({ d1, householdId, userId: current.user.id }),
     getCurrentAccountBalances(householdId, today),
@@ -155,7 +156,9 @@ export async function GET(request: Request) {
   const monthInstallments = installments.filter((item) => item.invoice?.referenceMonth === selectedMonth && item.status !== "cancelled" && item.purchase?.status === "active");
   const monthBills = billsWithInstallments.filter((item) => item.dueDate.startsWith(selectedMonth) && item.status !== "cancelled");
   const pendingBillsCents = monthBills.filter((item) => item.status === "pending").reduce((sum, item) => sum + item.amountCents, 0);
-  const incomeCents = monthTransactions.filter((item) => item.type === "income").reduce((sum, item) => sum + item.amountCents, 0);
+  const reversalCents = expectedIncomeOperationRows.filter((operation) => operation.operationType === "reverse" && operation.financialDate?.startsWith(selectedMonth))
+    .reduce((sum, operation) => sum + (operation.transactionId ? transactionById.get(operation.transactionId)?.amountCents ?? 0 : 0), 0);
+  const incomeCents = monthTransactions.filter((item) => item.type === "income").reduce((sum, item) => sum + item.amountCents, 0) - reversalCents;
   const cashExpenseCents = monthTransactions.filter((item) => item.type === "expense").reduce((sum, item) => sum + item.amountCents, 0);
   const cardExpenseCents = monthInstallments.reduce((sum, item) => sum + item.amountCents, 0);
   const pendingCardCents = invoiceStates.filter((item) => item.referenceMonth === selectedMonth).reduce((sum, item) => sum + item.remainingCents, 0);

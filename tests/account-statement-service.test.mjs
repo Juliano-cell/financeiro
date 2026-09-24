@@ -92,6 +92,27 @@ function operation(db, values) {
   );
 }
 
+function expectedIncomeCycle(db, values) {
+  const hash = "e".repeat(64);
+  const occurrence = `${values.id}-occurrence`;
+  const transactionId = `${values.id}-transaction`;
+  const createOperation = `${values.id}-create`;
+  const receiveOperation = `${values.id}-receive`;
+  const reverseOperation = `${values.id}-reverse`;
+  db.prepare(`INSERT INTO expected_income_operations(id,household_id,idempotency_key,request_hash,operation_type,occurrence_id,performed_by_user_id,financial_date,created_at)
+    VALUES(?,?,?,?, 'create_occurrence',?,?,?,?)`).run(createOperation, values.household, `${createOperation}-key`, hash, occurrence, values.user, values.receivedDate, AT);
+  db.prepare(`INSERT INTO expected_income_occurrences(id,household_id,description,expected_amount_cents,expected_date,status,last_operation_id,created_by_user_id,origin,created_at,updated_at)
+    VALUES(?,?,?,?,?,'pending',?,?,'web',?,?)`).run(occurrence, values.household, values.description, values.amount, values.receivedDate, createOperation, values.user, AT, AT);
+  transaction(db, { id: transactionId, household: values.household, type: "income", amount: values.amount, description: values.description, date: values.receivedDate, user: values.user, account: values.account, paymentMethod: "conta_a_receber" });
+  db.prepare(`INSERT INTO expected_income_operations(id,household_id,idempotency_key,request_hash,operation_type,occurrence_id,transaction_id,performed_by_user_id,financial_date,created_at)
+    VALUES(?,?,?,?, 'receive',?,?,?,?,?)`).run(receiveOperation, values.household, `${receiveOperation}-key`, hash, occurrence, transactionId, values.user, values.receivedDate, AT);
+  db.prepare("UPDATE expected_income_occurrences SET status='received',received_transaction_id=?,received_at=?,last_operation_id=?,updated_at=? WHERE id=?").run(transactionId, AT, receiveOperation, AT, occurrence);
+  db.prepare(`INSERT INTO expected_income_operations(id,household_id,idempotency_key,request_hash,operation_type,occurrence_id,transaction_id,performed_by_user_id,financial_date,created_at)
+    VALUES(?,?,?,?, 'reverse',?,?,?,?,?)`).run(reverseOperation, values.household, `${reverseOperation}-key`, hash, occurrence, transactionId, values.user, values.reversalDate, AT);
+  db.prepare("UPDATE expected_income_occurrences SET status='pending',received_transaction_id=NULL,received_at=NULL,last_operation_id=?,updated_at=? WHERE id=?").run(reverseOperation, AT, occurrence);
+  return { occurrence, transactionId, receiveOperation, reverseOperation };
+}
+
 function setup(t) {
   const db = database(t);
   const a = seedHousehold(db, "a");
@@ -223,6 +244,25 @@ test("pagamento legado e reversão reproduzem 78,13 → -21,87 → 78,13", async
   assert.equal(reversed.summary.closingBalanceCents, 7_813);
   assert.deepEqual(reversed.items.map((item) => item.eventType), ["invoice_payment_reversal", "invoice_payment"]);
   assert.equal(reversed.items[0].originalPaymentId, "legacy-payment");
+});
+
+test("recebimento previsto e estorno permanecem visíveis, compensam saldo e não viram despesa", async t => {
+  const f = setup(t);
+  const cycle = expectedIncomeCycle(f.db, { id: "expected", household: f.a.household, user: f.a.user, account: f.a.account, description: "Diária", amount: 22_000, receivedDate: "2026-09-17", reversalDate: "2026-09-18" });
+  const value = await statement(f);
+  const receipt = value.items.find((item) => item.entityId === cycle.transactionId);
+  const reversal = value.items.find((item) => item.entityId === cycle.reverseOperation);
+  assert.equal(receipt?.eventType, "expected_income_receipt");
+  assert.equal(receipt?.description, "Recebimento de entrada prevista · Diária");
+  assert.equal(receipt?.signedAmountCents, 22_000);
+  assert.equal(reversal?.eventType, "expected_income_reversal");
+  assert.equal(reversal?.description, "Estorno de entrada prevista · Diária");
+  assert.equal(reversal?.signedAmountCents, -22_000);
+  assert.equal(reversal?.direction, "debit");
+  assert.equal(receipt.signedAmountCents + reversal.signedAmountCents, 0);
+  assert.equal(value.items.some((item) => item.entityId === cycle.reverseOperation && item.eventType === "expense"), false);
+  const onlyReversals = await statement(f, { eventType: "expected_income_reversal" });
+  assert.deepEqual(onlyReversals.items.map((item) => item.entityId), [cycle.reverseOperation]);
 });
 
 test("conta sem eventos, saldo negativo e conta inativa permanecem consultáveis", async t => {

@@ -115,6 +115,8 @@ test("datas civis e mês de referência são formatados sem conversão de timezo
 test("rótulos contábeis não confundem pagamento com despesa nem reversão com renda", () => {
   assert.deepEqual(statementEventPresentation("income"), { label: "Entrada", direction: "credit" });
   assert.deepEqual(statementEventPresentation("expense"), { label: "Despesa", direction: "debit" });
+  assert.deepEqual(statementEventPresentation("expected_income_receipt"), { label: "Recebimento de entrada prevista", direction: "credit" });
+  assert.deepEqual(statementEventPresentation("expected_income_reversal"), { label: "Estorno de entrada prevista", direction: "debit" });
   assert.deepEqual(statementEventPresentation("invoice_payment"), { label: "Pagamento de fatura", direction: "debit" });
   assert.deepEqual(statementEventPresentation("invoice_payment_reversal"), { label: "Reversão de pagamento", direction: "credit" });
 });
@@ -183,7 +185,7 @@ test("extrato reserva a navegação móvel pelo offset global e preserva o heade
 });
 
 test("filtros do frontend permanecem alinhados ao contrato validado pela API", () => {
-  for (const value of ["this_month", "last_30_days", "custom", "all", "income", "expense", "invoice_payment", "invoice_payment_reversal"]) {
+  for (const value of ["this_month", "last_30_days", "custom", "all", "income", "expense", "expected_income_receipt", "expected_income_reversal", "invoice_payment", "invoice_payment_reversal"]) {
     assert.ok(componentSource.includes(value), value);
     assert.ok(apiSource.includes(value), value);
   }

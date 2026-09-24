@@ -56,7 +56,7 @@ export type AnalyticsTimelinePoint = {
 
 export type AnalyticsDetail = {
   id: string;
-  entityType: "transaction" | "card_installment";
+  entityType: "transaction" | "card_installment" | "expected_income_operation";
   date: string;
   competenceMonth: string;
   type: AnalyticsTransactionType;

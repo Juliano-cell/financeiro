@@ -41,7 +41,7 @@ const querySchema = z.object({
   period: z.enum(["last_30_days", "this_month", "custom"]).default("this_month"),
   from: isoDate.optional(),
   to: isoDate.optional(),
-  eventType: z.enum(["all", "income", "expense", "invoice_payment", "invoice_payment_reversal"]).default("all"),
+  eventType: z.enum(["all", "income", "expense", "expected_income_receipt", "expected_income_reversal", "invoice_payment", "invoice_payment_reversal"]).default("all"),
   cursor: z.string().min(1).max(4_096).regex(/^[A-Za-z0-9_-]+$/u, "Cursor inválido.").optional(),
   limit,
 }).strict().superRefine((value, context) => {

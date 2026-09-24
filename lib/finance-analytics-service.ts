@@ -144,7 +144,7 @@ function mapDetail(row: SqlRow): AnalyticsDetail {
   }
   return {
     id: String(row.id),
-    entityType: row.entity_type === "card_installment" ? "card_installment" : "transaction",
+    entityType: row.entity_type === "card_installment" ? "card_installment" : row.entity_type === "expected_income_operation" ? "expected_income_operation" : "transaction",
     date: String(row.event_date),
     competenceMonth: String(row.competence_month),
     type: row.type === "income" ? "income" : "expense",

@@ -74,6 +74,27 @@ function insertTransaction(db, values) {
     .run(values.id, values.householdId, values.type, values.amountCents, values.description, values.categoryId ?? null, values.subcategoryId ?? null, values.date, values.userId, values.accountId, values.paymentMethod ?? null, values.status ?? "confirmed", "dashboard", AT, AT);
 }
 
+function insertExpectedIncomeCycle(db, values) {
+  const hash = "e".repeat(64);
+  const occurrence = `${values.id}-occurrence`;
+  const transactionId = `${values.id}-transaction`;
+  const createOperation = `${values.id}-create`;
+  const receiveOperation = `${values.id}-receive`;
+  const reverseOperation = `${values.id}-reverse`;
+  db.prepare(`INSERT INTO expected_income_operations(id,household_id,idempotency_key,request_hash,operation_type,occurrence_id,performed_by_user_id,financial_date,created_at)
+    VALUES(?,?,?,?, 'create_occurrence',?,?,?,?)`).run(createOperation, values.householdId, `${createOperation}-key`, hash, occurrence, values.userId, values.receivedDate, AT);
+  db.prepare(`INSERT INTO expected_income_occurrences(id,household_id,description,expected_amount_cents,expected_date,status,last_operation_id,created_by_user_id,origin,created_at,updated_at)
+    VALUES(?,?,?,?,?,'pending',?,?,'web',?,?)`).run(occurrence, values.householdId, values.description, values.amountCents, values.receivedDate, createOperation, values.userId, AT, AT);
+  insertTransaction(db, { id: transactionId, householdId: values.householdId, type: "income", amountCents: values.amountCents, description: values.description, date: values.receivedDate, userId: values.userId, accountId: values.accountId, paymentMethod: "conta_a_receber" });
+  db.prepare(`INSERT INTO expected_income_operations(id,household_id,idempotency_key,request_hash,operation_type,occurrence_id,transaction_id,performed_by_user_id,financial_date,created_at)
+    VALUES(?,?,?,?, 'receive',?,?,?,?,?)`).run(receiveOperation, values.householdId, `${receiveOperation}-key`, hash, occurrence, transactionId, values.userId, values.receivedDate, AT);
+  db.prepare("UPDATE expected_income_occurrences SET status='received',received_transaction_id=?,received_at=?,last_operation_id=?,updated_at=? WHERE id=?").run(transactionId, AT, receiveOperation, AT, occurrence);
+  db.prepare(`INSERT INTO expected_income_operations(id,household_id,idempotency_key,request_hash,operation_type,occurrence_id,transaction_id,performed_by_user_id,financial_date,created_at)
+    VALUES(?,?,?,?, 'reverse',?,?,?,?,?)`).run(reverseOperation, values.householdId, `${reverseOperation}-key`, hash, occurrence, transactionId, values.userId, values.reversalDate, AT);
+  db.prepare("UPDATE expected_income_occurrences SET status='pending',received_transaction_id=NULL,received_at=NULL,last_operation_id=?,updated_at=? WHERE id=?").run(reverseOperation, AT, occurrence);
+  return { transactionId, reverseOperation };
+}
+
 function seedAnalyticsScenario() {
   const db = database();
   const a = seedHousehold(db, "a");
@@ -519,4 +540,29 @@ test("saldo de 78,13 passa a -21,87 com pagamento e volta a 78,13 com reversão"
       accountBalance(db, LEGACY_CURRENT_ACCOUNT_BALANCES_SQL, a.household, throughDate, "manual-account"),
     );
   }
+});
+
+test("receita prevista e estorno no mesmo mês zeram receita líquida sem criar despesa", () => {
+  const db = database(); const a = seedHousehold(db, "expected_same");
+  const cycle = insertExpectedIncomeCycle(db, { id: "same", householdId: a.household, userId: a.user, accountId: a.account, description: "Diária", amountCents: 22_000, receivedDate: "2026-09-17", reversalDate: "2026-09-18" });
+  const events = db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT id,entity_type,event_date,type,amount_cents,description FROM financial_events ORDER BY event_date`).all(a.household, a.household);
+  assert.deepEqual(events.map((event) => ({ ...event })), [
+    { id: cycle.transactionId, entity_type: "transaction", event_date: "2026-09-17", type: "income", amount_cents: 22_000, description: "Diária" },
+    { id: cycle.reverseOperation, entity_type: "expected_income_operation", event_date: "2026-09-18", type: "income", amount_cents: -22_000, description: "Estorno de entrada prevista · Diária" },
+  ]);
+  const totals = db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount_cents ELSE 0 END),0) income, COALESCE(SUM(CASE WHEN type='expense' THEN amount_cents ELSE 0 END),0) expense FROM financial_events WHERE competence_month='2026-09'`).get(a.household, a.household);
+  assert.deepEqual({ ...totals }, { income: 0, expense: 0 });
+  assert.equal(accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, "2026-09-17", a.account), 122_000);
+  assert.equal(accountBalance(db, CURRENT_ACCOUNT_BALANCES_SQL, a.household, "2026-09-18", a.account), 100_000);
+  db.close();
+});
+
+test("estorno em mês posterior preserva competência temporal +220 em setembro e -220 em outubro", () => {
+  const db = database(); const a = seedHousehold(db, "expected_cross");
+  insertExpectedIncomeCycle(db, { id: "cross", householdId: a.household, userId: a.user, accountId: a.account, description: "Diária", amountCents: 22_000, receivedDate: "2026-09-30", reversalDate: "2026-10-01" });
+  const monthly = db.prepare(`${FINANCIAL_EVENTS_CTE} SELECT competence_month,SUM(amount_cents) income_cents FROM financial_events WHERE type='income' GROUP BY competence_month ORDER BY competence_month`).all(a.household, a.household);
+  assert.deepEqual(monthly.map((row) => ({ ...row })), [{ competence_month: "2026-09", income_cents: 22_000 }, { competence_month: "2026-10", income_cents: -22_000 }]);
+  const movements = db.prepare(`${ACCOUNT_MOVEMENTS_CTE} SELECT event_date,type,amount_cents FROM account_movements ORDER BY event_date`).all(a.household, a.household);
+  assert.deepEqual(movements.map((row) => ({ ...row })), [{ event_date: "2026-09-30", type: "income", amount_cents: 22_000 }, { event_date: "2026-10-01", type: "income", amount_cents: -22_000 }]);
+  db.close();
 });

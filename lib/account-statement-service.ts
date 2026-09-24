@@ -73,9 +73,9 @@ type CursorPayload = {
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const REFERENCE_MONTH_PATTERN = /^\d{4}-\d{2}$/u;
-const EVENT_TYPES = new Set<AccountStatementEventType>(["income", "expense", "invoice_payment", "invoice_payment_reversal"]);
+const EVENT_TYPES = new Set<AccountStatementEventType>(["income", "expense", "expected_income_receipt", "expected_income_reversal", "invoice_payment", "invoice_payment_reversal"]);
 const FILTERS = new Set<AccountStatementEventFilter>(["all", ...EVENT_TYPES]);
-const SOURCE_TYPES = new Set<AccountStatementEntityType>(["transaction", "invoice_payment", "invoice_payment_operation"]);
+const SOURCE_TYPES = new Set<AccountStatementEntityType>(["transaction", "expected_income_operation", "invoice_payment", "invoice_payment_operation"]);
 const CURSOR_KEYS = ["accountId", "eventDate", "eventType", "filter", "from", "sourceId", "sourceType", "to", "v"];
 
 function validDate(value: unknown): value is string {
@@ -184,12 +184,16 @@ function mapItem(row: StatementRow): AccountStatementItem {
     || !safeInteger(row.amount_cents, 1) || !safeInteger(row.signed_amount_cents)) {
     throw new AccountStatementError("Os dados financeiros do extrato estão inconsistentes.", 409, "ACCOUNT_STATEMENT_INCONSISTENT");
   }
-  const credit = row.event_type === "income" || row.event_type === "invoice_payment_reversal";
+  const credit = row.event_type === "income" || row.event_type === "expected_income_receipt" || row.event_type === "invoice_payment_reversal";
   if ((credit && row.signed_amount_cents !== row.amount_cents)
     || (!credit && row.signed_amount_cents !== -row.amount_cents)) {
     throw new AccountStatementError("Os dados financeiros do extrato estão inconsistentes.", 409, "ACCOUNT_STATEMENT_INCONSISTENT");
   }
-  const description = row.event_type === "invoice_payment"
+  const description = row.event_type === "expected_income_receipt"
+    ? `Recebimento de entrada prevista · ${nullableString(row.transaction_description) ?? "Entrada prevista"}`
+    : row.event_type === "expected_income_reversal"
+      ? `Estorno de entrada prevista · ${nullableString(row.transaction_description) ?? "Entrada prevista"}`
+      : row.event_type === "invoice_payment"
     ? paymentDescription("Pagamento de fatura", row.card_name, row.reference_month)
     : row.event_type === "invoice_payment_reversal"
       ? paymentDescription("Reversão de pagamento", row.card_name, row.reference_month)
@@ -249,11 +253,11 @@ items AS (
     e.signed_amount_cents,
     e.event_type,
     e.amount_cents,
-    t.description AS transaction_description,
-    t.payment_method,
-    t.category_id,
+    COALESCE(t.description, expected_transaction.description) AS transaction_description,
+    COALESCE(t.payment_method, expected_transaction.payment_method) AS payment_method,
+    COALESCE(t.category_id, expected_transaction.category_id) AS category_id,
     c.name AS category_name,
-    t.subcategory_id,
+    COALESCE(t.subcategory_id, expected_transaction.subcategory_id) AS subcategory_id,
     sc.name AS subcategory_name,
     i.id AS invoice_id,
     i.reference_month,
@@ -264,10 +268,16 @@ items AS (
   LEFT JOIN transactions t
     ON e.source_type = 'transaction' AND t.household_id = e.household_id
       AND t.account_id = e.account_id AND t.id = e.source_id
+  LEFT JOIN expected_income_operations expected_operation
+    ON e.source_type = 'expected_income_operation' AND expected_operation.operation_type = 'reverse'
+      AND expected_operation.household_id = e.household_id AND expected_operation.id = e.source_id
+  LEFT JOIN transactions expected_transaction
+    ON expected_transaction.household_id = expected_operation.household_id
+      AND expected_transaction.account_id = e.account_id AND expected_transaction.id = expected_operation.transaction_id
   LEFT JOIN categories c
-    ON c.household_id = t.household_id AND c.id = t.category_id
+    ON c.household_id = e.household_id AND c.id = COALESCE(t.category_id, expected_transaction.category_id)
   LEFT JOIN subcategories sc
-    ON sc.household_id = t.household_id AND sc.category_id = t.category_id AND sc.id = t.subcategory_id
+    ON sc.household_id = e.household_id AND sc.category_id = COALESCE(t.category_id, expected_transaction.category_id) AND sc.id = COALESCE(t.subcategory_id, expected_transaction.subcategory_id)
   LEFT JOIN invoice_payments p
     ON e.source_type = 'invoice_payment' AND p.household_id = e.household_id
       AND p.account_id = e.account_id AND p.id = e.source_id
