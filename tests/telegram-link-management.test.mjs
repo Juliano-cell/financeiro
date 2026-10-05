@@ -39,7 +39,7 @@ function disconnect(db, householdId, userId, at) {
     db.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) SELECT ?, ?, ?, 'unlink', 'telegram_link', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM telegram_links WHERE household_id = ? AND user_id = ? AND is_active = 1)").run(`audit-${crypto.randomUUID()}`, householdId, userId, userId, '{"connected":true}', '{"connected":false}', at, householdId, userId);
     db.prepare("DELETE FROM telegram_conversation_states WHERE household_id = ? AND telegram_user_id IN (SELECT telegram_user_id FROM telegram_links WHERE household_id = ? AND user_id = ? AND is_active = 1)").run(householdId, householdId, userId);
     db.prepare("UPDATE telegram_link_codes SET used_at = ? WHERE household_id = ? AND user_id = ? AND used_at IS NULL").run(at, householdId, userId);
-    db.prepare("UPDATE telegram_links SET is_active = 0, updated_at = ? WHERE household_id = ? AND user_id = ? AND is_active = 1").run(at, householdId, userId);
+    db.prepare("DELETE FROM telegram_links WHERE household_id = ? AND user_id = ? AND is_active = 1").run(householdId, userId);
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -56,10 +56,11 @@ test("status distingue usuário conectado e desconectado sem misturar households
   assert.equal(connected(db, "house-a", "user-a"), false);
 });
 
-test("desvinculação desativa somente o usuário correto e preserva outros membros", () => {
+test("desvinculação remove somente o usuário correto e preserva outros membros", () => {
   const db = database(); const at = seed(db);
   disconnect(db, "house-a", "user-a", at);
   assert.equal(connected(db, "house-a", "user-a"), false);
+  assert.equal(db.prepare("SELECT count(*) total FROM telegram_links WHERE telegram_user_id='telegram-a'").get().total, 0);
   assert.equal(connected(db, "house-a", "user-b"), true);
   assert.equal(connected(db, "house-b", "user-c"), true);
   assert.equal(db.prepare("SELECT is_active FROM telegram_links WHERE id='link-b'").get().is_active, 1);
@@ -87,16 +88,36 @@ test("DELETE sem vínculo ativo é idempotente e ainda invalida código pendente
   assert.equal(db.prepare("SELECT used_at FROM telegram_link_codes WHERE id='code-a'").get().used_at, at);
 });
 
-test("após desvincular é possível gerar código e reativar o mesmo vínculo", () => {
+test("após desvincular é possível gerar código e reconectar no mesmo vínculo lógico", () => {
   const db = database(); const at = seed(db);
   assert.equal(connected(db, "house-a", "user-a"), true, "geração deve permanecer bloqueada enquanto houver vínculo ativo");
   disconnect(db, "house-a", "user-a", at);
   assert.equal(connected(db, "house-a", "user-a"), false);
   db.prepare("INSERT INTO telegram_link_codes(id,household_id,user_id,code_hash,expires_at,created_at) VALUES(?,?,?,?,?,?)").run("new-code", "house-a", "user-a", "new-hash", "2026-09-14T14:00:00.000Z", at);
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_link_codes WHERE user_id='user-a' AND used_at IS NULL").get().total, 1);
-  db.prepare("UPDATE telegram_links SET is_active=1,chat_id='new-chat',updated_at=? WHERE telegram_user_id='telegram-a' AND household_id='house-a' AND user_id='user-a'").run(at);
+  db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,is_active,linked_at,updated_at) VALUES(?,?,?,?,?,1,?,?)").run("link-a-reconnected", "house-a", "user-a", "telegram-a", "new-chat", at, at);
   assert.equal(connected(db, "house-a", "user-a"), true);
   assert.equal(db.prepare("SELECT count(*) total FROM telegram_links WHERE user_id='user-a'").get().total, 1);
+});
+
+test("Telegram liberado pode ser conectado a outro household sem afetar terceiros", () => {
+  const db = database(); const at = seed(db);
+  disconnect(db, "house-a", "user-a", at);
+  db.prepare("INSERT INTO users(id,name,email,created_at,updated_at) VALUES(?,?,?,?,?)").run("user-d", "user-d", "user-d@example.com", at, at);
+  db.prepare("INSERT INTO households(id,name,created_by,created_at,updated_at) VALUES(?,?,?,?,?)").run("house-d", "house-d", "user-d", at, at);
+  db.prepare("INSERT INTO household_members(id,household_id,user_id,role,status,joined_at,created_at) VALUES(?,?,?,?,?,?,?)").run("member-user-d", "house-d", "user-d", "owner", "active", at, at);
+  db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,is_active,linked_at,updated_at) VALUES(?,?,?,?,?,1,?,?)").run("link-d", "house-d", "user-d", "telegram-a", "chat-d", at, at);
+  assert.equal(connected(db, "house-d", "user-d"), true);
+  assert.equal(db.prepare("SELECT household_id FROM telegram_links WHERE telegram_user_id='telegram-a'").get().household_id, "house-d");
+  assert.equal(db.prepare("SELECT household_id FROM telegram_links WHERE telegram_user_id='telegram-b'").get().household_id, "house-a");
+  assert.equal(db.prepare("SELECT household_id FROM telegram_links WHERE telegram_user_id='telegram-c'").get().household_id, "house-b");
+});
+
+test("índice global continua impedindo dois vínculos para o mesmo Telegram", () => {
+  const db = database(); const at = seed(db);
+  disconnect(db, "house-a", "user-a", at);
+  assert.doesNotThrow(() => db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,is_active,linked_at,updated_at) VALUES(?,?,?,?,?,1,?,?)").run("link-a-new", "house-a", "user-a", "telegram-a", "chat-a-new", at, at));
+  assert.throws(() => db.prepare("INSERT INTO telegram_links(id,household_id,user_id,telegram_user_id,chat_id,is_active,linked_at,updated_at) VALUES(?,?,?,?,?,1,?,?)").run("link-a-duplicate", "house-a", "user-b", "telegram-a", "chat-a-duplicate", at, at), /UNIQUE constraint failed/iu);
 });
 
 test("backend deriva identidade da sessão e não expõe IDs sensíveis", () => {
@@ -107,7 +128,8 @@ test("backend deriva identidade da sessão e não expõe IDs sensíveis", () => 
   assert.match(service, /eq\(telegramLinks\.userId, userId\)/);
   assert.match(service, /eq\(telegramLinks\.householdId, membership\.householdId\)/);
   assert.match(service, /d1\.batch/);
-  assert.match(service, /UPDATE telegram_links SET is_active = 0/);
+  assert.match(service, /DELETE FROM telegram_links WHERE household_id = \? AND user_id = \? AND is_active = 1/);
+  assert.doesNotMatch(service, /UPDATE telegram_links SET is_active = 0/);
   assert.match(service, /UPDATE telegram_link_codes SET used_at/);
   assert.match(service, /DELETE FROM telegram_conversation_states/);
   assert.match(service, /INSERT INTO audit_logs/);

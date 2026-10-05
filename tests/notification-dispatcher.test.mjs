@@ -229,10 +229,10 @@ test("evento específico desativado cancela o item", async (t) => {
   assert.equal(transport.calls.length, 0);
 });
 
-test("Telegram desvinculado cancela sem resolver destino", async (t) => {
+test("Telegram removido pela desvinculação cancela sem resolver destino", async (t) => {
   const db = database(t);
   const fixture = seedDispatchable(db);
-  db.prepare("UPDATE telegram_links SET is_active=0 WHERE household_id=? AND user_id=?").run(fixture.household, fixture.user);
+  db.prepare("DELETE FROM telegram_links WHERE household_id=? AND user_id=?").run(fixture.household, fixture.user);
   const transport = fakeTransport();
   assert.equal((await run(db, transport)).cancelled, 1);
   assert.equal(transport.calls.length, 0);

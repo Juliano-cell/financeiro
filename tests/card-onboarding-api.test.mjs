@@ -321,7 +321,12 @@ test("categoria de outro household é rejeitada sem escrita", async (t) => {
 });
 
 test("GET informa elegibilidade mínima de cartão local", async (t) => {
-  setup(t); const result = await eligibility(); assert.equal(result.status, 200); assert.equal(result.body.cardId, "card-a"); assert.equal(result.body.eligible, true); assert.equal(result.body.cardUpdatedAt, AT); assert.equal(result.body.suggestedReferenceMonth, "2026-10"); assert.ok(result.body.cycles.some((cycle) => cycle.referenceMonth === "2026-09" && cycle.state === "closed")); assert.ok(result.body.cycles.some((cycle) => cycle.referenceMonth === "2026-10" && cycle.closesOn === "2026-10-05" && cycle.dueOn === "2026-10-12")); assert.equal(result.headers.get("cache-control"), "private, no-store");
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(AT) });
+  try {
+    setup(t); const result = await eligibility(); assert.equal(result.status, 200); assert.equal(result.body.cardId, "card-a"); assert.equal(result.body.eligible, true); assert.equal(result.body.cardUpdatedAt, AT); assert.equal(result.body.suggestedReferenceMonth, "2026-10"); assert.ok(result.body.cycles.some((cycle) => cycle.referenceMonth === "2026-09" && cycle.state === "closed")); assert.ok(result.body.cycles.some((cycle) => cycle.referenceMonth === "2026-10" && cycle.closesOn === "2026-10-05" && cycle.dueOn === "2026-10-12")); assert.equal(result.headers.get("cache-control"), "private, no-store");
+  } finally {
+    t.mock.timers.reset();
+  }
 });
 
 test("GET não revela card de outro household", async (t) => {

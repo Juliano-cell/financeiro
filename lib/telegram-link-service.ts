@@ -53,7 +53,7 @@ export async function disconnectTelegram(userId: string) {
     d1.prepare("INSERT INTO audit_logs (id, household_id, user_id, action, entity_type, entity_id, old_data, new_data, created_at) SELECT ?, ?, ?, 'unlink', 'telegram_link', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM telegram_links WHERE household_id = ? AND user_id = ? AND is_active = 1)").bind(uid("audit"), membership.householdId, userId, userId, JSON.stringify({ connected: true }), JSON.stringify({ connected: false }), at, ...filters),
     d1.prepare("DELETE FROM telegram_conversation_states WHERE household_id = ? AND telegram_user_id IN (SELECT telegram_user_id FROM telegram_links WHERE household_id = ? AND user_id = ? AND is_active = 1)").bind(membership.householdId, ...filters),
     d1.prepare("UPDATE telegram_link_codes SET used_at = ? WHERE household_id = ? AND user_id = ? AND used_at IS NULL").bind(at, ...filters),
-    d1.prepare("UPDATE telegram_links SET is_active = 0, updated_at = ? WHERE household_id = ? AND user_id = ? AND is_active = 1").bind(at, ...filters),
+    d1.prepare("DELETE FROM telegram_links WHERE household_id = ? AND user_id = ? AND is_active = 1").bind(...filters),
   ]);
   return { connected: false as const, changed: (results[3]?.meta.changes ?? 0) > 0 };
 }

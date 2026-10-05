@@ -517,21 +517,26 @@ test("future_bill deriva created_by de cada vínculo ativo no mesmo household", 
   assert.deepEqual(db.prepare("SELECT created_by_user_id FROM bills WHERE household_id='ha' ORDER BY amount_cents").all().map((row) => row.created_by_user_id), ["ua", "ua2"]);
 });
 
-test("mês-alvo incompleto é preservado até o usuário informar o dia", async () => {
-  const db = database(); seedTelegramContext(db);
-  const initial = await handleTelegramUpdate(messageUpdate(1901, "Comprei uma camiseta de 30 no mercado e pago mês que vem"));
-  let state = storedFinancialState(db);
-  assert.equal(state.phase, "collecting");
-  assert.equal(state.field, "vencimento");
-  assert.equal(state.financialIntent.dueMonth, "2026-10");
-  assert.match(initial.text ?? "", /vencimento/iu);
+test("mês-alvo incompleto é preservado até o usuário informar o dia", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-09-14T12:00:00.000Z") });
+  try {
+    const db = database(); seedTelegramContext(db);
+    const initial = await handleTelegramUpdate(messageUpdate(1901, "Comprei uma camiseta de 30 no mercado e pago mês que vem"));
+    let state = storedFinancialState(db);
+    assert.equal(state.phase, "collecting");
+    assert.equal(state.field, "vencimento");
+    assert.equal(state.financialIntent.dueMonth, "2026-10");
+    assert.match(initial.text ?? "", /vencimento/iu);
 
-  const completed = await handleTelegramUpdate(messageUpdate(1902, "dia 10"));
-  state = storedFinancialState(db);
-  assert.equal(state.phase, "confirming");
-  assert.equal(state.financialIntent.dueDate, "2026-10-10");
-  assert.equal(state.financialIntent.dueMonth, null);
-  assert.match(completed.text ?? "", /Vencimento: 2026-10-10/);
+    const completed = await handleTelegramUpdate(messageUpdate(1902, "dia 10"));
+    state = storedFinancialState(db);
+    assert.equal(state.phase, "confirming");
+    assert.equal(state.financialIntent.dueDate, "2026-10-10");
+    assert.equal(state.financialIntent.dueMonth, null);
+    assert.match(completed.text ?? "", /Vencimento: 2026-10-10/);
+  } finally {
+    t.mock.timers.reset();
+  }
 });
 
 test("direct_installments continua sem persistência", async () => {
