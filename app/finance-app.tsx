@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { BarChart3, Bell, CalendarClock, ChartNoAxesCombined, ChevronRight, CircleDollarSign, CreditCard, Eye, EyeOff, Home, Landmark, LayoutDashboard, Menu, Pencil, Plus, ReceiptText, Search, Settings2, Sparkles, Tags, Trash2, Users, Wallet, X } from "lucide-react";
+import { BarChart3, Bell, CalendarClock, ChartNoAxesCombined, ChevronRight, CircleDollarSign, CreditCard, Eye, EyeOff, Home, Landmark, LayoutDashboard, Menu, MessageSquareText, Pencil, Plus, ReceiptText, Search, Settings2, Sparkles, Tags, Trash2, Users, Wallet, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,6 +18,7 @@ import { SubcategoryManager } from "@/app/subcategory-manager";
 import { AccountStatementView } from "@/app/account-statement";
 import { ExpectedIncomeManager } from "@/app/expected-income-manager";
 import { FinanceForecast } from "@/app/finance-forecast";
+import { FinanceChatGptSummary } from "@/app/finance-chatgpt-summary";
 import type { DashboardNavigationIntent } from "@/lib/dashboard-navigation";
 import { activeSubcategories, changeTransactionCategory, changeTransactionType, transactionClassificationError } from "@/lib/finance-ui-rules.mjs";
 import { createFinancialRefreshController } from "@/lib/invoice-ui-rules.mjs";
@@ -29,7 +30,7 @@ import { ThemeToggle } from "@/app/theme-toggle";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
-type View = "dashboard" | "reports" | "forecast" | "transactions" | "expected-income" | "accounts" | "categories" | "family" | AdvancedView;
+type View = "dashboard" | "reports" | "forecast" | "chatgpt-summary" | "transactions" | "expected-income" | "accounts" | "categories" | "family" | AdvancedView;
 type Account = { id: string; name: string; type: "bank" | "cash" | "savings" | "wallet" | "other"; initialBalanceCents: number; currentBalanceCents: number; isActive: boolean };
 type Subcategory = { id: string; name: string; categoryId: string; isActive?: boolean; isInUse?: boolean };
 type Category = { id: string; name: string; type: "income" | "expense" | "both"; color: string; isActive: boolean; subcategories: Subcategory[] };
@@ -137,7 +138,7 @@ export function FinanceApp() {
     setDashboardNavigationIntent(intent);
     navigate("reports");
   };
-  const title = { dashboard: "Visão geral", reports: "Relatórios", forecast: "Previsão", transactions: "Movimentações", "expected-income": "Entradas previstas", accounts: "Contas e carteiras", categories: "Categorias", family: "Família", cards: "Cartões", installments: "Parcelas", bills: "Contas e vencimentos", simulator: "Simulador", settings: "Configurações" }[view];
+  const title = { dashboard: "Visão geral", reports: "Relatórios", forecast: "Previsão", "chatgpt-summary": "Resumo para o ChatGPT", transactions: "Movimentações", "expected-income": "Entradas previstas", accounts: "Contas e carteiras", categories: "Categorias", family: "Família", cards: "Cartões", installments: "Parcelas", bills: "Contas e vencimentos", simulator: "Simulador", settings: "Configurações" }[view];
 
   return (
     <main className="min-h-screen overflow-x-clip bg-[#f4f6f5] text-[#132b27] [--mobile-nav-offset:calc(4.5rem+env(safe-area-inset-bottom))]">
@@ -153,6 +154,7 @@ export function FinanceApp() {
           {view === "dashboard" && <FinanceDashboard onNavigate={navigateFromDashboard} />}
           {view === "reports" && <FinanceReports accounts={accounts} categories={categories} members={data.members ?? []} refreshKey={reportRevision} navigationIntent={dashboardNavigationIntent} onNavigationIntentConsumed={consumeDashboardNavigationIntent} onOpenTransaction={openReportTransaction} />}
           {view === "forecast" && <FinanceForecast valuesHidden={valuesHidden} onNavigate={navigate} />}
+          {view === "chatgpt-summary" && <FinanceChatGptSummary valuesHidden={valuesHidden} />}
           {view === "transactions" && <TransactionsView items={transactions.filter((item) => item.transactionDate.startsWith(selectedMonth))} onNew={() => openTransaction()} onEdit={openTransaction} onDelete={async (item) => { await api({ action: "delete_transaction", id: item.id }); toast.success("Movimentação excluída e saldo recalculado."); await refresh(); }} />}
           {view === "expected-income" && <ExpectedIncomeManager accounts={accounts} categories={categories} valuesHidden={valuesHidden} onFinancialChanged={refresh} />}
           {view === "accounts" && <AccountsView accounts={accounts} onNew={() => { setEditingAccount(null); setAccountOpen(true); }} onEdit={(item) => { setEditingAccount(item); setAccountOpen(true); }} onDelete={async (item) => { await api({ action: "delete_account", id: item.id }); toast.success("Conta excluída."); await load(); }} />}
@@ -169,7 +171,7 @@ export function FinanceApp() {
   );
 }
 
-const navItems: Array<{ id: View; label: string; icon: typeof LayoutDashboard }> = [{ id: "dashboard", label: "Visão geral", icon: LayoutDashboard }, { id: "reports", label: "Relatórios", icon: BarChart3 }, { id: "forecast", label: "Previsão", icon: ChartNoAxesCombined }, { id: "transactions", label: "Movimentações", icon: ReceiptText }, { id: "expected-income", label: "Entradas previstas", icon: CircleDollarSign }, { id: "bills", label: "Vencimentos", icon: CalendarClock }, { id: "cards", label: "Cartões", icon: CreditCard }, { id: "installments", label: "Parcelas", icon: ReceiptText }, { id: "simulator", label: "Simulador", icon: Sparkles }, { id: "accounts", label: "Contas", icon: Landmark }, { id: "categories", label: "Categorias", icon: Tags }, { id: "family", label: "Família", icon: Users }, { id: "settings", label: "Configurações", icon: Settings2 }];
+const navItems: Array<{ id: View; label: string; icon: typeof LayoutDashboard }> = [{ id: "dashboard", label: "Visão geral", icon: LayoutDashboard }, { id: "reports", label: "Relatórios", icon: BarChart3 }, { id: "forecast", label: "Previsão", icon: ChartNoAxesCombined }, { id: "chatgpt-summary", label: "Resumo para o ChatGPT", icon: MessageSquareText }, { id: "transactions", label: "Movimentações", icon: ReceiptText }, { id: "expected-income", label: "Entradas previstas", icon: CircleDollarSign }, { id: "bills", label: "Vencimentos", icon: CalendarClock }, { id: "cards", label: "Cartões", icon: CreditCard }, { id: "installments", label: "Parcelas", icon: ReceiptText }, { id: "simulator", label: "Simulador", icon: Sparkles }, { id: "accounts", label: "Contas", icon: Landmark }, { id: "categories", label: "Categorias", icon: Tags }, { id: "family", label: "Família", icon: Users }, { id: "settings", label: "Configurações", icon: Settings2 }];
 
 function Sidebar({ current, onNavigate, user, family, mobileOpen, onClose }: { current: View; onNavigate: (view: View) => void; user: Snapshot["user"]; family: string; mobileOpen: boolean; onClose: () => void }) {
   return <><div onClick={onClose} className={`fixed inset-0 z-30 bg-black/35 transition lg:hidden ${mobileOpen ? "opacity-100" : "pointer-events-none opacity-0"}`} /><aside className={`fixed inset-y-0 left-0 z-40 flex w-[248px] flex-col bg-[#0d2925] px-5 py-6 text-white transition-transform lg:translate-x-0 ${mobileOpen ? "translate-x-0" : "-translate-x-full"}`}><button className="absolute right-3 top-3 rounded-lg p-2 text-white/60 lg:hidden" onClick={onClose} aria-label="Fechar menu"><X className="h-5 w-5" /></button><div className="flex items-center gap-3 px-2"><div className="grid h-10 w-10 place-items-center rounded-2xl bg-[#b9f47a] text-[#17342d]"><Home className="h-5 w-5" /></div><div className="min-w-0"><p className="truncate text-lg font-semibold leading-none" title={family}>{family}</p><p className="mt-1 text-xs text-white/55">Finanças da família</p></div></div><nav className="mt-10 min-h-0 flex-1 space-y-1.5 overflow-y-auto">{navItems.map(({ id, label, icon: Icon }) => <button key={id} onClick={() => onNavigate(id)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm font-medium ${current === id ? "bg-white/12 text-white" : "text-white/60 hover:bg-white/6 hover:text-white"}`}><Icon className="h-[18px] w-[18px]" />{label}</button>)}</nav><div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3"><p className="truncate text-sm font-medium" title={user.name}>{user.name}</p><p className="truncate text-xs text-white/50" title={user.email}>{user.email}</p><button type="button" onClick={() => void signOut().catch((error) => toast.error(error.message))} className="mt-3 block text-xs font-medium text-[#b9f47a]">Sair da conta</button></div></aside></>;
