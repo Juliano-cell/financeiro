@@ -33,6 +33,7 @@ type AnalyticsContext = {
   userId: string;
   householdId: string;
   householdCreatedAt: string;
+  now?: Date;
 };
 
 type IdentityResult =
@@ -251,7 +252,7 @@ export async function getFinanceAnalytics(context: AnalyticsContext, filters: An
   await validateFilters(context.householdId, filters);
   let period;
   try {
-    period = resolveAnalyticsPeriod({ period: filters.period, from: filters.from, to: filters.to });
+    period = resolveAnalyticsPeriod({ period: filters.period, from: filters.from, to: filters.to, now: context.now });
   } catch (error) {
     throw new FinanceAnalyticsValidationError(error instanceof Error ? error.message : "Período inválido.");
   }

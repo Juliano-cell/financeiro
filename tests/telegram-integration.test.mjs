@@ -41,6 +41,7 @@ const loaderSource = `
 register(`data:text/javascript,${encodeURIComponent(loaderSource)}`, import.meta.url);
 const { handleTelegramUpdate } = await import("../lib/telegram-handler.ts?telegram-integration");
 const { FinanceValidationError } = await import("../lib/finance-service.ts");
+const { invoiceClosesOn } = await import("../lib/invoice-service.ts");
 
 class LocalStatement {
   constructor(db, sql, bindings = []) {
@@ -713,24 +714,39 @@ test("C2 T5 cartão exato em 3x passa pelo serviço canônico e remove conector 
   assert.deepEqual(db.prepare("SELECT amount_cents FROM card_installments ORDER BY installment_number").all().map((row) => row.amount_cents), [100, 100, 100]);
 });
 
-for (const status of ["paid", "closed"]) {
-  test(`C2 T5 fatura ${status} responde amigavelmente sem reabrir nem persistir parcialmente`, async () => {
+async function assertClosedInvoiceIsNotReopened(t, status) {
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-06T12:00:00.000Z") });
+  try {
     const db = database(); const at = seedTelegramContext(db);
-    const started = await beginFinancialConversation(db, 5201, "Comprei 3 no cartão Nubank em 3x no mercado");
+    const started = await beginFinancialConversation(db, 5201, "Comprei ontem 3 no cartão Nubank em 3x no mercado");
+    assert.equal(started.state.financialIntent.purchaseDate, "2026-10-05");
     const [first] = buildInstallmentPlan({ totalCents: 300, count: 3, purchaseDate: started.state.financialIntent.purchaseDate, closingDay: 5, dueDay: 12 });
-    db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").run("blocked", "ha", "card-nubank", first.referenceMonth, first.dueDate, status, at, at);
+    const closesOn = invoiceClosesOn(first.referenceMonth, 5, 12);
+    assert.equal(first.referenceMonth, "2026-10");
+    assert.equal(closesOn, "2026-10-05");
+    db.prepare("INSERT INTO card_invoices(id,household_id,card_id,reference_month,due_date,closes_on,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)").run("blocked", "ha", "card-nubank", first.referenceMonth, first.dueDate, closesOn, status, at, at);
     const stateBefore = storedFinancialState(db);
     const result = await handleTelegramUpdate(callbackUpdate(5202, callbackByText(started.response, "Confirmar")));
     assert.match(result.text, /Não foi possível registrar.*fatura.*não está aberta/iu);
     assertNoCardCreation(db);
     assert.deepEqual(storedFinancialState(db), stateBefore);
     assert.equal(db.prepare("SELECT count(*) total FROM card_invoices").get().total, 1);
-    assert.equal(db.prepare("SELECT status FROM card_invoices WHERE id='blocked'").get().status, status);
+    assert.deepEqual({ ...db.prepare("SELECT status, closes_on FROM card_invoices WHERE id='blocked'").get() }, { status, closes_on: closesOn });
     assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id='5202'").get().total, 1);
     assert.equal(db.prepare("SELECT count(*) total FROM telegram_processed_updates WHERE update_id=?").get(`financial:${started.state.sessionId}`).total, 0);
     assert.equal((await handleTelegramUpdate(callbackUpdate(5202, callbackByText(started.response, "Confirmar")))).duplicate, true);
-  });
+  } finally {
+    t.mock.timers.reset();
+  }
 }
+
+test("C2 T5 fatura paid responde amigavelmente sem reabrir nem persistir parcialmente", async (t) => {
+  await assertClosedInvoiceIsNotReopened(t, "paid");
+});
+
+test("C2 T5 fatura closed responde amigavelmente sem reabrir nem persistir parcialmente", async (t) => {
+  await assertClosedInvoiceIsNotReopened(t, "closed");
+});
 
 for (const phrase of ["Comprei 150 no cartão Nubank no mercado", "Comprei 150 no crédito do Nubank no mercado", "Comprei 150 no cartão no mercado"]) {
   test(`C2 1x implícito e único cartão: ${phrase}`, async () => {

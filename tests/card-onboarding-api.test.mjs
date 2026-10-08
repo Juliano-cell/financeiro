@@ -350,20 +350,32 @@ test("parcelamento complementar sem sessão e membership inativa são rejeitados
 });
 
 test("API adiciona parcelamento complementar após onboarding e não expõe dados internos", async (t) => {
-  const f = setup(t);
-  assert.equal((await post({ ...validPayload, referenceMonth: "2026-10", expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false })).status, 201);
-  const result = await postExisting();
-  assert.equal(result.status, 201); assert.equal(result.headers.get("cache-control"), "private, no-store");
-  assert.equal(result.body.importedInstallmentCount, 3); assert.equal(result.body.replayed, false);
-  assert.doesNotMatch(JSON.stringify(result.body), /fingerprint|idempotency/iu);
-  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_import_batches WHERE import_kind='existing_installments'").get().n, 1);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(AT) });
+  try {
+    const f = setup(t);
+    assert.equal((await post({ ...validPayload, referenceMonth: "2026-10", expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false })).status, 201);
+    const result = await postExisting();
+    assert.equal(result.status, 201); assert.equal(result.headers.get("cache-control"), "private, no-store");
+    assert.equal(result.body.importedInstallmentCount, 3); assert.equal(result.body.replayed, false);
+    assert.doesNotMatch(JSON.stringify(result.body), /fingerprint|idempotency/iu);
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_import_batches WHERE import_kind='existing_installments'").get().n, 1);
+  } finally {
+    t.mock.timers.reset();
+  }
 });
 
 test("API complementar mantém idempotência e isolamento de household", async (t) => {
-  const f = setup(t); await post({ ...validPayload, referenceMonth: "2026-10", expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false });
-  const first = await postExisting(); const replay = await postExisting();
-  assert.equal(first.status, 201); assert.equal(replay.status, 201); assert.equal(replay.body.batchId, first.body.batchId); assert.equal(replay.body.replayed, true);
-  const conflict = await postExisting({ ...existingInstallmentPayload, description: "Payload diferente" }); assert.equal(conflict.status, 409);
-  const foreign = await postExisting({ ...existingInstallmentPayload, cardId: "card-b", idempotencyKey: "foreign-key" }); assert.equal(foreign.status, 404);
-  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_import_batches WHERE import_kind='existing_installments'").get().n, 1);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(AT) });
+  try {
+    const f = setup(t);
+    const initial = await post({ ...validPayload, referenceMonth: "2026-10", expectedClosesOn: "2026-10-05", expectedDueOn: "2026-10-12", closedCycleConfirmed: false });
+    assert.equal(initial.status, 201);
+    const first = await postExisting(); const replay = await postExisting();
+    assert.equal(first.status, 201); assert.equal(replay.status, 201); assert.equal(replay.body.batchId, first.body.batchId); assert.equal(replay.body.replayed, true);
+    const conflict = await postExisting({ ...existingInstallmentPayload, description: "Payload diferente" }); assert.equal(conflict.status, 409);
+    const foreign = await postExisting({ ...existingInstallmentPayload, cardId: "card-b", idempotencyKey: "foreign-key" }); assert.equal(foreign.status, 404);
+    assert.equal(f.db.prepare("SELECT COUNT(*) n FROM card_import_batches WHERE import_kind='existing_installments'").get().n, 1);
+  } finally {
+    t.mock.timers.reset();
+  }
 });
